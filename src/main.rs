@@ -1,14 +1,17 @@
 //! rush — 速度重視のRust製シェル
 //!
-//! REPLループ: プロンプト表示 → 入力読み取り → コマンド実行 → ループ
+//! REPLループ: プロンプト表示 → 入力読み取り → パース → 実行 → ループ
 //!
-//! 現在のPhase 1実装:
-//! - `split_whitespace()` による簡易パース（Phase 2で本格パーサーに置換）
-//! - `std::process::Command` による外部コマンド実行（Phase 6で posix_spawn に置換）
-//! - SIGINT無視による最小限のシグナル対応（Phase 4で正式実装）
+//! 現在の機能:
+//! - 手書きトークナイザ + パーサーによる構文解析（[`parser`]）
+//! - パイプライン接続（`libc::pipe` + `Stdio::from_raw_fd`）（[`executor`]）
+//! - ファイルリダイレクト（`>`, `>>`, `<`, `2>`）（[`executor`]）
+//! - シングルクォート / ダブルクォート（[`parser`]）
+//! - ビルトイン: `cd`, `exit`（[`builtins`]）
 
 mod builtins;
 mod executor;
+mod parser;
 mod shell;
 
 use std::io::{self, BufRead, Write};
@@ -55,13 +58,18 @@ fn main() {
             }
         }
 
-        // 簡易パース: Phase 2で本格的なパーサーに置換予定
-        let args: Vec<&str> = line.split_whitespace().collect();
-        if args.is_empty() {
-            continue;
+        // パース: Pipeline<'_> は line を借用 → execute 後に drop → line.clear() は安全
+        match parser::parse(&line) {
+            Ok(Some(pipeline)) => {
+                shell.last_status = executor::execute(&mut shell, &pipeline);
+            }
+            Ok(None) => continue,
+            Err(e) => {
+                eprintln!("rush: {}", e);
+                shell.last_status = 2;
+                continue;
+            }
         }
-
-        shell.last_status = executor::execute(&mut shell, &args);
 
         if shell.should_exit {
             break;
