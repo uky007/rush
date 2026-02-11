@@ -7,7 +7,8 @@
 //! - パイプライン接続（`libc::pipe` + `Stdio::from_raw_fd`）（[`executor`]）
 //! - ファイルリダイレクト（`>`, `>>`, `<`, `2>`）（[`executor`]）
 //! - シングルクォート / ダブルクォート（[`parser`]）
-//! - ビルトイン: `cd`, `exit`（[`builtins`]）
+//! - 変数展開: `$VAR`, `$?`（ダブルクォート内・裸ワードで展開）（[`parser`]）
+//! - ビルトイン: `exit`, `cd`, `pwd`, `echo`, `export`, `unset`（[`builtins`]）
 
 mod builtins;
 mod executor;
@@ -59,7 +60,7 @@ fn main() {
         }
 
         // パース: Pipeline<'_> は line を借用 → execute 後に drop → line.clear() は安全
-        match parser::parse(&line) {
+        match parser::parse(&line, shell.last_status) {
             Ok(Some(pipeline)) => {
                 shell.last_status = executor::execute(&mut shell, &pipeline);
             }

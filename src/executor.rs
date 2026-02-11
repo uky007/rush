@@ -1,12 +1,15 @@
 //! コマンド実行: ビルトイン判定、リダイレクト適用、パイプライン接続。
 //!
 //! - 単一コマンド: ビルトイン → 外部コマンドの順に試行（[`execute_single`]）
+//!   - ビルトインには `&mut dyn Write` 経由で stdout リダイレクトを適用（[`open_builtin_stdout`]）
 //! - パイプライン（2段以上）: `libc::pipe()` + `Stdio::from_raw_fd()` で接続（[`execute_pipeline`]）
+//!   - パイプライン内のビルトインは外部コマンドとして実行（`/bin/echo` 等にフォールバック）
 //!
 //! fd 所有権: `from_raw_fd` で所有権移転し二重 close を防止。
 //! 消費済み fd は -1 にマークし、エラー時に未消費分のみ手動 close する。
 
 use std::fs::{File, OpenOptions};
+use std::io;
 use std::os::unix::io::FromRawFd;
 use std::process::{Command, Stdio};
 
@@ -29,13 +32,23 @@ pub fn execute(shell: &mut Shell, pipeline: &Pipeline<'_>) -> i32 {
 // ── 単一コマンド実行 ─────────────────────────────────────────────────
 
 /// 単一コマンドを実行する。ビルトイン → 外部コマンドの順に試行。
+///
+/// ビルトインの場合はリダイレクトに応じた stdout writer を準備してから実行する。
 fn execute_single(shell: &mut Shell, cmd: &parser::Command<'_>) -> i32 {
     let args: Vec<&str> = cmd.args.iter().map(|a| a.as_ref()).collect();
 
     // ビルトインを先にチェック（fork不要の高速パス）
-    // 現在ビルトインにリダイレクトは適用しない（cd/exit のみで実用上不要）
-    if let Some(status) = builtins::try_exec(shell, &args) {
-        return status;
+    if builtins::is_builtin(args[0]) {
+        // stdout リダイレクトがあればファイルを開く
+        match open_builtin_stdout(&cmd.redirects) {
+            Ok(Some(mut file)) => {
+                return builtins::try_exec(shell, &args, &mut file).unwrap();
+            }
+            Ok(None) => {
+                return builtins::try_exec(shell, &args, &mut io::stdout()).unwrap();
+            }
+            Err(status) => return status,
+        }
     }
 
     // 外部コマンド: リダイレクト適用 → spawn → wait
@@ -47,6 +60,39 @@ fn execute_single(shell: &mut Shell, cmd: &parser::Command<'_>) -> i32 {
     }
 
     spawn_and_wait(&mut command, args[0])
+}
+
+/// ビルトイン用の stdout リダイレクト先ファイルを開く。
+///
+/// `>` / `>>` があればファイルを開いて `Ok(Some(File))` を返す。
+/// stdout リダイレクトがなければ `Ok(None)` を返す（呼び出し側で `io::stdout()` を使う）。
+/// ファイルオープン失敗時は `Err(1)` を返す。
+fn open_builtin_stdout(redirects: &[parser::Redirect<'_>]) -> Result<Option<File>, i32> {
+    // 最後の stdout リダイレクトを適用（bash互換: 複数指定時は最後が有効）
+    for r in redirects.iter().rev() {
+        match r.kind {
+            RedirectKind::Output => {
+                let f = File::create(r.target.as_ref()).map_err(|e| {
+                    eprintln!("rush: {}: {}", r.target, e);
+                    1
+                })?;
+                return Ok(Some(f));
+            }
+            RedirectKind::Append => {
+                let f = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(r.target.as_ref())
+                    .map_err(|e| {
+                        eprintln!("rush: {}: {}", r.target, e);
+                        1
+                    })?;
+                return Ok(Some(f));
+            }
+            _ => continue,
+        }
+    }
+    Ok(None)
 }
 
 // ── パイプライン実行 ─────────────────────────────────────────────────
