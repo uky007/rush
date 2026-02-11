@@ -1,65 +1,58 @@
-//! コマンド実行: ビルトイン判定、リダイレクト適用、パイプライン接続。
+//! コマンド実行: ビルトイン判定、リダイレクト適用、パイプライン接続、ジョブ制御。
 //!
-//! - 単一コマンド: ビルトイン → 外部コマンドの順に試行（[`execute_single`]）
-//!   - ビルトインには `&mut dyn Write` 経由で stdout リダイレクトを適用（[`open_builtin_stdout`]）
-//! - パイプライン（2段以上）: `libc::pipe()` + `Stdio::from_raw_fd()` で接続（[`execute_pipeline`]）
-//!   - パイプライン内のビルトインは外部コマンドとして実行（`/bin/echo` 等にフォールバック）
-//!
-//! fd 所有権: `from_raw_fd` で所有権移転し二重 close を防止。
-//! 消費済み fd は -1 にマークし、エラー時に未消費分のみ手動 close する。
+//! - 単一ビルトイン（非 background）: fork なしの高速パス（[`execute_builtin`]）
+//! - それ以外: 統一 spawn パス（[`execute_job`]）
+//!   - `pre_exec` でプロセスグループ設定 + シグナルリセット
+//!   - `std::mem::forget(child)` で Rust の Child 管理を放棄し、`waitpid` で手動 reap
+//!   - foreground: `tcsetpgrp` でターミナル制御を渡し、`waitpid(WUNTRACED)` で待機
+//!   - background: ジョブテーブルに登録して即座に返る
 
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::io::FromRawFd;
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 
 use crate::builtins;
+use crate::job;
 use crate::parser::{self, Pipeline, RedirectKind};
 use crate::shell::Shell;
 
 /// パイプライン全体を実行し、終了ステータスを返す。
 ///
-/// 単一コマンドならビルトイン判定を含む [`execute_single`] へ、
-/// 2段以上なら [`execute_pipeline`] へディスパッチする。
-pub fn execute(shell: &mut Shell, pipeline: &Pipeline<'_>) -> i32 {
-    if pipeline.commands.len() == 1 {
-        execute_single(shell, &pipeline.commands[0])
-    } else {
-        execute_pipeline(pipeline)
-    }
-}
-
-// ── 単一コマンド実行 ─────────────────────────────────────────────────
-
-/// 単一コマンドを実行する。ビルトイン → 外部コマンドの順に試行。
+/// `cmd_text` は元のコマンド文字列で、ジョブテーブルの表示用に使用される。
 ///
-/// ビルトインの場合はリダイレクトに応じた stdout writer を準備してから実行する。
-fn execute_single(shell: &mut Shell, cmd: &parser::Command<'_>) -> i32 {
-    let args: Vec<&str> = cmd.args.iter().map(|a| a.as_ref()).collect();
+/// ディスパッチ:
+/// 1. 単一ビルトイン（非 background） → [`execute_builtin`]（fork なし高速パス）
+/// 2. それ以外（外部コマンド、パイプライン、ビルトイン + `&`） → [`execute_job`]
+pub fn execute(shell: &mut Shell, pipeline: &Pipeline<'_>, cmd_text: &str) -> i32 {
+    // バックグラウンドジョブを reap
+    job::reap_jobs(&mut shell.jobs);
 
-    // ビルトインを先にチェック（fork不要の高速パス）
-    if builtins::is_builtin(args[0]) {
-        // stdout リダイレクトがあればファイルを開く
-        match open_builtin_stdout(&cmd.redirects) {
-            Ok(Some(mut file)) => {
-                return builtins::try_exec(shell, &args, &mut file).unwrap();
-            }
-            Ok(None) => {
-                return builtins::try_exec(shell, &args, &mut io::stdout()).unwrap();
-            }
-            Err(status) => return status,
+    // 単一ビルトイン（非 background）→ fork なしの高速パス
+    if pipeline.commands.len() == 1 && !pipeline.background {
+        let args: Vec<&str> = pipeline.commands[0].args.iter().map(|a| a.as_ref()).collect();
+        if builtins::is_builtin(args[0]) {
+            return execute_builtin(shell, &pipeline.commands[0]);
         }
     }
 
-    // 外部コマンド: リダイレクト適用 → spawn → wait
-    let mut command = Command::new(args[0]);
-    command.args(&args[1..]);
+    execute_job(shell, pipeline, cmd_text)
+}
 
-    if let Err(status) = apply_redirects(&mut command, &cmd.redirects) {
-        return status;
+// ── ビルトイン高速パス ──────────────────────────────────────────────
+
+/// 単一ビルトインを fork なしで実行する。
+///
+/// stdout リダイレクトがあればファイルを開いてから実行する。
+/// `&` 付きビルトインはこのパスを通らず [`execute_job`] で外部コマンドとして spawn される。
+fn execute_builtin(shell: &mut Shell, cmd: &parser::Command<'_>) -> i32 {
+    let args: Vec<&str> = cmd.args.iter().map(|a| a.as_ref()).collect();
+    match open_builtin_stdout(&cmd.redirects) {
+        Ok(Some(mut file)) => builtins::try_exec(shell, &args, &mut file).unwrap(),
+        Ok(None) => builtins::try_exec(shell, &args, &mut io::stdout()).unwrap(),
+        Err(status) => status,
     }
-
-    spawn_and_wait(&mut command, args[0])
 }
 
 /// ビルトイン用の stdout リダイレクト先ファイルを開く。
@@ -67,8 +60,8 @@ fn execute_single(shell: &mut Shell, cmd: &parser::Command<'_>) -> i32 {
 /// `>` / `>>` があればファイルを開いて `Ok(Some(File))` を返す。
 /// stdout リダイレクトがなければ `Ok(None)` を返す（呼び出し側で `io::stdout()` を使う）。
 /// ファイルオープン失敗時は `Err(1)` を返す。
+/// 複数指定時は bash 互換で最後の指定が有効。
 fn open_builtin_stdout(redirects: &[parser::Redirect<'_>]) -> Result<Option<File>, i32> {
-    // 最後の stdout リダイレクトを適用（bash互換: 複数指定時は最後が有効）
     for r in redirects.iter().rev() {
         match r.kind {
             RedirectKind::Output => {
@@ -95,21 +88,24 @@ fn open_builtin_stdout(redirects: &[parser::Redirect<'_>]) -> Result<Option<File
     Ok(None)
 }
 
-// ── パイプライン実行 ─────────────────────────────────────────────────
+// ── 統一 spawn パス ─────────────────────────────────────────────────
 
-/// 2段以上のパイプラインを実行する。
+/// パイプライン（単一 or 複数コマンド）を子プロセスとして実行する。
 ///
-/// 1. N-1 個の `libc::pipe()` で fd ペアを作成
-/// 2. 各コマンドの stdin/stdout をパイプ fd で接続し spawn
-/// 3. 全子プロセスを wait し、最終コマンドのステータスを返す
-///
-/// ビルトインはパイプラインに参加しない（全て外部コマンドとして実行）。
-fn execute_pipeline(pipeline: &Pipeline<'_>) -> i32 {
+/// 処理の流れ:
+/// 1. N-1 個のパイプを作成
+/// 2. 各コマンドを spawn（`pre_exec` でプロセスグループ参加 + シグナル `SIG_DFL` リセット）
+/// 3. 親側でも `setpgid` を呼び、レースコンディションを防止
+/// 4. `std::mem::forget(child)` で Rust の `Child` 管理を放棄（`waitpid` で手動 reap するため）
+/// 5. background → ジョブテーブルに追加し `[N] pgid` を表示
+///    foreground → `tcsetpgrp` でターミナルを渡し、`wait_for_fg` で待機。
+///    停止検出時はジョブテーブルに Stopped として登録。
+fn execute_job(shell: &mut Shell, pipeline: &Pipeline<'_>, cmd_text: &str) -> i32 {
     let n = pipeline.commands.len();
 
     // N-1 個のパイプを作成
-    let mut pipes: Vec<[i32; 2]> = Vec::with_capacity(n - 1);
-    for _ in 0..n - 1 {
+    let mut pipes: Vec<[i32; 2]> = Vec::with_capacity(n.saturating_sub(1));
+    for _ in 0..n.saturating_sub(1) {
         let mut fds = [0i32; 2];
         if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
             eprintln!("rush: pipe: {}", std::io::Error::last_os_error());
@@ -124,7 +120,8 @@ fn execute_pipeline(pipeline: &Pipeline<'_>) -> i32 {
         pipes.push(fds);
     }
 
-    let mut children: Vec<std::process::Child> = Vec::with_capacity(n);
+    let mut pids: Vec<libc::pid_t> = Vec::with_capacity(n);
+    let mut pgid: libc::pid_t = 0; // 最初の子の PID がグループリーダーになる
     let mut spawn_error = false;
     let mut error_status = 1i32;
 
@@ -148,15 +145,48 @@ fn execute_pipeline(pipeline: &Pipeline<'_>) -> i32 {
             command.stdout(unsafe { Stdio::from_raw_fd(fd) });
         }
 
-        // コマンド個別のリダイレクトで上書き可能
+        // コマンド個別のリダイレクト
         if let Err(status) = apply_redirects(&mut command, &cmd.redirects) {
             error_status = status;
             spawn_error = true;
             break;
         }
 
+        // pre_exec: プロセスグループ設定 + シグナルリセット
+        let pgid_for_child = pgid;
+        unsafe {
+            command.pre_exec(move || {
+                let target = if pgid_for_child == 0 {
+                    libc::getpid()
+                } else {
+                    pgid_for_child
+                };
+                libc::setpgid(0, target);
+                libc::signal(libc::SIGINT, libc::SIG_DFL);
+                libc::signal(libc::SIGTSTP, libc::SIG_DFL);
+                libc::signal(libc::SIGTTOU, libc::SIG_DFL);
+                libc::signal(libc::SIGTTIN, libc::SIG_DFL);
+                Ok(())
+            });
+        }
+
         match command.spawn() {
-            Ok(child) => children.push(child),
+            Ok(child) => {
+                let child_pid = child.id() as libc::pid_t;
+
+                // 親側でもプロセスグループを設定（レースコンディション防止）
+                if pgid == 0 {
+                    pgid = child_pid;
+                }
+                unsafe {
+                    libc::setpgid(child_pid, pgid);
+                }
+
+                pids.push(child_pid);
+
+                // Rust の Child を forget し、waitpid で手動 reap する
+                std::mem::forget(child);
+            }
             Err(e) => {
                 error_status = spawn_error_status(args[0], &e);
                 spawn_error = true;
@@ -165,7 +195,7 @@ fn execute_pipeline(pipeline: &Pipeline<'_>) -> i32 {
         }
     }
 
-    // 未消費の fd を close（エラー時に残る分）
+    // 未消費の fd を close
     for fds in &pipes {
         if fds[0] >= 0 {
             unsafe { libc::close(fds[0]) };
@@ -175,26 +205,47 @@ fn execute_pipeline(pipeline: &Pipeline<'_>) -> i32 {
         }
     }
 
-    // 全子プロセスを wait。最後のコマンドのステータスを返す。
-    let spawned_all = !spawn_error;
-    let mut last_status = error_status;
-    for mut child in children {
-        match child.wait() {
-            Ok(status) => {
-                if spawned_all {
-                    last_status = status.code().unwrap_or(128);
-                }
-            }
-            Err(e) => {
-                eprintln!("rush: wait: {}", e);
-                if spawned_all {
-                    last_status = 1;
-                }
+    if spawn_error {
+        // エラー時: 既に spawn したプロセスを待機してクリーンアップ
+        for &pid in &pids {
+            unsafe {
+                libc::waitpid(pid, std::ptr::null_mut(), 0);
             }
         }
+        return error_status;
     }
 
-    last_status
+    // コマンドテキストから末尾の & を除去した表示用文字列
+    let display_cmd = cmd_text.strip_suffix('&').unwrap_or(cmd_text).trim();
+
+    if pipeline.background {
+        // バックグラウンド: ジョブテーブルに追加
+        let job_id = shell.jobs.insert(pgid, display_cmd.to_string(), pids);
+        eprintln!("[{}] {}", job_id, pgid);
+        0
+    } else {
+        // フォアグラウンド: ターミナル制御を渡して待機
+        job::give_terminal_to(shell.terminal_fd, pgid);
+
+        let (status, stopped) = job::wait_for_fg(&mut shell.jobs, pgid);
+
+        // ターミナルをシェルに戻す
+        job::take_terminal_back(shell.terminal_fd, shell.shell_pgid);
+
+        if stopped {
+            // Ctrl+Z で停止: ジョブテーブルに追加
+            let job_id = shell.jobs.insert(pgid, display_cmd.to_string(), pids);
+            // 停止状態をマーク（insert 後のプロセスは stopped=false なので更新する）
+            if let Some(job) = shell.jobs.get_mut(job_id) {
+                for proc in &mut job.processes {
+                    proc.stopped = true;
+                }
+            }
+            eprintln!("\n[{}]+  Stopped   {}", job_id, display_cmd);
+        }
+
+        status
+    }
 }
 
 // ── リダイレクト適用 ─────────────────────────────────────────────────
@@ -245,20 +296,6 @@ fn apply_redirects(command: &mut Command, redirects: &[parser::Redirect<'_>]) ->
 }
 
 // ── ヘルパー ─────────────────────────────────────────────────────────
-
-/// 外部コマンドを spawn し、完了を待って終了ステータスを返す。
-fn spawn_and_wait(command: &mut Command, name: &str) -> i32 {
-    match command.spawn() {
-        Ok(mut child) => match child.wait() {
-            Ok(status) => status.code().unwrap_or(128),
-            Err(e) => {
-                eprintln!("rush: {}: {}", name, e);
-                1
-            }
-        },
-        Err(e) => spawn_error_status(name, &e),
-    }
-}
 
 /// spawn 失敗時のエラーメッセージ出力と終了コード決定。
 ///

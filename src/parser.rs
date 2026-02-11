@@ -9,6 +9,7 @@
 //! - リダイレクト: `>`, `>>`, `<`, `2>`
 //! - クォート: シングル (`'...'`) / ダブル (`"..."`)
 //! - 変数展開: `$VAR`, `$?`（ダブルクォート内・裸ワードで展開、シングルクォートではリテラル）
+//! - バックグラウンド実行: `cmd &`（パイプラインの末尾に `&` を指定）
 //!
 //! ## 未対応（将来拡張）
 //!
@@ -21,9 +22,13 @@ use std::fmt;
 // ── AST ─────────────────────────────────────────────────────────────
 
 /// パイプラインで接続されたコマンド列。`cmd1 | cmd2 | cmd3` → 3要素。
+///
+/// `background` が `true` のとき、executor はジョブをバックグラウンドで実行する。
 #[derive(Debug, PartialEq)]
 pub struct Pipeline<'a> {
     pub commands: Vec<Command<'a>>,
+    /// 末尾に `&` が指定された場合に `true`。
+    pub background: bool,
 }
 
 /// 単一コマンド。引数リストとリダイレクト指定を持つ。
@@ -65,8 +70,10 @@ pub enum ParseError {
     UnterminatedQuote(char),
     /// リダイレクト演算子の後にターゲットファイル名がない。
     MissingRedirectTarget,
-    /// パイプの前後にコマンドがない（`| ls`, `ls |`, `ls | | grep` 等）。
+    /// パイプまたは `&` の前にコマンドがない（`| ls`, `ls |`, `&` 等）。
     EmptyPipelineSegment,
+    /// `&` の後に余計なトークンがある（`cmd & extra` 等）。
+    UnexpectedToken,
 }
 
 impl fmt::Display for ParseError {
@@ -75,6 +82,7 @@ impl fmt::Display for ParseError {
             Self::UnterminatedQuote(c) => write!(f, "unexpected EOF while looking for matching `{c}`"),
             Self::MissingRedirectTarget => write!(f, "syntax error: missing redirect target"),
             Self::EmptyPipelineSegment => write!(f, "syntax error near unexpected token `|`"),
+            Self::UnexpectedToken => write!(f, "syntax error: unexpected token after `&`"),
         }
     }
 }
@@ -157,6 +165,7 @@ fn is_var_char(b: u8) -> bool {
 enum Token<'a> {
     Word(Cow<'a, str>),
     Pipe,
+    Ampersand,
     RedirectOut,
     RedirectAppend,
     RedirectIn,
@@ -205,6 +214,10 @@ impl<'a> Iterator for Tokenizer<'a> {
             b'|' => {
                 self.pos += 1;
                 Some(Ok(Token::Pipe))
+            }
+            b'&' => {
+                self.pos += 1;
+                Some(Ok(Token::Ampersand))
             }
             b'>' => {
                 self.pos += 1;
@@ -260,7 +273,7 @@ impl<'a> Iterator for Tokenizer<'a> {
                 let start = self.pos;
                 while self.pos < self.input.len() {
                     match self.input.as_bytes()[self.pos] {
-                        b' ' | b'\t' | b'\n' | b'\r' | b'|' | b'>' | b'<' | b'\'' | b'"' => {
+                        b' ' | b'\t' | b'\n' | b'\r' | b'|' | b'&' | b'>' | b'<' | b'\'' | b'"' => {
                             break;
                         }
                         _ => self.pos += 1,
@@ -287,6 +300,7 @@ pub fn parse(input: &str, last_status: i32) -> Result<Option<Pipeline<'_>>, Pars
     let mut commands: Vec<Command<'_>> = Vec::new();
     let mut args: Vec<Cow<'_, str>> = Vec::new();
     let mut redirects: Vec<Redirect<'_>> = Vec::new();
+    let mut background = false;
 
     while let Some(result) = tokens.next() {
         let token = result?;
@@ -300,6 +314,18 @@ pub fn parse(input: &str, last_status: i32) -> Result<Option<Pipeline<'_>>, Pars
                     args: std::mem::take(&mut args),
                     redirects: std::mem::take(&mut redirects),
                 });
+            }
+            Token::Ampersand => {
+                if args.is_empty() && commands.is_empty() {
+                    return Err(ParseError::EmptyPipelineSegment);
+                }
+                background = true;
+                // `&` の後にトークンがあればエラー
+                if let Some(result) = tokens.next() {
+                    let _ = result?; // propagate tokenizer errors
+                    return Err(ParseError::UnexpectedToken);
+                }
+                break;
             }
             _ => {
                 // Redirect token — next token must be a Word (target)
@@ -327,11 +353,15 @@ pub fn parse(input: &str, last_status: i32) -> Result<Option<Pipeline<'_>>, Pars
             return Ok(None); // 空入力
         }
         // 末尾パイプ or リダイレクトのみ（コマンドなし）
-        return Err(ParseError::EmptyPipelineSegment);
+        if !background {
+            return Err(ParseError::EmptyPipelineSegment);
+        }
     }
 
-    commands.push(Command { args, redirects });
-    Ok(Some(Pipeline { commands }))
+    if !args.is_empty() {
+        commands.push(Command { args, redirects });
+    }
+    Ok(Some(Pipeline { commands, background }))
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -539,6 +569,39 @@ mod tests {
     #[test]
     fn err_double_pipe() {
         assert_eq!(parse("ls | | grep", 0), Err(ParseError::EmptyPipelineSegment));
+    }
+
+    // ── background (&) ──
+
+    #[test]
+    fn background_simple() {
+        let p = parse("sleep 10 &", 0).unwrap().unwrap();
+        assert!(p.background);
+        assert_eq!(p.commands.len(), 1);
+        assert_eq!(p.commands[0].args[0], "sleep");
+    }
+
+    #[test]
+    fn background_pipeline() {
+        let p = parse("ls | grep foo &", 0).unwrap().unwrap();
+        assert!(p.background);
+        assert_eq!(p.commands.len(), 2);
+    }
+
+    #[test]
+    fn background_bare_ampersand() {
+        assert_eq!(parse("&", 0), Err(ParseError::EmptyPipelineSegment));
+    }
+
+    #[test]
+    fn background_extra_token() {
+        assert_eq!(parse("cmd & extra", 0), Err(ParseError::UnexpectedToken));
+    }
+
+    #[test]
+    fn no_background_flag() {
+        let p = parse("ls", 0).unwrap().unwrap();
+        assert!(!p.background);
     }
 
     // ── Cow はすべて Borrowed（展開不要時） ──

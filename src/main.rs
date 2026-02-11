@@ -3,15 +3,14 @@
 //! REPLループ: プロンプト表示 → 入力読み取り → パース → 実行 → ループ
 //!
 //! 現在の機能:
-//! - 手書きトークナイザ + パーサーによる構文解析（[`parser`]）
-//! - パイプライン接続（`libc::pipe` + `Stdio::from_raw_fd`）（[`executor`]）
-//! - ファイルリダイレクト（`>`, `>>`, `<`, `2>`）（[`executor`]）
-//! - シングルクォート / ダブルクォート（[`parser`]）
-//! - 変数展開: `$VAR`, `$?`（ダブルクォート内・裸ワードで展開）（[`parser`]）
-//! - ビルトイン: `exit`, `cd`, `pwd`, `echo`, `export`, `unset`（[`builtins`]）
+//! - 構文解析: パイプライン、リダイレクト、クォート、変数展開、`&`（[`parser`]）
+//! - コマンド実行: パイプライン接続、プロセスグループ管理、ジョブ制御（[`executor`]）
+//! - ビルトイン: `exit`, `cd`, `pwd`, `echo`, `export`, `unset`, `jobs`, `fg`, `bg`（[`builtins`]）
+//! - ジョブコントロール: バックグラウンド実行 (`&`)、Ctrl+Z サスペンド、`fg`/`bg` 復帰（[`job`]）
 
 mod builtins;
 mod executor;
+mod job;
 mod parser;
 mod shell;
 
@@ -20,10 +19,20 @@ use std::io::{self, BufRead, Write};
 use shell::Shell;
 
 fn main() {
-    // SIGINTを無視し、Ctrl+Cでシェル自体が終了しないようにする。
-    // 子プロセスは独自のシグナルハンドラを持つため、Ctrl+Cで正常に停止する。
+    // シグナル設定: シェル自体は SIGINT/SIGTSTP/SIGTTOU/SIGTTIN を無視する。
+    // 子プロセスは pre_exec で SIG_DFL にリセットされる。
     unsafe {
         libc::signal(libc::SIGINT, libc::SIG_IGN);
+        libc::signal(libc::SIGTSTP, libc::SIG_IGN);
+        libc::signal(libc::SIGTTOU, libc::SIG_IGN);
+        libc::signal(libc::SIGTTIN, libc::SIG_IGN);
+    }
+
+    // シェルを自身のプロセスグループリーダーにし、ターミナルを掌握する。
+    unsafe {
+        let shell_pid = libc::getpid();
+        libc::setpgid(shell_pid, shell_pid);
+        libc::tcsetpgrp(libc::STDIN_FILENO, shell_pid);
     }
 
     let mut shell = Shell::new();
@@ -36,6 +45,10 @@ fn main() {
     let mut line = String::new();
 
     loop {
+        // プロンプト前にバックグラウンドジョブを reap し、完了通知を出力
+        job::reap_jobs(&mut shell.jobs);
+        job::notify_and_clean(&mut shell.jobs);
+
         // プロンプト表示: 失敗時は終了ステータスを接頭辞に付ける
         if shell.last_status == 0 {
             let _ = write!(stdout, "rush$ ");
@@ -60,9 +73,11 @@ fn main() {
         }
 
         // パース: Pipeline<'_> は line を借用 → execute 後に drop → line.clear() は安全
+        // cmd_text はジョブテーブルの表示用コマンド文字列として execute に渡す
+        let cmd_text = line.trim().to_string();
         match parser::parse(&line, shell.last_status) {
             Ok(Some(pipeline)) => {
-                shell.last_status = executor::execute(&mut shell, &pipeline);
+                shell.last_status = executor::execute(&mut shell, &pipeline, &cmd_text);
             }
             Ok(None) => continue,
             Err(e) => {
