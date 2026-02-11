@@ -83,9 +83,13 @@
 
 ## Implementation Phases
 
-### Phase 1: Minimal REPL
-- プロンプト表示 → 入力読み取り → 外部コマンド実行
-- 最低限の動くシェル
+### Phase 1: Minimal REPL ✅
+- REPLループ (`main.rs`): プロンプト表示 → 入力読み取り → コマンド実行 → ループ
+- シェル状態管理 (`shell.rs`): 終了ステータスと終了フラグ
+- ビルトイン (`builtins.rs`): `exit [N]`, `cd [dir]`
+- コマンド実行 (`executor.rs`): ビルトイン優先 → `std::process::Command` で外部コマンド
+- SIGINTを無視してCtrl+Cからシェルを保護
+- プロンプトに終了ステータスを表示 (`[N] rush$ `)
 
 ### Phase 2: Parser
 - パイプライン (`cmd1 | cmd2 | cmd3`)
