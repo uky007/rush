@@ -41,7 +41,7 @@ pub fn is_builtin(name: &str) -> bool {
 pub fn try_exec(shell: &mut Shell, args: &[&str], stdout: &mut dyn Write) -> Option<i32> {
     match args[0] {
         "exit" => Some(builtin_exit(shell, args)),
-        "cd" => Some(builtin_cd(args)),
+        "cd" => Some(builtin_cd(args, stdout)),
         "pwd" => Some(builtin_pwd(stdout)),
         "echo" => Some(builtin_echo(args, stdout)),
         "export" => Some(builtin_export(args, stdout)),
@@ -68,12 +68,24 @@ fn builtin_exit(shell: &mut Shell, args: &[&str]) -> i32 {
 }
 
 /// `cd [dir]` — カレントディレクトリを変更する。引数省略時は `$HOME` に移動。
-fn builtin_cd(args: &[&str]) -> i32 {
-    let target = if args.len() > 1 {
-        args[1].to_string()
+/// `cd -` で OLDPWD に移動し、新ディレクトリを stdout に表示する。
+/// 成功時は `OLDPWD` 環境変数を更新する。
+fn builtin_cd(args: &[&str], stdout: &mut dyn Write) -> i32 {
+    let oldpwd = env::current_dir().ok().map(|p| p.to_string_lossy().to_string());
+
+    let (target, print_dir) = if args.len() > 1 && args[1] == "-" {
+        match env::var("OLDPWD") {
+            Ok(old) => (old, true),
+            Err(_) => {
+                eprintln!("rush: cd: OLDPWD not set");
+                return 1;
+            }
+        }
+    } else if args.len() > 1 {
+        (args[1].to_string(), false)
     } else {
         match env::var("HOME") {
-            Ok(home) => home,
+            Ok(home) => (home, false),
             Err(_) => {
                 eprintln!("rush: cd: HOME not set");
                 return 1;
@@ -85,6 +97,14 @@ fn builtin_cd(args: &[&str]) -> i32 {
         eprintln!("rush: cd: {}: {}", target, e);
         1
     } else {
+        if let Some(old) = oldpwd {
+            env::set_var("OLDPWD", &old);
+        }
+        if print_dir {
+            if let Ok(cwd) = env::current_dir() {
+                let _ = writeln!(stdout, "{}", cwd.display());
+            }
+        }
         0
     }
 }
@@ -492,5 +512,33 @@ mod tests {
         let status = try_exec(&mut shell, &["echo", "test"], &mut buf).unwrap();
         assert_eq!(status, 0);
         assert_eq!(String::from_utf8(buf).unwrap(), "test\n");
+    }
+
+    #[test]
+    fn cd_dash_returns_to_oldpwd() {
+        let orig = env::current_dir().unwrap();
+        let tmp = env::temp_dir();
+        // First cd to tmp to set OLDPWD
+        let mut buf = Vec::new();
+        builtin_cd(&["cd", tmp.to_str().unwrap()], &mut buf);
+        // Now cd - should return to orig
+        let mut buf2 = Vec::new();
+        let status = builtin_cd(&["cd", "-"], &mut buf2);
+        assert_eq!(status, 0);
+        let output = String::from_utf8(buf2).unwrap();
+        assert!(!output.trim().is_empty()); // should print the directory
+        // Restore
+        let _ = env::set_current_dir(&orig);
+    }
+
+    #[test]
+    fn cd_sets_oldpwd() {
+        let orig = env::current_dir().unwrap();
+        let tmp = env::temp_dir();
+        let mut buf = Vec::new();
+        builtin_cd(&["cd", tmp.to_str().unwrap()], &mut buf);
+        let oldpwd = env::var("OLDPWD").unwrap();
+        assert_eq!(oldpwd, orig.to_string_lossy());
+        let _ = env::set_current_dir(&orig);
     }
 }
