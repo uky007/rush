@@ -200,9 +200,16 @@ impl JobTable {
 /// `waitpid(-pgid, WUNTRACED)` をループし、プロセスグループ内の全プロセスが
 /// 完了または停止するまでブロックする。
 ///
+/// ジョブテーブルに登録済みのジョブ（パイプライン）は [`mark_pid`](JobTable::mark_pid) で
+/// 各プロセスの状態を更新し、全体の完了/停止を判定する。
+/// フォアグラウンド単発コマンドはジョブテーブルに未登録のため、
+/// `waitpid` の `raw_status` から `WIFEXITED`/`WIFSIGNALED`/`WIFSTOPPED` で
+/// 直接終了ステータスを抽出する。
+///
 /// 戻り値: `(終了ステータス, 停止したか)`。
 /// 停止時のステータスは 148（128 + SIGTSTP）。
 pub fn wait_for_fg(jobs: &mut JobTable, pgid: pid_t) -> (i32, bool) {
+    let mut last_raw_status: i32 = 0;
     loop {
         let mut raw_status: i32 = 0;
         let pid = unsafe { libc::waitpid(-pgid, &mut raw_status, libc::WUNTRACED) };
@@ -211,6 +218,7 @@ pub fn wait_for_fg(jobs: &mut JobTable, pgid: pid_t) -> (i32, bool) {
             break;
         }
 
+        last_raw_status = raw_status;
         jobs.mark_pid(pid, raw_status);
 
         // ジョブの全プロセスの状態を確認
@@ -222,11 +230,30 @@ pub fn wait_for_fg(jobs: &mut JobTable, pgid: pid_t) -> (i32, bool) {
                 JobStatus::Running => continue,
             }
         } else {
+            // フォアグラウンドジョブはジョブテーブルに登録されていないため、
+            // raw_status から直接ステータスを抽出する
+            if libc::WIFSTOPPED(raw_status) {
+                return (148, true);
+            }
+            if libc::WIFEXITED(raw_status) {
+                return (libc::WEXITSTATUS(raw_status), false);
+            }
+            if libc::WIFSIGNALED(raw_status) {
+                return (128 + libc::WTERMSIG(raw_status), false);
+            }
             break;
         }
     }
 
-    (1, false)
+    // waitpid が即座に返った場合（プロセスが既に終了済み）
+    if libc::WIFEXITED(last_raw_status) {
+        return (libc::WEXITSTATUS(last_raw_status), false);
+    }
+    if libc::WIFSIGNALED(last_raw_status) {
+        return (128 + libc::WTERMSIG(last_raw_status), false);
+    }
+
+    (0, false)
 }
 
 /// 非ブロッキングでバックグラウンドジョブを reap する。

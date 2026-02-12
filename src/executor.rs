@@ -1,5 +1,8 @@
 //! コマンド実行: コマンドリスト条件付き実行、ビルトイン判定、リダイレクト適用、
-//! パイプライン接続、展開パイプライン（コマンド置換 → チルダ → ブレース → glob）、ジョブ制御。
+//! パイプライン接続、展開パイプライン（コマンド置換 → チルダ → ブレース → glob）、ジョブ制御、
+//! `if`/`then`/`elif`/`else`/`fi` 複合コマンド。
+//!
+//! ## パイプライン実行
 //!
 //! - [`execute`]: コマンドリスト（`&&`/`||`/`;`）全体を条件付きで実行
 //! - 単一ビルトイン（非 background、非 FdDup）: fork なしの高速パス（[`execute_builtin`]）
@@ -9,6 +12,23 @@
 //!   - fd 複製（`2>&1` 等）は `extra_dup2s` で spawn に渡す
 //!   - foreground: `tcsetpgrp` でターミナル制御を渡し、`waitpid(WUNTRACED)` で待機
 //!   - background: ジョブテーブルに登録して即座に返る
+//!
+//! ## 複合コマンド (`if`/`then`/`elif`/`else`/`fi`)
+//!
+//! テキストベースのアプローチで実装。既存の AST を変更せず、
+//! if ブロック全体を文字列として収集してから専用関数で解釈・実行する。
+//!
+//! - [`execute_if_block`]: if ブロックのエントリポイント。テキストをセクション分割し条件評価
+//! - [`collect_if_block`]: 行配列から `if`〜`fi` の範囲を収集（ネスト深さ追跡）
+//! - [`starts_with_if`]: 行が `if` キーワードで始まるかの判定
+//!
+//! 対応構文:
+//! ```sh
+//! if command; then body; fi
+//! if command; then body; else body; fi
+//! if command; then body; elif command; then body; else body; fi
+//! # ネスト・複数行にも対応
+//! ```
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -768,6 +788,510 @@ fn execute_job(shell: &mut Shell, pipeline: &Pipeline<'_>, cmd_text: &str) -> i3
     }
 }
 
+// ── if/then/elif/else/fi 複合コマンド ────────────────────────────────
+
+/// テキストベースで if ブロック全体を解釈・実行する。
+///
+/// 処理フロー:
+/// 1. トークン列を `if` / `then` / `elif` / `else` / `fi` で分割
+/// 2. 条件部分をパース＆実行し、ステータス 0 なら本体を実行
+/// 3. elif チェーン、else 部分を順に評価
+/// 4. 最終ステータスを返す（どの分岐も実行されなければ 0）
+pub fn execute_if_block(shell: &mut Shell, block: &str) -> i32 {
+    // if ブロックをセクションに分割
+    let sections = match parse_if_sections(block) {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln!("rush: {}", msg);
+            return 2;
+        }
+    };
+
+    // if 条件を評価
+    let cond_status = run_command_string(shell, &sections.condition);
+    if cond_status == 0 {
+        return run_command_string(shell, &sections.then_body);
+    }
+
+    // elif チェーン
+    for (elif_cond, elif_body) in &sections.elif_parts {
+        let s = run_command_string(shell, elif_cond);
+        if s == 0 {
+            return run_command_string(shell, elif_body);
+        }
+    }
+
+    // else
+    if let Some(ref else_body) = sections.else_body {
+        return run_command_string(shell, else_body);
+    }
+
+    0
+}
+
+/// if ブロックの各セクションを保持する構造体。
+///
+/// [`parse_if_sections`] が if ブロックテキストを解析した結果を格納する。
+/// 各フィールドは実行可能なコマンド文字列（改行区切り）。
+struct IfSections {
+    /// `if` と `then` の間の条件コマンド。
+    condition: String,
+    /// `then` 以降（`elif`/`else`/`fi` の前）の本体コマンド。
+    then_body: String,
+    /// `elif` 部分のリスト。各要素は `(条件, 本体)` のペア。
+    elif_parts: Vec<(String, String)>,
+    /// `else` 部分。存在しない場合は `None`。
+    else_body: Option<String>,
+}
+
+/// if ブロックのテキストを解析し、各セクション（condition, then, elif, else）に分割する。
+///
+/// 入力は `if ... fi` の完全なブロック。ネストした if/fi も正しく追跡する。
+fn parse_if_sections(block: &str) -> Result<IfSections, String> {
+    let tokens = tokenize_block(block);
+
+    let mut depth = 0i32;
+    let mut state = IfParseState::BeforeIf;
+    let mut condition = String::new();
+    let mut then_body = String::new();
+    let mut elif_parts: Vec<(String, String)> = Vec::new();
+    let mut else_body: Option<String> = None;
+    let mut current_elif_cond = String::new();
+
+    for token in &tokens {
+        let trimmed = token.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let keyword = extract_keyword(trimmed);
+
+        match keyword {
+            Some("if") if matches!(state, IfParseState::BeforeIf) => {
+                state = IfParseState::InCondition;
+                let after_if = trimmed.strip_prefix("if").unwrap().trim();
+                if !after_if.is_empty() {
+                    append_to_section(&mut state, after_if, &mut condition, &mut then_body,
+                        &mut elif_parts, &mut else_body, &mut current_elif_cond);
+                }
+            }
+            Some("if") => {
+                // ネストした if
+                depth += 1;
+                append_to_section(&mut state, trimmed, &mut condition, &mut then_body,
+                    &mut elif_parts, &mut else_body, &mut current_elif_cond);
+            }
+            Some("fi") if depth > 0 => {
+                depth -= 1;
+                append_to_section(&mut state, trimmed, &mut condition, &mut then_body,
+                    &mut elif_parts, &mut else_body, &mut current_elif_cond);
+            }
+            Some("fi") => {
+                // ブロック終了
+                break;
+            }
+            Some("then") if depth == 0 => {
+                match state {
+                    IfParseState::InCondition => {
+                        state = IfParseState::InThenBody;
+                        let after_then = trimmed.strip_prefix("then").unwrap().trim();
+                        if !after_then.is_empty() {
+                            append_to_section(&mut state, after_then, &mut condition, &mut then_body,
+                                &mut elif_parts, &mut else_body, &mut current_elif_cond);
+                        }
+                    }
+                    IfParseState::InElifCond => {
+                        state = IfParseState::InElifBody;
+                        elif_parts.push((current_elif_cond.clone(), String::new()));
+                        current_elif_cond.clear();
+                        let after_then = trimmed.strip_prefix("then").unwrap().trim();
+                        if !after_then.is_empty() {
+                            append_to_section(&mut state, after_then, &mut condition, &mut then_body,
+                                &mut elif_parts, &mut else_body, &mut current_elif_cond);
+                        }
+                    }
+                    _ => {
+                        append_to_section(&mut state, trimmed, &mut condition, &mut then_body,
+                            &mut elif_parts, &mut else_body, &mut current_elif_cond);
+                    }
+                }
+            }
+            Some("elif") if depth == 0 => {
+                state = IfParseState::InElifCond;
+                let after_elif = trimmed.strip_prefix("elif").unwrap().trim();
+                if !after_elif.is_empty() {
+                    append_to_section(&mut state, after_elif, &mut condition, &mut then_body,
+                        &mut elif_parts, &mut else_body, &mut current_elif_cond);
+                }
+            }
+            Some("else") if depth == 0 => {
+                state = IfParseState::InElseBody;
+                else_body = Some(String::new());
+                let after_else = trimmed.strip_prefix("else").unwrap().trim();
+                if !after_else.is_empty() {
+                    append_to_section(&mut state, after_else, &mut condition, &mut then_body,
+                        &mut elif_parts, &mut else_body, &mut current_elif_cond);
+                }
+            }
+            _ => {
+                append_to_section(&mut state, trimmed, &mut condition, &mut then_body,
+                    &mut elif_parts, &mut else_body, &mut current_elif_cond);
+            }
+        }
+    }
+
+    if condition.is_empty() {
+        return Err("syntax error: missing condition after `if`".to_string());
+    }
+    if matches!(state, IfParseState::InCondition | IfParseState::BeforeIf) {
+        return Err("syntax error: missing `then` keyword".to_string());
+    }
+
+    Ok(IfSections {
+        condition,
+        then_body,
+        elif_parts,
+        else_body,
+    })
+}
+
+/// [`parse_if_sections`] の状態遷移マシン。
+///
+/// トークンを走査しながら以下の順で遷移する:
+/// `BeforeIf` → `InCondition` → `InThenBody` → (`InElifCond` → `InElifBody`)* → `InElseBody`?
+enum IfParseState {
+    /// `if` キーワード出現前の初期状態。
+    BeforeIf,
+    /// `if` と `then` の間（条件部分を蓄積中）。
+    InCondition,
+    /// `then` 以降の本体を蓄積中。
+    InThenBody,
+    /// `elif` と次の `then` の間（elif 条件を蓄積中）。
+    InElifCond,
+    /// `elif ... then` 以降の本体を蓄積中。
+    InElifBody,
+    /// `else` 以降の本体を蓄積中。
+    InElseBody,
+}
+
+/// 現在の解析状態に応じて、適切なセクション文字列の末尾にテキストを追加する。
+///
+/// 複数行のセクション内容は `\n` で連結される。
+fn append_to_section(
+    state: &mut IfParseState,
+    text: &str,
+    condition: &mut String,
+    then_body: &mut String,
+    elif_parts: &mut Vec<(String, String)>,
+    else_body: &mut Option<String>,
+    current_elif_cond: &mut String,
+) {
+    let target = match state {
+        IfParseState::BeforeIf => return,
+        IfParseState::InCondition => condition,
+        IfParseState::InThenBody => then_body,
+        IfParseState::InElifCond => current_elif_cond,
+        IfParseState::InElifBody => {
+            if let Some((_, ref mut body)) = elif_parts.last_mut() {
+                body
+            } else {
+                return;
+            }
+        }
+        IfParseState::InElseBody => {
+            if let Some(ref mut body) = else_body {
+                body
+            } else {
+                return;
+            }
+        }
+    };
+    if !target.is_empty() {
+        target.push('\n');
+    }
+    target.push_str(text);
+}
+
+/// if ブロックテキストをステートメント単位のトークン列に分割する。
+///
+/// `;` と改行 (`\n`) を区切りとして使い、各トークンは 1 つのステートメント
+/// （キーワード付き or コマンド）に対応する。
+/// シングル/ダブルクォート内の `;` や改行は区切りとして扱わない。
+///
+/// 例: `"if true; then echo yes; fi"` → `["if true", "then echo yes", "fi"]`
+fn tokenize_block(block: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let bytes = block.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        match bytes[i] {
+            b'\'' => {
+                current.push('\'');
+                i += 1;
+                while i < len && bytes[i] != b'\'' {
+                    current.push(bytes[i] as char);
+                    i += 1;
+                }
+                if i < len {
+                    current.push('\'');
+                    i += 1;
+                }
+            }
+            b'"' => {
+                current.push('"');
+                i += 1;
+                while i < len && bytes[i] != b'"' {
+                    if bytes[i] == b'\\' && i + 1 < len {
+                        current.push(bytes[i] as char);
+                        i += 1;
+                        current.push(bytes[i] as char);
+                        i += 1;
+                    } else {
+                        current.push(bytes[i] as char);
+                        i += 1;
+                    }
+                }
+                if i < len {
+                    current.push('"');
+                    i += 1;
+                }
+            }
+            b'\n' | b';' => {
+                let trimmed = current.trim().to_string();
+                if !trimmed.is_empty() {
+                    tokens.push(trimmed);
+                }
+                current.clear();
+                i += 1;
+            }
+            _ => {
+                current.push(bytes[i] as char);
+                i += 1;
+            }
+        }
+    }
+
+    let trimmed = current.trim().to_string();
+    if !trimmed.is_empty() {
+        tokens.push(trimmed);
+    }
+
+    tokens
+}
+
+/// トークンの先頭がシェルキーワード (`if`, `then`, `elif`, `else`, `fi`) かを判定する。
+///
+/// キーワードがトークンと完全一致するか、キーワードの直後に空白または `;` が
+/// 続く場合にキーワードとして認識する。`ifdef` や `finally` のような
+/// キーワードを含む非キーワードは認識しない。
+fn extract_keyword(token: &str) -> Option<&'static str> {
+    for kw in &["if", "then", "elif", "else", "fi"] {
+        if token == *kw {
+            return Some(kw);
+        }
+        if token.starts_with(kw) {
+            let rest = &token[kw.len()..];
+            if rest.starts_with(char::is_whitespace) || rest.starts_with(';') {
+                return Some(kw);
+            }
+        }
+    }
+    None
+}
+
+/// コマンド文字列を行単位でパース・実行する内部ヘルパー。
+///
+/// if ブロックの条件部分・本体部分を実行するために使用する。
+/// 複数行入力・ネストした if ブロックにも対応し、各行を
+/// [`parser::parse`] → [`execute`] で順次実行する。
+/// 最後に実行されたコマンドの終了ステータスを返す。
+fn run_command_string(shell: &mut Shell, input: &str) -> i32 {
+    let lines: Vec<&str> = input.lines().collect();
+    let mut last_status = 0;
+    let mut i = 0;
+
+    while i < lines.len() {
+        let trimmed = lines[i].trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            i += 1;
+            continue;
+        }
+
+        // ネストした if ブロックを検出
+        if starts_with_if(trimmed) {
+            let (block, next_i) = collect_if_block(&lines, i);
+            last_status = execute_if_block(shell, &block);
+            shell.last_status = last_status;
+            i = next_i;
+            continue;
+        }
+
+        match parser::parse(trimmed, shell.last_status) {
+            Ok(Some(list)) => {
+                let cmd_text = trimmed.to_string();
+                last_status = execute(shell, &list, &cmd_text);
+                shell.last_status = last_status;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("rush: {}", e);
+                return 2;
+            }
+        }
+        if shell.should_return || shell.should_exit {
+            return last_status;
+        }
+
+        i += 1;
+    }
+    last_status
+}
+
+/// 行が `if` キーワードで始まるかどうかを判定する。
+///
+/// 先頭空白を除去した後、`if` の直後に空白・タブがあるか、
+/// `if` のみの行であれば `true` を返す。
+/// `ifdef` や `ifconfig` のような `if` を含む非キーワードは `false`。
+pub fn starts_with_if(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed == "if" || trimmed.starts_with("if ") || trimmed.starts_with("if\t")
+}
+
+/// 行配列から if ブロック全体（`if`〜`fi`）を収集する。
+///
+/// `lines[start]` は最初の `if` キーワードを含む行。
+/// ネストした `if`/`fi` を深さカウントで追跡し、対応する `fi` が見つかるまで
+/// 行を `\n` で連結する。
+///
+/// 戻り値: `(収集したブロック文字列, 次に処理すべき行インデックス)`。
+/// `fi` が見つからなかった場合は入力末尾まで収集する。
+pub fn collect_if_block(lines: &[&str], start: usize) -> (String, usize) {
+    let mut depth = 0i32;
+    let mut block = String::new();
+    let mut i = start;
+
+    while i < lines.len() {
+        let line = lines[i];
+        if !block.is_empty() {
+            block.push('\n');
+        }
+        block.push_str(line);
+
+        // キーワードの出現をカウント（クォート内は無視）
+        for token in shell_tokens(line.trim()) {
+            match token {
+                "if" => depth += 1,
+                "fi" => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return (block, i + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        i += 1;
+    }
+
+    (block, i)
+}
+
+/// 行をシェルトークンに分割する（公開版）。
+///
+/// REPL の if ブロック収集で `if`/`fi` キーワードの出現をカウントするために使用。
+/// 内部の [`shell_tokens`] を呼び出す薄いラッパー。
+pub fn shell_tokens_pub(line: &str) -> Vec<&str> {
+    shell_tokens(line)
+}
+
+/// 行をシェルの単語単位に分割する。
+///
+/// キーワード（`if`, `fi` 等）の検出と if/fi のネスト深さ追跡に使用。
+/// 空白とタブで単語を区切り、`;` はセパレータとして消費する。
+/// シングル/ダブルクォート内のテキストは 1 トークンとしてスキップし、
+/// クォート内の空白・`;` は区切りとして扱わない。
+fn shell_tokens(line: &str) -> Vec<&str> {
+    let mut tokens = Vec::new();
+    let bytes = line.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        // 空白スキップ
+        while i < len && (bytes[i] == b' ' || bytes[i] == b'\t') {
+            i += 1;
+        }
+        if i >= len {
+            break;
+        }
+
+        match bytes[i] {
+            b';' => {
+                i += 1;
+            }
+            b'\'' => {
+                let start = i;
+                i += 1;
+                while i < len && bytes[i] != b'\'' {
+                    i += 1;
+                }
+                if i < len {
+                    i += 1;
+                }
+                tokens.push(&line[start..i]);
+            }
+            b'"' => {
+                let start = i;
+                i += 1;
+                while i < len && bytes[i] != b'"' {
+                    if bytes[i] == b'\\' && i + 1 < len {
+                        i += 1;
+                    }
+                    i += 1;
+                }
+                if i < len {
+                    i += 1;
+                }
+                tokens.push(&line[start..i]);
+            }
+            _ => {
+                let start = i;
+                while i < len && bytes[i] != b' ' && bytes[i] != b'\t' && bytes[i] != b';' {
+                    if bytes[i] == b'\'' {
+                        i += 1;
+                        while i < len && bytes[i] != b'\'' {
+                            i += 1;
+                        }
+                        if i < len {
+                            i += 1;
+                        }
+                    } else if bytes[i] == b'"' {
+                        i += 1;
+                        while i < len && bytes[i] != b'"' {
+                            if bytes[i] == b'\\' && i + 1 < len {
+                                i += 1;
+                            }
+                            i += 1;
+                        }
+                        if i < len {
+                            i += 1;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+                tokens.push(&line[start..i]);
+            }
+        }
+    }
+
+    tokens
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -835,5 +1359,163 @@ mod tests {
             expand_braces("file{1..3}.txt"),
             vec!["file1.txt", "file2.txt", "file3.txt"],
         );
+    }
+
+    // ── if/then/fi テスト ────────────────────────────────────────────
+
+    #[test]
+    fn starts_with_if_basic() {
+        assert!(starts_with_if("if true; then echo yes; fi"));
+        assert!(starts_with_if("if false; then echo no; fi"));
+        assert!(starts_with_if("  if true; then echo yes; fi"));
+        assert!(!starts_with_if("echo if"));
+        assert!(!starts_with_if("ifdef"));
+        assert!(!starts_with_if("ifconfig"));
+    }
+
+    #[test]
+    fn shell_tokens_basic() {
+        assert_eq!(shell_tokens("if true; then echo yes; fi"),
+            vec!["if", "true", "then", "echo", "yes", "fi"]);
+    }
+
+    #[test]
+    fn shell_tokens_quoted() {
+        assert_eq!(shell_tokens("echo 'hello world'"),
+            vec!["echo", "'hello world'"]);
+        assert_eq!(shell_tokens("echo \"hello world\""),
+            vec!["echo", "\"hello world\""]);
+    }
+
+    #[test]
+    fn collect_if_block_oneliner() {
+        let lines = vec!["if true; then echo yes; fi"];
+        let (block, next) = collect_if_block(&lines, 0);
+        assert_eq!(block, "if true; then echo yes; fi");
+        assert_eq!(next, 1);
+    }
+
+    #[test]
+    fn collect_if_block_multiline() {
+        let lines = vec!["if true", "then", "echo yes", "fi", "echo after"];
+        let (block, next) = collect_if_block(&lines, 0);
+        assert_eq!(block, "if true\nthen\necho yes\nfi");
+        assert_eq!(next, 4);
+    }
+
+    #[test]
+    fn collect_if_block_nested() {
+        let lines = vec![
+            "if true; then",
+            "  if false; then",
+            "    echo inner",
+            "  fi",
+            "fi",
+            "echo after",
+        ];
+        let (block, next) = collect_if_block(&lines, 0);
+        assert!(block.contains("fi\nfi"));
+        assert_eq!(next, 5);
+    }
+
+    #[test]
+    fn parse_if_sections_basic() {
+        let sections = parse_if_sections("if true; then echo yes; fi").unwrap();
+        assert_eq!(sections.condition.trim(), "true");
+        assert_eq!(sections.then_body.trim(), "echo yes");
+        assert!(sections.elif_parts.is_empty());
+        assert!(sections.else_body.is_none());
+    }
+
+    #[test]
+    fn parse_if_sections_else() {
+        let sections = parse_if_sections("if false; then echo no; else echo yes; fi").unwrap();
+        assert_eq!(sections.condition.trim(), "false");
+        assert_eq!(sections.then_body.trim(), "echo no");
+        assert!(sections.elif_parts.is_empty());
+        assert_eq!(sections.else_body.as_deref().unwrap().trim(), "echo yes");
+    }
+
+    #[test]
+    fn parse_if_sections_elif() {
+        let sections = parse_if_sections(
+            "if false; then echo first; elif true; then echo second; else echo third; fi"
+        ).unwrap();
+        assert_eq!(sections.condition.trim(), "false");
+        assert_eq!(sections.then_body.trim(), "echo first");
+        assert_eq!(sections.elif_parts.len(), 1);
+        assert_eq!(sections.elif_parts[0].0.trim(), "true");
+        assert_eq!(sections.elif_parts[0].1.trim(), "echo second");
+        assert_eq!(sections.else_body.as_deref().unwrap().trim(), "echo third");
+    }
+
+    #[test]
+    fn parse_if_sections_multiline() {
+        let block = "if true\nthen\necho hello\necho world\nfi";
+        let sections = parse_if_sections(block).unwrap();
+        assert_eq!(sections.condition.trim(), "true");
+        assert!(sections.then_body.contains("echo hello"));
+        assert!(sections.then_body.contains("echo world"));
+    }
+
+    #[test]
+    fn execute_if_block_true() {
+        let mut shell = Shell::new();
+        let status = execute_if_block(&mut shell, "if true; then echo yes; fi");
+        assert_eq!(status, 0);
+    }
+
+    #[test]
+    fn execute_if_block_false_with_else() {
+        let mut shell = Shell::new();
+        let status = execute_if_block(&mut shell, "if false; then echo no; else true; fi");
+        assert_eq!(status, 0);
+    }
+
+    #[test]
+    fn execute_if_block_false_no_else() {
+        let mut shell = Shell::new();
+        let status = execute_if_block(&mut shell, "if false; then echo no; fi");
+        assert_eq!(status, 0); // no branch executed → 0
+    }
+
+    #[test]
+    fn execute_if_block_elif() {
+        let mut shell = Shell::new();
+        let status = execute_if_block(&mut shell,
+            "if false; then false; elif true; then true; fi");
+        assert_eq!(status, 0);
+    }
+
+    #[test]
+    fn tokenize_block_basic() {
+        let tokens = tokenize_block("if true; then echo yes; fi");
+        assert_eq!(tokens, vec!["if true", "then echo yes", "fi"]);
+    }
+
+    #[test]
+    fn tokenize_block_multiline() {
+        let tokens = tokenize_block("if true\nthen\necho yes\nfi");
+        assert_eq!(tokens, vec!["if true", "then", "echo yes", "fi"]);
+    }
+
+    #[test]
+    fn tokenize_block_quoted_semicolons() {
+        let tokens = tokenize_block("echo 'hello;world'; echo done");
+        assert_eq!(tokens, vec!["echo 'hello;world'", "echo done"]);
+    }
+
+    #[test]
+    fn extract_keyword_basic() {
+        assert_eq!(extract_keyword("if"), Some("if"));
+        assert_eq!(extract_keyword("if true"), Some("if"));
+        assert_eq!(extract_keyword("then"), Some("then"));
+        assert_eq!(extract_keyword("then echo"), Some("then"));
+        assert_eq!(extract_keyword("elif"), Some("elif"));
+        assert_eq!(extract_keyword("else"), Some("else"));
+        assert_eq!(extract_keyword("fi"), Some("fi"));
+        assert_eq!(extract_keyword("echo"), None);
+        assert_eq!(extract_keyword("ifdef"), None);
+        assert_eq!(extract_keyword("finally"), None);
     }
 }

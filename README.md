@@ -75,9 +75,9 @@
 | モジュール | 責務 | 高速化手法 |
 |-----------|------|-----------|
 | `parser` | 入力をAST（コマンド列）に変換。変数展開、パラメータ展開、算術展開、継続行検出 | ゼロコピー (`Cow::Borrowed`) |
-| `executor` | コマンド実行・パイプライン接続。展開パイプライン: コマンド置換 → チルダ → ブレース → glob | ビルトイン in-process、スタック配列 |
+| `executor` | コマンド実行・パイプライン接続・`if`/`elif`/`else`/`fi` 複合コマンド。展開パイプライン: コマンド置換 → チルダ → ブレース → glob | ビルトイン in-process、スタック配列 |
 | `spawn` | 外部コマンドの起動 (`posix_spawnp`)。fd 複製 (`2>&1`) 対応 | fork+exec 回避、RAII ラッパー |
-| `builtins` | cd, pwd, echo, export, unset, source, read, exec, wait, type, command, builtin 等 20 種 | fork 不要、直接実行 |
+| `builtins` | cd, pwd, echo, export, unset, source, read, exec, wait, type, command, builtin 等 27 種 | fork 不要、直接実行 |
 | `job` | ジョブコントロール (bg/fg/jobs/wait) | waitpid 手動 reap |
 | `editor` | 行編集 (raw モード、Ctrl+R 逆方向検索、Tab 補完、シンタックスハイライト) | libc 直接操作、1 回の write(2) |
 | `highlight` | シンタックスハイライト・PATH キャッシュ | HashSet キャッシュ、変更検出 |
@@ -169,6 +169,7 @@
 - **プロンプトカスタマイズ `$PROMPT`**: `\u`（ユーザー）, `\h`（ホスト）, `\w`（CWD）, `\W`（ベース名）, `\$`（`$`/`#`）, `\?`（非ゼロステータス）
 - **履歴展開 `!!`/`!N`/`!-N`/`!prefix`**: 直前コマンド、番号指定、末尾からの相対指定、プレフィックス検索
 - **`trap` ビルトイン**: `trap 'cmd' SIGNAL` でシグナルハンドラ設定、一覧表示、`-` でリセット
+- **`if`/`then`/`elif`/`else`/`fi` 複合コマンド**: 条件分岐（`test`/`[` との組合せ、ネスト対応、ワンライナー・複数行両対応）
 
 ## Speed Comparison Targets
 

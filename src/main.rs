@@ -10,6 +10,7 @@
 //! - `~/.rushrc` 読み込み
 //! - 非インタラクティブモード（`rush -c 'cmd'`、`rush script.sh`）
 //! - プロンプトカスタマイズ（`$PROMPT` 環境変数: `\u`/`\h`/`\w`/`\W`/`\$`/`\?`）
+//! - `if`/`then`/`elif`/`else`/`fi` 複合コマンド（ネスト対応、ワンライナー・複数行両対応）
 //!
 //! ## モジュール構成
 //!
@@ -20,8 +21,8 @@
 //! | [`complete`] | Tab 補完（コマンド名、ファイル名、`&&`/`||`/`;` 後のコマンド位置認識） |
 //! | [`highlight`] | シンタックスハイライト（ANSI カラー、PATH キャッシュ、`$(cmd)`/`2>&1` 対応） |
 //! | [`parser`] | 構文解析（パイプライン、リダイレクト、クォート、変数展開、パラメータ展開、算術展開、継続行検出） |
-//! | [`executor`] | コマンド実行（条件付き実行、展開パイプライン: コマンド置換 → チルダ → ブレース → glob） |
-//! | [`builtins`] | ビルトイン（`cd`, `echo`, `export`, `alias`, `source`, `read`, `exec`, `wait` 等 20 種） |
+//! | [`executor`] | コマンド実行（条件付き実行、展開パイプライン、`if`/`elif`/`else`/`fi` 複合コマンド） |
+//! | [`builtins`] | ビルトイン（`cd`, `echo`, `export`, `alias`, `source`, `read`, `exec`, `wait` 等 27 種） |
 //! | [`glob`] | パス名展開（`*`, `?` によるファイル名マッチング、パラメータ展開のパターン共有） |
 //! | [`job`] | ジョブコントロール（バックグラウンド実行、Ctrl+Z サスペンド、`fg`/`bg` 復帰） |
 //! | [`shell`] | シェルのグローバル状態（終了ステータス、ジョブテーブル、エイリアスマップ） |
@@ -54,21 +55,7 @@ fn load_rc(shell: &mut Shell) {
         Ok(c) => c,
         Err(_) => return, // ファイルなし → サイレントスキップ
     };
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        let expanded = expand_alias(trimmed, &shell.aliases);
-        match parser::parse(&expanded, shell.last_status) {
-            Ok(Some(list)) => {
-                let cmd_text = expanded.trim().to_string();
-                shell.last_status = executor::execute(shell, &list, &cmd_text);
-            }
-            Ok(None) => {}
-            Err(e) => eprintln!("rush: ~/.rushrc: {}", e),
-        }
-    }
+    run_string(shell, &content);
 }
 
 /// `history` / `history N` / `history -c` を処理する。
@@ -344,7 +331,11 @@ fn expand_alias(line: &str, aliases: &HashMap<String, String>) -> String {
     }
 }
 
-/// 文字列を 1 行ずつ（または単一コマンドとして）パースして実行する。
+/// 文字列を 1 行ずつパースして実行する。
+///
+/// `if` で始まる行を検出すると、対応する `fi` まで行を収集して
+/// [`executor::execute_if_block`] で複合コマンドとして実行する。
+/// ヒアドキュメントの本文収集にも対応。
 fn run_string(shell: &mut Shell, input: &str) {
     let lines: Vec<&str> = input.lines().collect();
     let mut i = 0;
@@ -355,6 +346,20 @@ fn run_string(shell: &mut Shell, input: &str) {
             continue;
         }
         let expanded = expand_alias(trimmed, &shell.aliases);
+
+        // if ブロックの検出: `if` で始まる行を見つけたら `fi` まで収集
+        if executor::starts_with_if(&expanded) {
+            // i-1 は現在行、lines の i-1 から収集を開始
+            // ただし expanded はエイリアス展開後なので元の lines を使う
+            let (block, next_i) = executor::collect_if_block(&lines, i - 1);
+            shell.last_status = executor::execute_if_block(shell, &block);
+            i = next_i;
+            if shell.should_exit {
+                break;
+            }
+            continue;
+        }
+
         match parser::parse(&expanded, shell.last_status) {
             Ok(Some(mut list)) => {
                 // ヒアドキュメントの本文を収集
@@ -494,6 +499,45 @@ fn main() {
                     let cmd_trimmed = accumulated.trim();
                     if cmd_trimmed == "history" || cmd_trimmed.starts_with("history ") {
                         shell.last_status = handle_history(&mut editor, cmd_trimmed);
+                        break;
+                    }
+
+                    // if 複合コマンド: `if` で始まる入力を検出したら、
+                    // `> ` プロンプトで `fi` まで対話的に行を収集し、
+                    // ブロック全体を execute_if_block() で実行する。
+                    // ネストした if/fi も深さカウントで正しく追跡する。
+                    if executor::starts_with_if(accumulated.trim()) {
+                        let mut block = accumulated.clone();
+                        let mut depth = 0i32;
+                        for token in executor::shell_tokens_pub(block.trim()) {
+                            match token {
+                                "if" => depth += 1,
+                                "fi" => depth -= 1,
+                                _ => {}
+                            }
+                        }
+                        while depth > 0 {
+                            match editor.read_line("> ") {
+                                Some(next) => {
+                                    block.push('\n');
+                                    block.push_str(&next);
+                                    for token in executor::shell_tokens_pub(next.trim()) {
+                                        match token {
+                                            "if" => depth += 1,
+                                            "fi" => depth -= 1,
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                                None => {
+                                    println!();
+                                    break;
+                                }
+                            }
+                        }
+                        if depth == 0 {
+                            shell.last_status = executor::execute_if_block(&mut shell, &block);
+                        }
                         break;
                     }
 

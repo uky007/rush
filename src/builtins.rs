@@ -11,7 +11,7 @@
 //! - 環境変数: `export`, `unset`, `read`（`-p` プロンプト、IFS 分割、`REPLY`）
 //! - ジョブコントロール: `jobs`, `fg`, `bg`, `wait`
 //! - エイリアス: `alias`, `unalias`（`-a` 全削除）
-//! - スクリプト: `source` / `.`（ファイル行単位実行）
+//! - スクリプト: `source` / `.`（ファイル行単位実行、`if`/`fi` 複合コマンド対応）
 //! - 情報: `type`
 //! - 実行制御: `command`（`-v` パス表示、エイリアスバイパス）, `builtin`（ビルトイン限定実行）
 //! - フロー制御: `true` / `:`（常に 0）, `false`（常に 1）, `return`（source からの早期脱出）
@@ -658,7 +658,7 @@ fn builtin_return(shell: &mut Shell, args: &[&str]) -> i32 {
 // ── source / . ──────────────────────────────────────────────────────
 
 /// `source file` / `. file` — ファイルを現在のシェルコンテキストで行単位実行する。
-/// `return` による早期脱出をサポート。
+/// `return` による早期脱出をサポート。if/then/elif/else/fi ブロックに対応。
 fn builtin_source(shell: &mut Shell, args: &[&str]) -> i32 {
     if args.len() < 2 {
         eprintln!("rush: {}: filename argument required", args[0]);
@@ -673,11 +673,27 @@ fn builtin_source(shell: &mut Shell, args: &[&str]) -> i32 {
         }
     };
     shell.source_depth += 1;
-    for line in content.lines() {
-        let trimmed = line.trim();
+    let lines: Vec<&str> = content.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let trimmed = lines[i].trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
+            i += 1;
             continue;
         }
+
+        // if ブロック検出
+        if executor::starts_with_if(trimmed) {
+            let (block, next_i) = executor::collect_if_block(&lines, i);
+            shell.last_status = executor::execute_if_block(shell, &block);
+            i = next_i;
+            if shell.should_return {
+                shell.should_return = false;
+                break;
+            }
+            continue;
+        }
+
         match parser::parse(trimmed, shell.last_status) {
             Ok(Some(list)) => {
                 let cmd_text = trimmed.to_string();
@@ -690,6 +706,7 @@ fn builtin_source(shell: &mut Shell, args: &[&str]) -> i32 {
             shell.should_return = false;
             break;
         }
+        i += 1;
     }
     shell.source_depth -= 1;
     shell.last_status
