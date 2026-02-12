@@ -28,7 +28,8 @@ use crate::{executor, parser};
 /// - [`complete`](crate::complete): ビルトイン名のリストを補完候補に使用（`BUILTINS` 定数と同期）
 pub fn is_builtin(name: &str) -> bool {
     matches!(name, "exit" | "cd" | "pwd" | "echo" | "export" | "unset"
-                 | "jobs" | "fg" | "bg" | "type" | "source" | ".")
+                 | "jobs" | "fg" | "bg" | "type" | "source" | "."
+                 | "alias" | "unalias")
 }
 
 /// ビルトインコマンドの実行を試みる。
@@ -52,6 +53,8 @@ pub fn try_exec(shell: &mut Shell, args: &[&str], stdout: &mut dyn Write) -> Opt
         "bg" => Some(builtin_bg(shell, args)),
         "type" => Some(builtin_type(args, stdout)),
         "source" | "." => Some(builtin_source(shell, args)),
+        "alias" => Some(builtin_alias(shell, args, stdout)),
+        "unalias" => Some(builtin_unalias(shell, args)),
         _ => None,
     }
 }
@@ -358,6 +361,55 @@ fn builtin_bg(shell: &mut Shell, args: &[&str]) -> i32 {
     }
 
     eprintln!("[{}]+ {} &", job_id, command);
+    0
+}
+
+// ── alias / unalias ─────────────────────────────────────────────────
+
+/// `alias [name=value ...]` — エイリアスを定義・一覧表示する。
+/// 引数なしなら全エイリアスをソート済みで表示。
+fn builtin_alias(shell: &mut Shell, args: &[&str], stdout: &mut dyn Write) -> i32 {
+    if args.len() <= 1 {
+        let mut aliases: Vec<_> = shell.aliases.iter().collect();
+        aliases.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, value) in aliases {
+            let _ = writeln!(stdout, "alias {}='{}'", name, value);
+        }
+        return 0;
+    }
+    for arg in &args[1..] {
+        if let Some(eq_pos) = arg.find('=') {
+            let name = &arg[..eq_pos];
+            let value = &arg[eq_pos + 1..];
+            shell.aliases.insert(name.to_string(), value.to_string());
+        } else {
+            // alias name → 特定エイリアスを表示
+            if let Some(value) = shell.aliases.get(*arg) {
+                let _ = writeln!(stdout, "alias {}='{}'", arg, value);
+            } else {
+                eprintln!("rush: alias: {}: not found", arg);
+                return 1;
+            }
+        }
+    }
+    0
+}
+
+/// `unalias [-a] name ...` — エイリアスを削除する。`-a` で全削除。
+fn builtin_unalias(shell: &mut Shell, args: &[&str]) -> i32 {
+    if args.len() <= 1 {
+        eprintln!("rush: unalias: usage: unalias [-a] name [name ...]");
+        return 2;
+    }
+    if args[1] == "-a" {
+        shell.aliases.clear();
+        return 0;
+    }
+    for arg in &args[1..] {
+        if shell.aliases.remove(*arg).is_none() {
+            eprintln!("rush: unalias: {}: not found", arg);
+        }
+    }
     0
 }
 

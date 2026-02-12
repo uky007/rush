@@ -30,6 +30,8 @@ mod parser;
 mod shell;
 mod spawn;
 
+use std::collections::HashMap;
+
 use shell::Shell;
 
 /// `~/.rushrc` を読み込んで各行を実行する。ファイルが存在しなければサイレントスキップ。
@@ -48,14 +50,45 @@ fn load_rc(shell: &mut Shell) {
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        match parser::parse(trimmed, shell.last_status) {
+        let expanded = expand_alias(trimmed, &shell.aliases);
+        match parser::parse(&expanded, shell.last_status) {
             Ok(Some(list)) => {
-                let cmd_text = trimmed.to_string();
+                let cmd_text = expanded.trim().to_string();
                 shell.last_status = executor::execute(shell, &list, &cmd_text);
             }
             Ok(None) => {}
             Err(e) => eprintln!("rush: ~/.rushrc: {}", e),
         }
+    }
+}
+
+/// エイリアス展開: 行の最初のワードがエイリアスならその値に置換する。
+/// 再帰ガード付き（同じエイリアスは 1 回のみ展開）。
+fn expand_alias(line: &str, aliases: &HashMap<String, String>) -> String {
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() {
+        return line.to_string();
+    }
+    let word_end = trimmed
+        .find(|c: char| c.is_whitespace())
+        .unwrap_or(trimmed.len());
+    let first_word = &trimmed[..word_end];
+    let rest = &trimmed[word_end..];
+
+    if let Some(value) = aliases.get(first_word) {
+        // 再帰ガード: 展開結果の最初の単語が同じエイリアスなら停止
+        let expanded_first = value
+            .split_whitespace()
+            .next()
+            .unwrap_or("");
+        if expanded_first == first_word {
+            return line.to_string();
+        }
+        let new_line = format!("{}{}", value, rest);
+        // 再帰展開（別のエイリアスが先頭に来る場合）
+        expand_alias(&new_line, aliases)
+    } else {
+        line.to_string()
     }
 }
 
@@ -98,6 +131,8 @@ fn main() {
         match editor.read_line(&prompt) {
             Some(line) if !line.trim().is_empty() => {
                 editor.add_history(&line);
+                // エイリアス展開（コマンド位置の最初の単語のみ、再帰ガード付き）
+                let line = expand_alias(&line, &shell.aliases);
                 // パース: CommandList<'_> は line を借用 → execute 後に drop
                 // cmd_text はジョブテーブルの表示用コマンド文字列として execute に渡す
                 let cmd_text = line.trim().to_string();

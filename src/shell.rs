@@ -8,6 +8,8 @@
 //! エディタの PathCache はハイライト・補完用で `read_line` 呼び出し毎にリフレッシュされ、
 //! Shell の PathCache は executor での将来的な PATH 検索最適化用に保持される。
 
+use std::collections::HashMap;
+
 use libc::pid_t;
 
 use crate::highlight::PathCache;
@@ -28,6 +30,8 @@ pub struct Shell {
     /// `$PATH` 内コマンドのキャッシュ。executor での PATH 検索最適化用（将来使用予定）。
     #[allow(dead_code)]
     pub path_cache: PathCache,
+    /// エイリアスマップ。`alias name=value` で定義される。
+    pub aliases: HashMap<String, String>,
 }
 
 impl Shell {
@@ -40,6 +44,7 @@ impl Shell {
             shell_pgid,
             terminal_fd: libc::STDIN_FILENO,
             path_cache: PathCache::new(),
+            aliases: HashMap::new(),
         }
     }
 }
