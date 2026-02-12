@@ -1,11 +1,11 @@
-//! Tab 補完（コマンド名、ファイル名）。
+//! Tab 補完（コマンド名、ファイル名、`&&`/`||`/`;` 後のコマンド位置認識）。
 //!
-//! カーソル位置の単語を抽出し、パイプラインセグメント内での位置に応じて
+//! カーソル位置の単語を抽出し、コマンドリスト・パイプライン内での位置に応じて
 //! コマンド名補完またはファイル名補完を行う。
 //!
 //! ## 補完の種類
 //!
-//! - **コマンド名補完**（行頭 or `|` の後の最初の単語）:
+//! - **コマンド名補完**（行頭 or `|`/`&&`/`||`/`;` の後の最初の単語）:
 //!   ビルトイン一覧 + `$PATH` 内の実行可能ファイルから候補を収集
 //! - **ファイル名補完**（それ以外の位置）:
 //!   カレントディレクトリまたは指定ディレクトリのファイル名から候補を収集
@@ -60,9 +60,13 @@ fn current_word(buf: &str, cursor: usize) -> (usize, &str, bool) {
         .unwrap_or(0);
     let word = &buf[word_start..cursor];
 
-    // パイプの後 or 行頭ならコマンド位置
+    // パイプ / &&  / || / ; の後 or 行頭ならコマンド位置
     let prefix = buf[..word_start].trim_end();
-    let is_command = prefix.is_empty() || prefix.ends_with('|');
+    let is_command = prefix.is_empty()
+        || prefix.ends_with('|')
+        || prefix.ends_with("&&")
+        || prefix.ends_with("||")
+        || prefix.ends_with(';');
 
     (word_start, word, is_command)
 }

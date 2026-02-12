@@ -8,11 +8,12 @@
 //! |-----------|------|
 //! | [`editor`] | 行エディタ（raw モード、キー入力、バッファ操作、表示更新） |
 //! | [`history`] | コマンド履歴（`~/.rush_history` 永続化、↑↓ ナビゲーション） |
-//! | [`complete`] | Tab 補完（コマンド名、ファイル名） |
-//! | [`highlight`] | シンタックスハイライト（ANSI カラー、PATH キャッシュ） |
-//! | [`parser`] | 構文解析（パイプライン、リダイレクト、クォート、変数展開、`&`） |
-//! | [`executor`] | コマンド実行（パイプライン接続、プロセスグループ管理） |
+//! | [`complete`] | Tab 補完（コマンド名、ファイル名、`&&`/`||`/`;` 後のコマンド位置認識） |
+//! | [`highlight`] | シンタックスハイライト（ANSI カラー、PATH キャッシュ、`&&`/`||`/`;`/`${VAR}` 対応） |
+//! | [`parser`] | 構文解析（コマンドリスト `&&`/`||`/`;`、パイプライン、リダイレクト、クォート、エスケープ、変数展開 `$VAR`/`${VAR}`/`$?`、`&`） |
+//! | [`executor`] | コマンド実行（コマンドリスト条件付き実行、パイプライン接続、glob 展開、プロセスグループ管理） |
 //! | [`builtins`] | ビルトイン（`exit`, `cd`, `pwd`, `echo`, `export`, `unset`, `jobs`, `fg`, `bg`） |
+//! | [`glob`] | パス名展開（`*`, `?` によるファイル名マッチング） |
 //! | [`job`] | ジョブコントロール（バックグラウンド実行、Ctrl+Z サスペンド、`fg`/`bg` 復帰） |
 //! | [`shell`] | シェルのグローバル状態（終了ステータス、ジョブテーブル、プロセスグループ） |
 //! | [`spawn`] | `posix_spawnp` ラッパー（外部コマンド起動の高速化） |
@@ -21,6 +22,7 @@ mod builtins;
 mod complete;
 mod editor;
 mod executor;
+mod glob;
 mod highlight;
 mod history;
 mod job;
@@ -68,12 +70,12 @@ fn main() {
         match editor.read_line(&prompt) {
             Some(line) if !line.trim().is_empty() => {
                 editor.add_history(&line);
-                // パース: Pipeline<'_> は line を借用 → execute 後に drop
+                // パース: CommandList<'_> は line を借用 → execute 後に drop
                 // cmd_text はジョブテーブルの表示用コマンド文字列として execute に渡す
                 let cmd_text = line.trim().to_string();
                 match parser::parse(&line, shell.last_status) {
-                    Ok(Some(pipeline)) => {
-                        shell.last_status = executor::execute(&mut shell, &pipeline, &cmd_text);
+                    Ok(Some(list)) => {
+                        shell.last_status = executor::execute(&mut shell, &list, &cmd_text);
                     }
                     Ok(None) => continue,
                     Err(e) => {

@@ -1,4 +1,4 @@
-//! rush ベンチマーク: パーサー、ビルトイン、spawn、フルパイプラインの計測。
+//! rush ベンチマーク: パーサー、ビルトイン、spawn、フルパイプライン、glob の計測。
 //!
 //! `std::time::Instant` による手動計測（外部クレート不要）。
 //!
@@ -86,6 +86,14 @@ fn main() {
         let _ = rush::parser::parse("sleep 1 &", 0);
     }));
 
+    results.push(bench("parser", "echo hello && echo world", 10_000, || {
+        let _ = rush::parser::parse("echo hello && echo world", 0);
+    }));
+
+    results.push(bench("parser", "a || b ; c && d", 10_000, || {
+        let _ = rush::parser::parse("a || b ; c && d", 0);
+    }));
+
     for r in &results {
         r.print();
     }
@@ -133,9 +141,22 @@ fn main() {
     println!("\n--- Full pipeline (parse + spawn + wait) ---");
 
     results.push(bench("full", "/bin/echo hello > /dev/null", 1_000, || {
-        if let Ok(Some(pipeline)) = rush::parser::parse("/bin/echo hello > /dev/null", 0) {
-            rush::executor::execute(&mut shell, &pipeline, "/bin/echo hello > /dev/null");
+        if let Ok(Some(list)) = rush::parser::parse("/bin/echo hello > /dev/null", 0) {
+            rush::executor::execute(&mut shell, &list, "/bin/echo hello > /dev/null");
         }
+    }));
+
+    for r in &results {
+        r.print();
+    }
+
+    // ── glob ベンチマーク ──
+    println!("\n--- Glob ---");
+
+    results.clear();
+
+    results.push(bench("glob", "expand *.rs", 1_000, || {
+        let _ = rush::glob::expand("*.rs");
     }));
 
     for r in &results {

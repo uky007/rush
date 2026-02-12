@@ -1,7 +1,10 @@
-//! コマンド実行: ビルトイン判定、リダイレクト適用、パイプライン接続、ジョブ制御。
+//! コマンド実行: コマンドリスト条件付き実行、ビルトイン判定、リダイレクト適用、
+//! パイプライン接続、glob 展開、ジョブ制御。
 //!
+//! - [`execute`]: コマンドリスト（`&&`/`||`/`;`）全体を条件付きで実行
 //! - 単一ビルトイン（非 background）: fork なしの高速パス（[`execute_builtin`]）
 //! - それ以外: 統一 spawn パス（[`execute_job`]）
+//!   - 各コマンドの引数を [`glob::expand_args`] でパス名展開してから実行
 //!   - `posix_spawnp` でプロセスグループ設定 + シグナル `SIG_DFL` リセット
 //!   - foreground: `tcsetpgrp` でターミナル制御を渡し、`waitpid(WUNTRACED)` で待機
 //!   - background: ジョブテーブルに登録して即座に返る
@@ -11,27 +14,51 @@ use std::io;
 use std::os::unix::io::IntoRawFd;
 
 use crate::builtins;
+use crate::glob;
 use crate::job;
-use crate::parser::{self, Pipeline, RedirectKind};
+use crate::parser::{self, CommandList, Connector, Pipeline, RedirectKind};
 use crate::shell::Shell;
 use crate::spawn;
 
-/// パイプライン全体を実行し、終了ステータスを返す。
+/// コマンドリスト全体を実行し、終了ステータスを返す。
 ///
 /// `cmd_text` は元のコマンド文字列で、ジョブテーブルの表示用に使用される。
+///
+/// 各パイプラインを接続子（`&&`, `||`, `;`）に基づいて条件付きで実行する。
+pub fn execute(shell: &mut Shell, list: &CommandList<'_>, cmd_text: &str) -> i32 {
+    // バックグラウンドジョブを reap
+    job::reap_jobs(&mut shell.jobs);
+
+    let mut last_status = 0;
+
+    for (i, item) in list.items.iter().enumerate() {
+        // 前の接続子に基づく条件判定
+        if i > 0 {
+            match list.items[i - 1].connector {
+                Connector::And if last_status != 0 => continue,
+                Connector::Or if last_status == 0 => continue,
+                _ => {}
+            }
+        }
+
+        last_status = execute_pipeline(shell, &item.pipeline, cmd_text);
+    }
+
+    last_status
+}
+
+/// 単一パイプラインを実行し、終了ステータスを返す。
 ///
 /// ディスパッチ:
 /// 1. 単一ビルトイン（非 background） → [`execute_builtin`]（fork なし高速パス）
 /// 2. それ以外（外部コマンド、パイプライン、ビルトイン + `&`） → [`execute_job`]
-pub fn execute(shell: &mut Shell, pipeline: &Pipeline<'_>, cmd_text: &str) -> i32 {
-    // バックグラウンドジョブを reap
-    job::reap_jobs(&mut shell.jobs);
-
+fn execute_pipeline(shell: &mut Shell, pipeline: &Pipeline<'_>, cmd_text: &str) -> i32 {
     // 単一ビルトイン（非 background）→ fork なしの高速パス
     if pipeline.commands.len() == 1 && !pipeline.background {
-        let args: Vec<&str> = pipeline.commands[0].args.iter().map(|a| a.as_ref()).collect();
+        let expanded = glob::expand_args(&pipeline.commands[0].args);
+        let args: Vec<&str> = expanded.iter().map(|s| s.as_str()).collect();
         if builtins::is_builtin(args[0]) {
-            return execute_builtin(shell, &pipeline.commands[0]);
+            return execute_builtin(shell, &pipeline.commands[0], &expanded);
         }
     }
 
@@ -44,8 +71,8 @@ pub fn execute(shell: &mut Shell, pipeline: &Pipeline<'_>, cmd_text: &str) -> i3
 ///
 /// stdout リダイレクトがあればファイルを開いてから実行する。
 /// `&` 付きビルトインはこのパスを通らず [`execute_job`] で外部コマンドとして spawn される。
-fn execute_builtin(shell: &mut Shell, cmd: &parser::Command<'_>) -> i32 {
-    let args: Vec<&str> = cmd.args.iter().map(|a| a.as_ref()).collect();
+fn execute_builtin(shell: &mut Shell, cmd: &parser::Command<'_>, expanded_args: &[String]) -> i32 {
+    let args: Vec<&str> = expanded_args.iter().map(|s| s.as_str()).collect();
     match open_builtin_stdout(&cmd.redirects) {
         Ok(Some(mut file)) => builtins::try_exec(shell, &args, &mut file).unwrap(),
         Ok(None) => builtins::try_exec(shell, &args, &mut io::stdout()).unwrap(),
@@ -216,7 +243,10 @@ fn execute_job(shell: &mut Shell, pipeline: &Pipeline<'_>, cmd_text: &str) -> i3
 
     for i in 0..n {
         let cmd = &pipeline.commands[i];
-        let args: Vec<&str> = cmd.args.iter().map(|a| a.as_ref()).collect();
+
+        // glob 展開
+        let expanded = glob::expand_args(&cmd.args);
+        let args: Vec<&str> = expanded.iter().map(|s| s.as_str()).collect();
 
         // stdin/stdout の決定（パイプ接続）
         let mut stdin_fd: Option<i32> = None;
