@@ -9,6 +9,7 @@
 //! - 継続行入力（末尾 `\`・未完了パイプ/演算子・未閉クォートで `> ` プロンプト）
 //! - `~/.rushrc` 読み込み
 //! - 非インタラクティブモード（`rush -c 'cmd'`、`rush script.sh`）
+//! - プロンプトカスタマイズ（`$PROMPT` 環境変数: `\u`/`\h`/`\w`/`\W`/`\$`/`\?`）
 //!
 //! ## モジュール構成
 //!
@@ -102,6 +103,118 @@ fn handle_history(editor: &mut editor::LineEditor, cmd: &str) -> i32 {
             }
             0
         }
+    }
+}
+
+/// プロンプトを構築する。`$PROMPT` 環境変数が設定されていればエスケープ展開する。
+///
+/// 対応エスケープ:
+/// - `\u` — ユーザー名
+/// - `\h` — ホスト名（最初の `.` まで）
+/// - `\w` — カレントディレクトリ（`~` 省略）
+/// - `\W` — カレントディレクトリのベース名
+/// - `\$` — root なら `#`、それ以外は `$`
+/// - `\?` — 直前の終了ステータス（非ゼロ時のみ表示）
+/// - `\\` — リテラル `\`
+fn build_prompt(last_status: i32) -> String {
+    match std::env::var("PROMPT") {
+        Ok(fmt) => expand_prompt(&fmt, last_status),
+        Err(_) => {
+            if last_status == 0 {
+                "rush$ ".to_string()
+            } else {
+                format!("[{}] rush$ ", last_status)
+            }
+        }
+    }
+}
+
+fn expand_prompt(fmt: &str, last_status: i32) -> String {
+    let mut result = String::new();
+    let bytes = fmt.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            match bytes[i + 1] {
+                b'u' => {
+                    result.push_str(&std::env::var("USER").unwrap_or_else(|_| "user".into()));
+                    i += 2;
+                }
+                b'h' => {
+                    let host = hostname();
+                    if let Some(dot) = host.find('.') {
+                        result.push_str(&host[..dot]);
+                    } else {
+                        result.push_str(&host);
+                    }
+                    i += 2;
+                }
+                b'w' => {
+                    let cwd = std::env::current_dir()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    let home = std::env::var("HOME").unwrap_or_default();
+                    if !home.is_empty() && cwd.starts_with(&home) {
+                        result.push('~');
+                        result.push_str(&cwd[home.len()..]);
+                    } else {
+                        result.push_str(&cwd);
+                    }
+                    i += 2;
+                }
+                b'W' => {
+                    let cwd = std::env::current_dir()
+                        .map(|p| p.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    let base = cwd.rsplit('/').next().unwrap_or(&cwd);
+                    let home = std::env::var("HOME").unwrap_or_default();
+                    if cwd == home {
+                        result.push('~');
+                    } else {
+                        result.push_str(base);
+                    }
+                    i += 2;
+                }
+                b'$' => {
+                    if unsafe { libc::getuid() } == 0 {
+                        result.push('#');
+                    } else {
+                        result.push('$');
+                    }
+                    i += 2;
+                }
+                b'?' => {
+                    if last_status != 0 {
+                        result.push_str(&format!("[{}]", last_status));
+                    }
+                    i += 2;
+                }
+                b'\\' => {
+                    result.push('\\');
+                    i += 2;
+                }
+                _ => {
+                    result.push('\\');
+                    i += 1;
+                }
+            }
+        } else {
+            result.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    result
+}
+
+/// ホスト名を取得する。
+fn hostname() -> String {
+    let mut buf = [0u8; 256];
+    let ret = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    if ret == 0 {
+        let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        String::from_utf8_lossy(&buf[..len]).to_string()
+    } else {
+        "localhost".to_string()
     }
 }
 
@@ -242,12 +355,8 @@ fn main() {
         job::reap_jobs(&mut shell.jobs);
         job::notify_and_clean(&mut shell.jobs);
 
-        // プロンプト構築: 終了ステータスが非ゼロなら接頭辞に付ける
-        let prompt = if shell.last_status == 0 {
-            "rush$ ".to_string()
-        } else {
-            format!("[{}] rush$ ", shell.last_status)
-        };
+        // プロンプト構築: $PROMPT が設定されていればエスケープ展開、なければデフォルト
+        let prompt = build_prompt(shell.last_status);
 
         // 行エディタで 1 行読み取る（raw モード → Enter で確定 → cooked モードに復帰）
         match editor.read_line(&prompt) {
