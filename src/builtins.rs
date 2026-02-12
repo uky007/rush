@@ -29,7 +29,8 @@ use crate::{executor, parser};
 pub fn is_builtin(name: &str) -> bool {
     matches!(name, "exit" | "cd" | "pwd" | "echo" | "export" | "unset"
                  | "jobs" | "fg" | "bg" | "type" | "source" | "."
-                 | "alias" | "unalias" | "history")
+                 | "alias" | "unalias" | "history"
+                 | "command" | "builtin")
 }
 
 /// ビルトインコマンドの実行を試みる。
@@ -55,6 +56,8 @@ pub fn try_exec(shell: &mut Shell, args: &[&str], stdout: &mut dyn Write) -> Opt
         "source" | "." => Some(builtin_source(shell, args)),
         "alias" => Some(builtin_alias(shell, args, stdout)),
         "unalias" => Some(builtin_unalias(shell, args)),
+        "command" => Some(builtin_command(shell, args, stdout)),
+        "builtin" => Some(builtin_builtin(shell, args, stdout)),
         _ => None,
     }
 }
@@ -362,6 +365,58 @@ fn builtin_bg(shell: &mut Shell, args: &[&str]) -> i32 {
 
     eprintln!("[{}]+ {} &", job_id, command);
     0
+}
+
+// ── command / builtin ────────────────────────────────────────────────
+
+/// `command [-v] name [args...]` — エイリアスをバイパスしてコマンドを実行する。
+/// `command -v name` はコマンドのパスまたは "builtin" を表示する。
+fn builtin_command(shell: &mut Shell, args: &[&str], stdout: &mut dyn Write) -> i32 {
+    if args.len() < 2 {
+        return 0;
+    }
+    if args[1] == "-v" {
+        // command -v: コマンドの所在を表示
+        if args.len() < 3 {
+            return 1;
+        }
+        let name = args[2];
+        if is_builtin(name) {
+            let _ = writeln!(stdout, "{}", name);
+            0
+        } else if let Some(path) = find_in_path(name) {
+            let _ = writeln!(stdout, "{}", path);
+            0
+        } else {
+            1
+        }
+    } else {
+        // command name args: ビルトインとして試行し、なければ外部コマンドとして実行
+        // executor 側で alias をスキップして実行するため、ここではビルトインのみ試行
+        let sub_args = &args[1..];
+        if let Some(status) = try_exec(shell, sub_args, stdout) {
+            status
+        } else {
+            // 外部コマンドとして実行 — executor に委ねるため 127 を返す
+            // （実際には executor がこれを処理する）
+            eprintln!("rush: {}: command not found", sub_args[0]);
+            127
+        }
+    }
+}
+
+/// `builtin name [args...]` — ビルトインコマンドのみ実行する。外部コマンドならエラー。
+fn builtin_builtin(shell: &mut Shell, args: &[&str], stdout: &mut dyn Write) -> i32 {
+    if args.len() < 2 {
+        return 0;
+    }
+    let sub_args = &args[1..];
+    if let Some(status) = try_exec(shell, sub_args, stdout) {
+        status
+    } else {
+        eprintln!("rush: builtin: {}: not a shell builtin", sub_args[0]);
+        1
+    }
 }
 
 // ── alias / unalias ─────────────────────────────────────────────────
