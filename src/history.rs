@@ -116,6 +116,23 @@ impl History {
         }
     }
 
+    /// 全エントリへの参照を返す（`history` ビルトイン用）。
+    pub fn entries(&self) -> &[String] {
+        &self.entries
+    }
+
+    /// エントリ数を返す。
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// 履歴をクリアする（`history -c` 用）。
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.nav_index = 0;
+    }
+
     /// ↓: 一つ次のエントリを返す。末尾到達時は saved_buf を復元。
     pub fn next(&mut self) -> Option<&str> {
         if self.nav_index < self.entries.len() {

@@ -29,7 +29,7 @@ use crate::{executor, parser};
 pub fn is_builtin(name: &str) -> bool {
     matches!(name, "exit" | "cd" | "pwd" | "echo" | "export" | "unset"
                  | "jobs" | "fg" | "bg" | "type" | "source" | "."
-                 | "alias" | "unalias")
+                 | "alias" | "unalias" | "history")
 }
 
 /// ビルトインコマンドの実行を試みる。

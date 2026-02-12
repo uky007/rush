@@ -62,6 +62,41 @@ fn load_rc(shell: &mut Shell) {
     }
 }
 
+/// `history` / `history N` / `history -c` を処理する。
+/// editor が履歴を所有しているため main.rs で特別扱いする。
+fn handle_history(editor: &mut editor::LineEditor, cmd: &str) -> i32 {
+    let args: Vec<&str> = cmd.split_whitespace().collect();
+    match args.get(1).copied() {
+        Some("-c") => {
+            editor.history_mut().clear();
+            0
+        }
+        Some(n_str) => match n_str.parse::<usize>() {
+            Ok(n) => {
+                let history = editor.history();
+                let entries = history.entries();
+                let start = entries.len().saturating_sub(n);
+                for (i, entry) in entries[start..].iter().enumerate() {
+                    println!("{:5}  {}", start + i + 1, entry);
+                }
+                0
+            }
+            Err(_) => {
+                eprintln!("rush: history: {}: numeric argument required", n_str);
+                2
+            }
+        },
+        None => {
+            let history = editor.history();
+            let entries = history.entries();
+            for (i, entry) in entries.iter().enumerate() {
+                println!("{:5}  {}", i + 1, entry);
+            }
+            0
+        }
+    }
+}
+
 /// エイリアス展開: 行の最初のワードがエイリアスならその値に置換する。
 /// 再帰ガード付き（同じエイリアスは 1 回のみ展開）。
 fn expand_alias(line: &str, aliases: &HashMap<String, String>) -> String {
@@ -133,6 +168,15 @@ fn main() {
                 editor.add_history(&line);
                 // エイリアス展開（コマンド位置の最初の単語のみ、再帰ガード付き）
                 let line = expand_alias(&line, &shell.aliases);
+
+                // history ビルトイン: editor へのアクセスが必要なため main.rs で特別扱い
+                let trimmed = line.trim();
+                if trimmed == "history" || trimmed.starts_with("history ") {
+                    shell.last_status = handle_history(&mut editor, trimmed);
+                    if shell.should_exit { break; }
+                    continue;
+                }
+
                 // パース: CommandList<'_> は line を借用 → execute 後に drop
                 // cmd_text はジョブテーブルの表示用コマンド文字列として execute に渡す
                 let cmd_text = line.trim().to_string();

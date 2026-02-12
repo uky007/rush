@@ -308,6 +308,16 @@ impl LineEditor {
         self.history.add(line);
     }
 
+    /// 履歴への不変参照を返す（`history` ビルトイン用）。
+    pub fn history(&self) -> &History {
+        &self.history
+    }
+
+    /// 履歴への可変参照を返す（`history -c` 用）。
+    pub fn history_mut(&mut self) -> &mut History {
+        &mut self.history
+    }
+
     /// プロンプトを表示し、1 行読み取る。
     /// Enter → `Some(line)`, Ctrl+D (空バッファ) → `None` (EOF)。
     pub fn read_line(&mut self, prompt: &str) -> Option<String> {
