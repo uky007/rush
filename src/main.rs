@@ -218,6 +218,102 @@ fn hostname() -> String {
     }
 }
 
+/// 履歴展開: `!!`, `!N`, `!-N`, `!prefix` を展開する。
+///
+/// - `!!` — 直前のコマンドに置換
+/// - `!N` — 履歴番号 N のコマンドに置換
+/// - `!-N` — 末尾から N 番目のコマンドに置換
+/// - `!prefix` — prefix で始まる最新のコマンドに置換
+/// - シングルクォート内の `!` は展開しない
+fn expand_history(line: &str, history: &history::History) -> Result<String, String> {
+    if !line.contains('!') {
+        return Ok(line.to_string());
+    }
+
+    let bytes = line.as_bytes();
+    let mut result = String::new();
+    let mut i = 0;
+    let mut in_single_quote = false;
+
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            in_single_quote = !in_single_quote;
+            result.push('\'');
+            i += 1;
+            continue;
+        }
+
+        if in_single_quote || bytes[i] != b'!' {
+            result.push(bytes[i] as char);
+            i += 1;
+            continue;
+        }
+
+        // `!` を検出
+        i += 1; // skip '!'
+        if i >= bytes.len() {
+            result.push('!');
+            break;
+        }
+
+        match bytes[i] {
+            b'!' => {
+                // `!!` — 直前のコマンド
+                match history.last_entry() {
+                    Some(entry) => result.push_str(entry),
+                    None => return Err("!!: event not found".to_string()),
+                }
+                i += 1;
+            }
+            b'-' if i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() => {
+                // `!-N` — 末尾から N 番目
+                i += 1; // skip '-'
+                let start = i;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                let n: usize = line[start..i].parse().unwrap_or(0);
+                let entries = history.entries();
+                if n == 0 || n > entries.len() {
+                    return Err(format!("!-{}: event not found", n));
+                }
+                result.push_str(&entries[entries.len() - n]);
+            }
+            b if b.is_ascii_digit() => {
+                // `!N` — 履歴番号 N
+                let start = i;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                let n: usize = line[start..i].parse().unwrap_or(0);
+                match history.get(n) {
+                    Some(entry) => result.push_str(entry),
+                    None => return Err(format!("!{}: event not found", n)),
+                }
+            }
+            b if b.is_ascii_alphabetic() || b == b'_' => {
+                // `!prefix` — prefix で始まる最新のコマンド
+                let start = i;
+                while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+                    i += 1;
+                }
+                let prefix = &line[start..i];
+                let entries = history.entries();
+                match entries.iter().rev().find(|e| e.starts_with(prefix)) {
+                    Some(entry) => result.push_str(entry),
+                    None => return Err(format!("!{}: event not found", prefix)),
+                }
+            }
+            _ => {
+                // `!` の後に認識できない文字 → リテラル `!`
+                result.push('!');
+            }
+        }
+    }
+
+    Ok(result)
+}
+
 /// エイリアス展開: 行の最初のワードがエイリアスならその値に置換する。
 /// 再帰ガード付き（同じエイリアスは 1 回のみ展開）。
 fn expand_alias(line: &str, aliases: &HashMap<String, String>) -> String {
@@ -361,6 +457,20 @@ fn main() {
         // 行エディタで 1 行読み取る（raw モード → Enter で確定 → cooked モードに復帰）
         match editor.read_line(&prompt) {
             Some(line) if !line.trim().is_empty() => {
+                // 履歴展開（`!!`, `!N`, `!-N`, `!prefix`）
+                let line = match expand_history(&line, editor.history()) {
+                    Ok(expanded) => {
+                        if expanded != line {
+                            println!("{}", expanded);
+                        }
+                        expanded
+                    }
+                    Err(msg) => {
+                        eprintln!("rush: {}", msg);
+                        shell.last_status = 1;
+                        continue;
+                    }
+                };
                 editor.add_history(&line);
                 // エイリアス展開（コマンド位置の最初の単語のみ、再帰ガード付き）
                 let mut accumulated = expand_alias(&line, &shell.aliases);

@@ -137,6 +137,20 @@ impl History {
         self.entries.len()
     }
 
+    /// 指定番号のエントリを返す（1-indexed）。`!N` 展開用。
+    pub fn get(&self, n: usize) -> Option<&str> {
+        if n == 0 || n > self.entries.len() {
+            None
+        } else {
+            Some(&self.entries[n - 1])
+        }
+    }
+
+    /// 最後のエントリを返す。`!!` 展開用。
+    pub fn last_entry(&self) -> Option<&str> {
+        self.entries.last().map(|s| s.as_str())
+    }
+
     /// 履歴をクリアする（`history -c` 用）。
     pub fn clear(&mut self) {
         self.entries.clear();
@@ -254,6 +268,24 @@ mod tests {
         let h = make_history(&["echo hello"]);
         let result = h.search_back(1, "");
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn get_by_number() {
+        let h = make_history(&["echo hello", "ls -la", "echo world"]);
+        assert_eq!(h.get(1), Some("echo hello"));
+        assert_eq!(h.get(3), Some("echo world"));
+        assert_eq!(h.get(0), None);
+        assert_eq!(h.get(4), None);
+    }
+
+    #[test]
+    fn last_entry_returns_latest() {
+        let h = make_history(&["echo hello", "ls -la"]);
+        assert_eq!(h.last_entry(), Some("ls -la"));
+
+        let empty = make_history(&[]);
+        assert_eq!(empty.last_entry(), None);
     }
 
     #[test]
