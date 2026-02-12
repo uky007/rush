@@ -1,10 +1,10 @@
 //! コマンド実行: コマンドリスト条件付き実行、ビルトイン判定、リダイレクト適用、
-//! パイプライン接続、展開パイプライン（コマンド置換 → チルダ → glob）、ジョブ制御。
+//! パイプライン接続、展開パイプライン（コマンド置換 → チルダ → ブレース → glob）、ジョブ制御。
 //!
 //! - [`execute`]: コマンドリスト（`&&`/`||`/`;`）全体を条件付きで実行
 //! - 単一ビルトイン（非 background、非 FdDup）: fork なしの高速パス（[`execute_builtin`]）
 //! - それ以外: 統一 spawn パス（[`execute_job`]）
-//!   - 各コマンドの引数を `expand_args_full` で統一展開（コマンド置換 → チルダ → glob）
+//!   - 各コマンドの引数を `expand_args_full` で統一展開（コマンド置換 → チルダ → ブレース → glob）
 //!   - `posix_spawnp` でプロセスグループ設定 + シグナル `SIG_DFL` リセット
 //!   - fd 複製（`2>&1` 等）は `extra_dup2s` で spawn に渡す
 //!   - foreground: `tcsetpgrp` でターミナル制御を渡し、`waitpid(WUNTRACED)` で待機
@@ -21,7 +21,7 @@ use crate::parser::{self, CommandList, Connector, Pipeline, RedirectKind};
 use crate::shell::Shell;
 use crate::spawn;
 
-/// コマンド置換 + チルダ展開 + glob 展開を統一的に適用する。
+/// コマンド置換 + チルダ展開 + ブレース展開 + glob 展開を統一的に適用する。
 fn expand_args_full(args: &[std::borrow::Cow<'_, str>], shell: &mut Shell) -> Vec<String> {
     let mut result = Vec::new();
     for arg in args {
@@ -33,14 +33,162 @@ fn expand_args_full(args: &[std::borrow::Cow<'_, str>], shell: &mut Shell) -> Ve
         };
         // 2. チルダ展開
         let tilde_expanded = parser::expand_tilde(&sub_expanded);
-        // 3. glob 展開
-        if glob::has_glob_chars(&tilde_expanded) {
-            result.extend(glob::expand(&tilde_expanded));
-        } else {
-            result.push(tilde_expanded.into_owned());
+        // 3. ブレース展開
+        let brace_expanded = expand_braces(&tilde_expanded);
+        // 4. glob 展開
+        for word in &brace_expanded {
+            if glob::has_glob_chars(word) {
+                result.extend(glob::expand(word));
+            } else {
+                result.push(word.clone());
+            }
         }
     }
     result
+}
+
+/// ブレース展開: `{a,b,c}` → カンマ区切り、`{1..5}` → 数値レンジ、`{a..z}` → 文字レンジ。
+/// ネスト対応（再帰展開）。
+fn expand_braces(word: &str) -> Vec<String> {
+    let bytes = word.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        if bytes[i] == b'{' {
+            // 対応する `}` を探す
+            let mut depth = 1;
+            let mut j = i + 1;
+            while j < len {
+                match bytes[j] {
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth -= 1;
+                        if depth == 0 { break; }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+
+            if depth == 0 {
+                let prefix = &word[..i];
+                let inner = &word[i + 1..j];
+                let suffix = &word[j + 1..];
+
+                // レンジ展開を試す
+                if let Some(items) = try_expand_range(inner) {
+                    let mut results = Vec::new();
+                    for item in items {
+                        let combined = format!("{}{}{}", prefix, item, suffix);
+                        results.extend(expand_braces(&combined));
+                    }
+                    return results;
+                }
+
+                // カンマ区切り展開を試す
+                let parts = split_brace_commas(inner);
+                if parts.len() >= 2 {
+                    let mut results = Vec::new();
+                    for part in parts {
+                        let combined = format!("{}{}{}", prefix, part, suffix);
+                        results.extend(expand_braces(&combined));
+                    }
+                    return results;
+                }
+            }
+        }
+        i += 1;
+    }
+
+    vec![word.to_string()]
+}
+
+/// ブレース内のカンマ区切り分割（ネストされた `{...}` 内のカンマは無視）。
+fn split_brace_commas(content: &str) -> Vec<&str> {
+    let bytes = content.as_bytes();
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut depth = 0;
+
+    for i in 0..bytes.len() {
+        match bytes[i] {
+            b'{' => depth += 1,
+            b'}' => { if depth > 0 { depth -= 1; } }
+            b',' if depth == 0 => {
+                parts.push(&content[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&content[start..]);
+    parts
+}
+
+/// レンジ展開を試みる。`a..z` → 文字レンジ、`1..5` → 数値レンジ。
+/// 有効なレンジでなければ `None` を返す。
+fn try_expand_range(inner: &str) -> Option<Vec<String>> {
+    let sep = inner.find("..")?;
+    let start_s = &inner[..sep];
+    let end_s = &inner[sep + 2..];
+
+    // 二重 `..` が含まれる場合はレンジとして扱わない
+    if end_s.contains("..") {
+        return None;
+    }
+
+    // 文字レンジ: 単一文字 .. 単一文字
+    if start_s.len() == 1 && end_s.len() == 1 {
+        let s = start_s.as_bytes()[0];
+        let e = end_s.as_bytes()[0];
+        if s.is_ascii_alphabetic() && e.is_ascii_alphabetic() {
+            let mut results = Vec::new();
+            if s <= e {
+                for c in s..=e {
+                    results.push((c as char).to_string());
+                }
+            } else {
+                for c in (e..=s).rev() {
+                    results.push((c as char).to_string());
+                }
+            }
+            return Some(results);
+        }
+    }
+
+    // 数値レンジ
+    let s_val = start_s.parse::<i64>().ok()?;
+    let e_val = end_s.parse::<i64>().ok()?;
+
+    // ゼロパディング検出
+    let pad = if (start_s.starts_with('0') && start_s.len() > 1)
+        || (end_s.starts_with('0') && end_s.len() > 1) {
+        start_s.len().max(end_s.len())
+    } else {
+        0
+    };
+
+    let mut results = Vec::new();
+    if s_val <= e_val {
+        for n in s_val..=e_val {
+            if pad > 0 {
+                results.push(format!("{:0>width$}", n, width = pad));
+            } else {
+                results.push(n.to_string());
+            }
+        }
+    } else {
+        for n in (e_val..=s_val).rev() {
+            if pad > 0 {
+                results.push(format!("{:0>width$}", n, width = pad));
+            } else {
+                results.push(n.to_string());
+            }
+        }
+    }
+
+    Some(results)
 }
 
 /// コマンド文字列を実行して stdout の出力を取得する（コマンド置換用）。
@@ -530,5 +678,75 @@ fn execute_job(shell: &mut Shell, pipeline: &Pipeline<'_>, cmd_text: &str) -> i3
         }
 
         status
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn brace_comma() {
+        assert_eq!(expand_braces("file.{rs,toml}"), vec!["file.rs", "file.toml"]);
+    }
+
+    #[test]
+    fn brace_three() {
+        assert_eq!(expand_braces("{a,b,c}"), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn brace_prefix_suffix() {
+        assert_eq!(expand_braces("pre{x,y}suf"), vec!["prexsuf", "preysuf"]);
+    }
+
+    #[test]
+    fn brace_nested() {
+        assert_eq!(expand_braces("{a,{b,c}}"), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn brace_multi() {
+        assert_eq!(
+            expand_braces("{a,b}{1,2}"),
+            vec!["a1", "a2", "b1", "b2"],
+        );
+    }
+
+    #[test]
+    fn brace_numeric_range() {
+        assert_eq!(expand_braces("{1..5}"), vec!["1", "2", "3", "4", "5"]);
+    }
+
+    #[test]
+    fn brace_reverse_range() {
+        assert_eq!(expand_braces("{5..1}"), vec!["5", "4", "3", "2", "1"]);
+    }
+
+    #[test]
+    fn brace_char_range() {
+        assert_eq!(expand_braces("{a..e}"), vec!["a", "b", "c", "d", "e"]);
+    }
+
+    #[test]
+    fn brace_zero_pad() {
+        assert_eq!(
+            expand_braces("{01..03}"),
+            vec!["01", "02", "03"],
+        );
+    }
+
+    #[test]
+    fn brace_no_expansion() {
+        assert_eq!(expand_braces("hello"), vec!["hello"]);
+        assert_eq!(expand_braces("{single}"), vec!["{single}"]);
+    }
+
+    #[test]
+    fn brace_range_with_prefix() {
+        assert_eq!(
+            expand_braces("file{1..3}.txt"),
+            vec!["file1.txt", "file2.txt", "file3.txt"],
+        );
     }
 }
