@@ -10,27 +10,9 @@
 //! - `[a-z]` 範囲パターンは未対応（将来の拡張）
 //! - `.` で始まるファイルはパターンが `.` で始まる場合のみマッチ（bash 互換）
 
-use std::borrow::Cow;
-
 /// パターンにグロブ文字（`*`, `?`）が含まれるか判定する。
 pub fn has_glob_chars(s: &str) -> bool {
     s.bytes().any(|b| b == b'*' || b == b'?')
-}
-
-/// 引数リストの各要素をグロブ展開し、結果を返す。
-///
-/// グロブ文字を含まない引数はそのまま結果に追加される。
-/// グロブ文字を含む引数は展開され、マッチがなければ元のパターンが返る。
-pub fn expand_args(args: &[Cow<'_, str>]) -> Vec<String> {
-    let mut result = Vec::new();
-    for arg in args {
-        if has_glob_chars(arg) {
-            result.extend(expand(arg));
-        } else {
-            result.push(arg.to_string());
-        }
-    }
-    result
 }
 
 /// パターンを展開し、マッチするファイルパスをソート済みで返す。

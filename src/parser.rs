@@ -9,8 +9,11 @@
 //! - リダイレクト: `>`, `>>`, `<`, `2>`
 //! - クォート: シングル (`'...'`) / ダブル (`"..."`)
 //! - 変数展開: `$VAR`, `${VAR}`, `$?`（ダブルクォート内・裸ワードで展開、シングルクォートではリテラル）
+//! - チルダ展開: `~` → `$HOME`, `~/path`, `~user`, `VAR=~/path`
+//! - コマンド置換パススルー: `$(cmd)`, `` `cmd` `` — パーサーでは展開せずリテラル保持、executor で展開
 //! - バックグラウンド実行: `cmd &`（パイプラインの末尾に `&` を指定）
 //! - 複合コマンド: `&&` (AND), `||` (OR), `;` (順次実行)
+//! - fd 複製: `2>&1`, `>&2`（fd 複製リダイレクト）
 //! - エスケープ: `\"`, `\\`, `\$`（ダブルクォート内）, `\X`（裸ワード）
 
 use std::borrow::Cow;
@@ -82,6 +85,8 @@ pub enum RedirectKind {
     Input,
     /// `2>` — stderr を上書き
     Stderr,
+    /// `N>&M` — fd 複製（src_fd を dst_fd のコピーにする）
+    FdDup { src_fd: i32, dst_fd: i32 },
 }
 
 // ── Error ───────────────────────────────────────────────────────────
@@ -95,6 +100,8 @@ pub enum ParseError {
     MissingRedirectTarget,
     /// パイプ、`&&`、`||` の前後にコマンドがない。
     EmptyPipelineSegment,
+    /// fd 複製リダイレクトの dst_fd が不正。
+    BadFdRedirect,
 }
 
 impl fmt::Display for ParseError {
@@ -103,6 +110,59 @@ impl fmt::Display for ParseError {
             Self::UnterminatedQuote(c) => write!(f, "unexpected EOF while looking for matching `{c}`"),
             Self::MissingRedirectTarget => write!(f, "syntax error: missing redirect target"),
             Self::EmptyPipelineSegment => write!(f, "syntax error near unexpected token"),
+            Self::BadFdRedirect => write!(f, "syntax error: invalid file descriptor in redirect"),
+        }
+    }
+}
+
+// ── Tilde expansion ─────────────────────────────────────────────────
+
+/// チルダ展開: `~` → $HOME, `~/path` → $HOME/path, `~user` → user のホーム。
+/// `=` の後のチルダも展開する（`export VAR=~/foo`）。
+pub fn expand_tilde(s: &str) -> Cow<'_, str> {
+    if !s.starts_with('~') {
+        // `=` の後にチルダがあるケースをチェック
+        if let Some(eq) = s.find('=') {
+            if s[eq + 1..].starts_with('~') {
+                let (key, val) = s.split_at(eq + 1);
+                if let Cow::Owned(expanded) = expand_tilde_prefix(val) {
+                    return Cow::Owned(format!("{}{}", key, expanded));
+                }
+            }
+        }
+        return Cow::Borrowed(s);
+    }
+    expand_tilde_prefix(s)
+}
+
+fn expand_tilde_prefix(s: &str) -> Cow<'_, str> {
+    if !s.starts_with('~') {
+        return Cow::Borrowed(s);
+    }
+    let rest_start = s[1..].find('/').map(|i| i + 1).unwrap_or(s.len());
+    let user_part = &s[1..rest_start];
+    let rest = &s[rest_start..];
+
+    if user_part.is_empty() {
+        // ~ or ~/path → $HOME
+        match std::env::var("HOME") {
+            Ok(home) => Cow::Owned(format!("{}{}", home, rest)),
+            Err(_) => Cow::Borrowed(s),
+        }
+    } else {
+        // ~user → getpwnam
+        let c_user = match std::ffi::CString::new(user_part) {
+            Ok(c) => c,
+            Err(_) => return Cow::Borrowed(s),
+        };
+        let pw = unsafe { libc::getpwnam(c_user.as_ptr()) };
+        if pw.is_null() {
+            return Cow::Borrowed(s);
+        }
+        let home = unsafe { std::ffi::CStr::from_ptr((*pw).pw_dir) };
+        match home.to_str() {
+            Ok(h) => Cow::Owned(format!("{}{}", h, rest)),
+            Err(_) => Cow::Borrowed(s),
         }
     }
 }
@@ -139,6 +199,38 @@ fn expand_variables(s: &str, last_status: i32) -> Cow<'_, str> {
         }
 
         match bytes[pos] {
+            b'(' => {
+                // $(...) — コマンド置換。executor で展開するのでリテラル保持。
+                result.push_str("$(");
+                pos += 1; // skip '('
+                let mut depth = 1;
+                while pos < len && depth > 0 {
+                    match bytes[pos] {
+                        b'(' => depth += 1,
+                        b')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                pos += 1;
+                                break;
+                            }
+                        }
+                        b'\'' => {
+                            result.push(bytes[pos] as char);
+                            pos += 1;
+                            while pos < len && bytes[pos] != b'\'' {
+                                result.push(bytes[pos] as char);
+                                pos += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                    if depth > 0 {
+                        result.push(bytes[pos] as char);
+                        pos += 1;
+                    }
+                }
+                result.push(')');
+            }
             b'?' => {
                 result.push_str(&last_status.to_string());
                 pos += 1;
@@ -214,6 +306,7 @@ enum Token<'a> {
     RedirectAppend, // >>
     RedirectIn,     // <
     RedirectErr,    // 2>
+    FdDupPrefix(i32), // N>& — src_fd は N、次の Word が dst_fd
 }
 
 /// 入力文字列をトークン列に変換するイテレータ。
@@ -252,6 +345,38 @@ impl<'a> Tokenizer<'a> {
         let bytes = self.input.as_bytes();
         let len = bytes.len();
         match bytes[self.pos] {
+            b'(' => {
+                // $(...) — コマンド置換。リテラル保持。
+                buf.push_str("$(");
+                self.pos += 1; // skip '('
+                let mut depth = 1;
+                while self.pos < len && depth > 0 {
+                    match bytes[self.pos] {
+                        b'(' => depth += 1,
+                        b')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                self.pos += 1;
+                                break;
+                            }
+                        }
+                        b'\'' => {
+                            buf.push(bytes[self.pos] as char);
+                            self.pos += 1;
+                            while self.pos < len && bytes[self.pos] != b'\'' {
+                                buf.push(bytes[self.pos] as char);
+                                self.pos += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                    if depth > 0 {
+                        buf.push(bytes[self.pos] as char);
+                        self.pos += 1;
+                    }
+                }
+                buf.push(')');
+            }
             b'?' => {
                 buf.push_str(&self.last_status.to_string());
                 self.pos += 1;
@@ -330,6 +455,9 @@ impl<'a> Iterator for Tokenizer<'a> {
                 if self.peek() == Some(b'>') {
                     self.pos += 1;
                     Some(Ok(Token::RedirectAppend))
+                } else if self.peek() == Some(b'&') {
+                    self.pos += 1;
+                    Some(Ok(Token::FdDupPrefix(1))) // >&M は 1>&M の省略形
                 } else {
                     Some(Ok(Token::RedirectOut))
                 }
@@ -339,6 +467,10 @@ impl<'a> Iterator for Tokenizer<'a> {
                 Some(Ok(Token::RedirectIn))
             }
             // トークン先頭の `2>` のみ。`file2>` 等の途中はWordとして読まれる。
+            b'2' if self.peek_at(1) == Some(b'>') && self.peek_at(2) == Some(b'&') => {
+                self.pos += 3;
+                Some(Ok(Token::FdDupPrefix(2)))
+            }
             b'2' if self.peek_at(1) == Some(b'>') => {
                 self.pos += 2;
                 Some(Ok(Token::RedirectErr))
@@ -390,10 +522,23 @@ impl<'a> Iterator for Tokenizer<'a> {
                                 self.pos += 1; // skip closing quote
                                 return Some(Ok(Token::Word(Cow::Owned(buf))));
                             }
+                            b'`' => {
+                                // バッククォート → リテラル保持
+                                buf.push('`');
+                                self.pos += 1;
+                                while self.pos < self.input.len() && self.input.as_bytes()[self.pos] != b'`' {
+                                    buf.push(self.input.as_bytes()[self.pos] as char);
+                                    self.pos += 1;
+                                }
+                                if self.pos < self.input.len() {
+                                    buf.push('`');
+                                    self.pos += 1;
+                                }
+                            }
                             b'\\' if self.pos + 1 < self.input.len() => {
                                 let next = self.input.as_bytes()[self.pos + 1];
                                 match next {
-                                    b'"' | b'\\' | b'$' => {
+                                    b'"' | b'\\' | b'$' | b'`' => {
                                         buf.push(next as char);
                                         self.pos += 2;
                                     }
@@ -465,6 +610,50 @@ impl<'a> Iterator for Tokenizer<'a> {
                         match self.input.as_bytes()[self.pos] {
                             b' ' | b'\t' | b'\n' | b'\r' | b'|' | b'&' | b'>' | b'<'
                             | b'\'' | b'"' | b';' => break,
+                            b'$' if self.pos + 1 < self.input.len()
+                                && self.input.as_bytes()[self.pos + 1] == b'(' =>
+                            {
+                                // $(...) をリテラル保持
+                                buf.push('$');
+                                buf.push('(');
+                                self.pos += 2;
+                                let mut depth = 1;
+                                while self.pos < self.input.len() && depth > 0 {
+                                    match self.input.as_bytes()[self.pos] {
+                                        b'(' => depth += 1,
+                                        b')' => depth -= 1,
+                                        b'\'' => {
+                                            buf.push(self.input.as_bytes()[self.pos] as char);
+                                            self.pos += 1;
+                                            while self.pos < self.input.len()
+                                                && self.input.as_bytes()[self.pos] != b'\''
+                                            {
+                                                buf.push(self.input.as_bytes()[self.pos] as char);
+                                                self.pos += 1;
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                    if depth > 0 {
+                                        buf.push(self.input.as_bytes()[self.pos] as char);
+                                    }
+                                    self.pos += 1;
+                                }
+                                buf.push(')');
+                            }
+                            b'`' => {
+                                // バッククォート内をリテラル保持
+                                buf.push('`');
+                                self.pos += 1;
+                                while self.pos < self.input.len() && self.input.as_bytes()[self.pos] != b'`' {
+                                    buf.push(self.input.as_bytes()[self.pos] as char);
+                                    self.pos += 1;
+                                }
+                                if self.pos < self.input.len() {
+                                    buf.push('`');
+                                    self.pos += 1;
+                                }
+                            }
                             b'\\' if self.pos + 1 < self.input.len() => {
                                 // `\X` → リテラル `X`
                                 self.pos += 1;
@@ -490,6 +679,35 @@ impl<'a> Iterator for Tokenizer<'a> {
                         match self.input.as_bytes()[self.pos] {
                             b' ' | b'\t' | b'\n' | b'\r' | b'|' | b'&' | b'>' | b'<'
                             | b'\'' | b'"' | b';' => break,
+                            b'$' if self.pos + 1 < self.input.len()
+                                && self.input.as_bytes()[self.pos + 1] == b'(' =>
+                            {
+                                // $(...) をまとめてスキップ
+                                self.pos += 2; // skip "$("
+                                let mut depth = 1;
+                                while self.pos < self.input.len() && depth > 0 {
+                                    match self.input.as_bytes()[self.pos] {
+                                        b'(' => depth += 1,
+                                        b')' => depth -= 1,
+                                        b'\'' => {
+                                            self.pos += 1;
+                                            while self.pos < self.input.len()
+                                                && self.input.as_bytes()[self.pos] != b'\''
+                                            { self.pos += 1; }
+                                        }
+                                        _ => {}
+                                    }
+                                    self.pos += 1;
+                                }
+                            }
+                            b'`' => {
+                                // バッククォートをスキップ
+                                self.pos += 1;
+                                while self.pos < self.input.len() && self.input.as_bytes()[self.pos] != b'`' {
+                                    self.pos += 1;
+                                }
+                                if self.pos < self.input.len() { self.pos += 1; }
+                            }
                             _ => self.pos += 1,
                         }
                     }
@@ -595,6 +813,19 @@ pub fn parse(input: &str, last_status: i32) -> Result<Option<CommandList<'_>>, P
                 match tokens.next() {
                     Some(Ok(Token::Word(target))) => {
                         redirects.push(Redirect { kind, target });
+                    }
+                    Some(Err(e)) => return Err(e),
+                    _ => return Err(ParseError::MissingRedirectTarget),
+                }
+            }
+            Token::FdDupPrefix(src_fd) => {
+                match tokens.next() {
+                    Some(Ok(Token::Word(w))) => {
+                        let dst_fd = w.parse::<i32>().map_err(|_| ParseError::BadFdRedirect)?;
+                        redirects.push(Redirect {
+                            kind: RedirectKind::FdDup { src_fd, dst_fd },
+                            target: Cow::Borrowed(""),
+                        });
                     }
                     Some(Err(e)) => return Err(e),
                     _ => return Err(ParseError::MissingRedirectTarget),
@@ -1132,5 +1363,92 @@ mod tests {
         // `${` without closing `}` → literal "${" then rest
         let list = parse("echo ${abc", 0).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "${abc");
+    }
+
+    // ── チルダ展開テスト ──
+
+    #[test]
+    fn tilde_home() {
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(expand_tilde("~"), Cow::Owned::<str>(home));
+    }
+
+    #[test]
+    fn tilde_home_path() {
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(expand_tilde("~/foo"), Cow::Owned::<str>(format!("{}/foo", home)));
+    }
+
+    #[test]
+    fn tilde_no_change() {
+        assert!(matches!(expand_tilde("hello"), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn tilde_after_equals() {
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(expand_tilde("X=~/bar"), Cow::Owned::<str>(format!("X={}/bar", home)));
+    }
+
+    #[test]
+    fn tilde_no_equals_tilde() {
+        assert!(matches!(expand_tilde("X=hello"), Cow::Borrowed(_)));
+    }
+
+    // ── fd 複製テスト ──
+
+    #[test]
+    fn fd_dup_2_to_1() {
+        let list = parse("cmd 2>&1", 0).unwrap().unwrap();
+        let r = &list.items[0].pipeline.commands[0].redirects[0];
+        assert_eq!(r.kind, RedirectKind::FdDup { src_fd: 2, dst_fd: 1 });
+    }
+
+    #[test]
+    fn fd_dup_stdout_to_stderr() {
+        let list = parse("cmd >&2", 0).unwrap().unwrap();
+        let r = &list.items[0].pipeline.commands[0].redirects[0];
+        assert_eq!(r.kind, RedirectKind::FdDup { src_fd: 1, dst_fd: 2 });
+    }
+
+    #[test]
+    fn fd_dup_with_file_redirect() {
+        let list = parse("cmd > out 2>&1", 0).unwrap().unwrap();
+        let redirects = &list.items[0].pipeline.commands[0].redirects;
+        assert_eq!(redirects.len(), 2);
+        assert_eq!(redirects[0].kind, RedirectKind::Output);
+        assert_eq!(redirects[0].target, "out");
+        assert_eq!(redirects[1].kind, RedirectKind::FdDup { src_fd: 2, dst_fd: 1 });
+    }
+
+    #[test]
+    fn fd_dup_bad_target() {
+        assert_eq!(parse("cmd 2>&abc", 0), Err(ParseError::BadFdRedirect));
+    }
+
+    // ── コマンド置換パススルーテスト ──
+
+    #[test]
+    fn cmd_sub_passthrough() {
+        let list = parse("echo $(date)", 0).unwrap().unwrap();
+        assert_eq!(list.items[0].pipeline.commands[0].args[1], "$(date)");
+    }
+
+    #[test]
+    fn backtick_passthrough() {
+        let list = parse("echo `date`", 0).unwrap().unwrap();
+        assert_eq!(list.items[0].pipeline.commands[0].args[1], "`date`");
+    }
+
+    #[test]
+    fn cmd_sub_nested() {
+        let list = parse("echo $(echo $(whoami))", 0).unwrap().unwrap();
+        assert_eq!(list.items[0].pipeline.commands[0].args[1], "$(echo $(whoami))");
+    }
+
+    #[test]
+    fn cmd_sub_in_double_quotes() {
+        let list = parse("echo \"today is $(date)\"", 0).unwrap().unwrap();
+        assert_eq!(list.items[0].pipeline.commands[0].args[1], "today is $(date)");
     }
 }

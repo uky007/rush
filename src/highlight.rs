@@ -10,8 +10,9 @@
 //! | 有効なコマンド（ビルトイン or PATH 内） | 太字緑 | `\x1b[1;32m` |
 //! | 無効なコマンド | 太字赤 | `\x1b[1;31m` |
 //! | 文字列（クォート内） | 黄 | `\x1b[33m` |
-//! | 演算子（`\|`, `\|\|`, `>`, `>>`, `<`, `2>`, `&`, `&&`, `;`） | シアン | `\x1b[36m` |
+//! | 演算子（`\|`, `\|\|`, `>`, `>>`, `<`, `2>`, `>&N`, `2>&1`, `&`, `&&`, `;`） | シアン | `\x1b[36m` |
 //! | 変数（`$VAR`, `${VAR}`, `$?`） | マゼンタ | `\x1b[35m` |
+//! | コマンド置換（`$(cmd)`, `` `cmd` ``） | シアン | `\x1b[36m` |
 //! | 引数・リダイレクト先 | デフォルト | （色なし） |
 //!
 //! ## 状態機械
@@ -180,6 +181,14 @@ pub fn highlight(buf: &str, cache: &PathCache) -> String {
                 if pos < len && bytes[pos] == b'>' {
                     result.push('>');
                     pos += 1;
+                } else if pos < len && bytes[pos] == b'&' {
+                    // >&N
+                    result.push('&');
+                    pos += 1;
+                    while pos < len && bytes[pos].is_ascii_digit() {
+                        result.push(bytes[pos] as char);
+                        pos += 1;
+                    }
                 }
                 result.push_str(RESET);
                 redirect_target = true;
@@ -218,11 +227,29 @@ pub fn highlight(buf: &str, cache: &PathCache) -> String {
                         result.push(bytes[pos + 1] as char);
                         pos += 2;
                     } else if bytes[pos] == b'$' {
-                        result.push_str(MAGENTA);
-                        result.push('$');
                         pos += 1;
-                        if pos < len && bytes[pos] == b'{' {
-                            result.push('{');
+                        if pos < len && bytes[pos] == b'(' {
+                            // $(...) → シアン
+                            result.push_str(CYAN);
+                            result.push_str("$(");
+                            pos += 1;
+                            let mut depth = 1;
+                            while pos < len && depth > 0 {
+                                match bytes[pos] {
+                                    b'(' => { depth += 1; result.push('('); }
+                                    b')' => {
+                                        depth -= 1;
+                                        if depth > 0 { result.push(')'); }
+                                    }
+                                    _ => result.push(bytes[pos] as char),
+                                }
+                                pos += 1;
+                            }
+                            result.push(')');
+                            result.push_str(YELLOW);
+                        } else if pos < len && bytes[pos] == b'{' {
+                            result.push_str(MAGENTA);
+                            result.push_str("${");
                             pos += 1;
                             while pos < len && bytes[pos] != b'}' && bytes[pos] != b'"' {
                                 result.push(bytes[pos] as char);
@@ -232,7 +259,10 @@ pub fn highlight(buf: &str, cache: &PathCache) -> String {
                                 result.push('}');
                                 pos += 1;
                             }
+                            result.push_str(YELLOW);
                         } else {
+                            result.push_str(MAGENTA);
+                            result.push('$');
                             while pos < len
                                 && (bytes[pos].is_ascii_alphanumeric()
                                     || bytes[pos] == b'_'
@@ -241,6 +271,20 @@ pub fn highlight(buf: &str, cache: &PathCache) -> String {
                                 result.push(bytes[pos] as char);
                                 pos += 1;
                             }
+                            result.push_str(YELLOW);
+                        }
+                    } else if bytes[pos] == b'`' {
+                        // バッククォート → シアン
+                        result.push_str(CYAN);
+                        result.push('`');
+                        pos += 1;
+                        while pos < len && bytes[pos] != b'`' && bytes[pos] != b'"' {
+                            result.push(bytes[pos] as char);
+                            pos += 1;
+                        }
+                        if pos < len && bytes[pos] == b'`' {
+                            result.push('`');
+                            pos += 1;
                         }
                         result.push_str(YELLOW);
                     } else {
@@ -256,8 +300,20 @@ pub fn highlight(buf: &str, cache: &PathCache) -> String {
                 command_position = false;
                 redirect_target = false;
             }
+            // 2>& (fd 複製) の着色
+            b'2' if pos + 2 < len && bytes[pos + 1] == b'>' && bytes[pos + 2] == b'&' => {
+                result.push_str(CYAN);
+                result.push_str("2>&");
+                pos += 3;
+                // 続く数字も含める
+                while pos < len && bytes[pos].is_ascii_digit() {
+                    result.push(bytes[pos] as char);
+                    pos += 1;
+                }
+                result.push_str(RESET);
+            }
             _ => {
-                // 通常ワード（変数 $VAR を含む可能性あり）
+                // 通常ワード（変数 $VAR、$()、バッククォートを含む可能性あり）
                 let word_start = pos;
                 while pos < len
                     && !matches!(
@@ -265,7 +321,14 @@ pub fn highlight(buf: &str, cache: &PathCache) -> String {
                         b' ' | b'\t' | b'|' | b'&' | b'>' | b'<' | b'\'' | b'"' | b';'
                     )
                 {
-                    pos += 1;
+                    if bytes[pos] == b'`' {
+                        // バッククォートをスキップ
+                        pos += 1;
+                        while pos < len && bytes[pos] != b'`' { pos += 1; }
+                        if pos < len { pos += 1; }
+                    } else {
+                        pos += 1;
+                    }
                 }
                 let word = &buf[word_start..pos];
 
@@ -273,7 +336,7 @@ pub fn highlight(buf: &str, cache: &PathCache) -> String {
                     result.push_str(word);
                     redirect_target = false;
                 } else if command_position {
-                    if word.starts_with('$') {
+                    if word.starts_with('$') || word.contains("$(") || word.contains('`') {
                         highlight_with_vars(&mut result, word);
                     } else if is_valid_command(word, cache) {
                         result.push_str(GREEN_BOLD);
@@ -295,7 +358,7 @@ pub fn highlight(buf: &str, cache: &PathCache) -> String {
     result
 }
 
-/// ワード内の `$VAR` / `${VAR}` / `$?` をマゼンタで着色する。
+/// ワード内の `$VAR` / `${VAR}` / `$?` / `$(cmd)` / `` `cmd` `` をシアン/マゼンタで着色する。
 fn highlight_with_vars(result: &mut String, word: &str) {
     let bytes = word.as_bytes();
     let len = bytes.len();
@@ -304,7 +367,26 @@ fn highlight_with_vars(result: &mut String, word: &str) {
     while i < len {
         if bytes[i] == b'$' && i + 1 < len {
             let next = bytes[i + 1];
-            if next == b'{' {
+            if next == b'(' {
+                // $(...) パターン → シアン
+                result.push_str(CYAN);
+                result.push_str("$(");
+                i += 2;
+                let mut depth = 1;
+                while i < len && depth > 0 {
+                    match bytes[i] {
+                        b'(' => { depth += 1; result.push('('); }
+                        b')' => {
+                            depth -= 1;
+                            if depth > 0 { result.push(')'); }
+                        }
+                        _ => result.push(bytes[i] as char),
+                    }
+                    i += 1;
+                }
+                result.push(')');
+                result.push_str(RESET);
+            } else if next == b'{' {
                 // ${VAR} パターン
                 result.push_str(MAGENTA);
                 result.push_str("${");
@@ -336,6 +418,20 @@ fn highlight_with_vars(result: &mut String, word: &str) {
                 result.push(bytes[i] as char);
                 i += 1;
             }
+        } else if bytes[i] == b'`' {
+            // バッククォート → シアン
+            result.push_str(CYAN);
+            result.push('`');
+            i += 1;
+            while i < len && bytes[i] != b'`' {
+                result.push(bytes[i] as char);
+                i += 1;
+            }
+            if i < len {
+                result.push('`');
+                i += 1;
+            }
+            result.push_str(RESET);
         } else {
             result.push(bytes[i] as char);
             i += 1;

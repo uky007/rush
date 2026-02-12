@@ -9,10 +9,10 @@
 //! | [`editor`] | 行エディタ（raw モード、キー入力、バッファ操作、表示更新） |
 //! | [`history`] | コマンド履歴（`~/.rush_history` 永続化、↑↓ ナビゲーション） |
 //! | [`complete`] | Tab 補完（コマンド名、ファイル名、`&&`/`||`/`;` 後のコマンド位置認識） |
-//! | [`highlight`] | シンタックスハイライト（ANSI カラー、PATH キャッシュ、`&&`/`||`/`;`/`${VAR}` 対応） |
-//! | [`parser`] | 構文解析（コマンドリスト `&&`/`||`/`;`、パイプライン、リダイレクト、クォート、エスケープ、変数展開 `$VAR`/`${VAR}`/`$?`、`&`） |
-//! | [`executor`] | コマンド実行（コマンドリスト条件付き実行、パイプライン接続、glob 展開、プロセスグループ管理） |
-//! | [`builtins`] | ビルトイン（`exit`, `cd`, `pwd`, `echo`, `export`, `unset`, `jobs`, `fg`, `bg`） |
+//! | [`highlight`] | シンタックスハイライト（ANSI カラー、PATH キャッシュ、`&&`/`||`/`;`/`${VAR}`/`$(cmd)`/`` `cmd` ``/`2>&1` 対応） |
+//! | [`parser`] | 構文解析（コマンドリスト、パイプライン、リダイレクト、クォート、エスケープ、変数展開、チルダ展開、コマンド置換パススルー、fd 複製） |
+//! | [`executor`] | コマンド実行（コマンドリスト条件付き実行、パイプライン接続、展開パイプライン: コマンド置換 → チルダ → glob、プロセスグループ管理） |
+//! | [`builtins`] | ビルトイン（`exit`, `cd`, `pwd`, `echo`, `export`, `unset`, `jobs`, `fg`, `bg`, `type`） |
 //! | [`glob`] | パス名展開（`*`, `?` によるファイル名マッチング） |
 //! | [`job`] | ジョブコントロール（バックグラウンド実行、Ctrl+Z サスペンド、`fg`/`bg` 復帰） |
 //! | [`shell`] | シェルのグローバル状態（終了ステータス、ジョブテーブル、プロセスグループ） |
@@ -32,6 +32,33 @@ mod spawn;
 
 use shell::Shell;
 
+/// `~/.rushrc` を読み込んで各行を実行する。ファイルが存在しなければサイレントスキップ。
+fn load_rc(shell: &mut Shell) {
+    let home = match std::env::var("HOME") {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    let rc_path = format!("{}/.rushrc", home);
+    let content = match std::fs::read_to_string(&rc_path) {
+        Ok(c) => c,
+        Err(_) => return, // ファイルなし → サイレントスキップ
+    };
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        match parser::parse(trimmed, shell.last_status) {
+            Ok(Some(list)) => {
+                let cmd_text = trimmed.to_string();
+                shell.last_status = executor::execute(shell, &list, &cmd_text);
+            }
+            Ok(None) => {}
+            Err(e) => eprintln!("rush: ~/.rushrc: {}", e),
+        }
+    }
+}
+
 fn main() {
     // シグナル設定: シェル自体は SIGINT/SIGTSTP/SIGTTOU/SIGTTIN を無視する。
     // 子プロセスは posix_spawnattr の POSIX_SPAWN_SETSIGDEF で SIG_DFL にリセットされる。
@@ -50,6 +77,7 @@ fn main() {
     }
 
     let mut shell = Shell::new();
+    load_rc(&mut shell);
     // 行エディタ: raw モードによるキー入力、履歴、Tab 補完、シンタックスハイライトを統合。
     // raw モードは read_line() 内でのみ有効で、コマンド実行中は cooked モードに戻る。
     let mut editor = editor::LineEditor::new();

@@ -1,4 +1,4 @@
-//! Tab 補完（コマンド名、ファイル名、`&&`/`||`/`;` 後のコマンド位置認識）。
+//! Tab 補完（コマンド名、ファイル名、チルダ展開、`&&`/`||`/`;` 後のコマンド位置認識）。
 //!
 //! カーソル位置の単語を抽出し、コマンドリスト・パイプライン内での位置に応じて
 //! コマンド名補完またはファイル名補完を行う。
@@ -8,7 +8,9 @@
 //! - **コマンド名補完**（行頭 or `|`/`&&`/`||`/`;` の後の最初の単語）:
 //!   ビルトイン一覧 + `$PATH` 内の実行可能ファイルから候補を収集
 //! - **ファイル名補完**（それ以外の位置）:
-//!   カレントディレクトリまたは指定ディレクトリのファイル名から候補を収集
+//!   カレントディレクトリまたは指定ディレクトリのファイル名から候補を収集。
+//!   `~/` プレフィックスはチルダ展開してディレクトリを検索し、
+//!   表示用にはオリジナルの `~` プレフィックスを維持する。
 //!
 //! ## 候補の適用（[`editor`](crate::editor) 側で処理）
 //!
@@ -17,11 +19,12 @@
 //! - 候補複数 → 共通接頭辞まで補完 + 候補一覧を表示
 
 use crate::highlight::PathCache;
+use crate::parser;
 
 /// コマンド名補完に使うビルトイン一覧（アルファベット順）。
 ///
 /// [`builtins::is_builtin`](crate::builtins::is_builtin) と同期させること。
-const BUILTINS: &[&str] = &["bg", "cd", "echo", "exit", "export", "fg", "jobs", "pwd", "unset"];
+const BUILTINS: &[&str] = &["bg", "cd", "echo", "exit", "export", "fg", "jobs", "pwd", "type", "unset"];
 
 /// Tab 補完の結果。候補リストと補完対象の単語位置を持つ。
 pub struct CompletionResult {
@@ -91,10 +94,26 @@ fn find_commands(prefix: &str, cache: &PathCache) -> Vec<String> {
 /// 含まれなければカレントディレクトリを検索する。
 /// `.` で始まる隠しファイルは `prefix` が `.` で始まる場合のみ候補に含める。
 fn find_files(prefix: &str) -> Vec<String> {
-    let (dir_str, file_prefix) = if let Some(slash_pos) = prefix.rfind('/') {
-        (&prefix[..slash_pos + 1], &prefix[slash_pos + 1..])
+    // チルダ展開してディレクトリ検索
+    let expanded_prefix = parser::expand_tilde(prefix);
+
+    let (dir_str, file_prefix, display_dir) = if let Some(slash_pos) = expanded_prefix.rfind('/') {
+        let search_dir = &expanded_prefix[..slash_pos + 1];
+        let file_part = &expanded_prefix[slash_pos + 1..];
+        // 表示用はオリジナルの ~ プレフィックスを維持
+        let orig_dir = if prefix.starts_with('~') {
+            if let Some(orig_slash) = prefix.rfind('/') {
+                &prefix[..orig_slash + 1]
+            } else {
+                // ~/... のスラッシュが展開で変わるケース
+                search_dir
+            }
+        } else {
+            search_dir
+        };
+        (search_dir.to_string(), file_part.to_string(), orig_dir.to_string())
     } else {
-        ("", prefix)
+        ("".to_string(), expanded_prefix.to_string(), "".to_string())
     };
 
     let search_dir = if dir_str.is_empty() {
@@ -110,7 +129,7 @@ fn find_files(prefix: &str) -> Vec<String> {
         for entry in entries.flatten() {
             if let Ok(name) = entry.file_name().into_string() {
                 // 隠しファイルは prefix が '.' で始まる場合のみ表示
-                if !name.starts_with(file_prefix) {
+                if !name.starts_with(file_prefix.as_str()) {
                     continue;
                 }
                 if name.starts_with('.') && !file_prefix.starts_with('.') {
@@ -119,7 +138,7 @@ fn find_files(prefix: &str) -> Vec<String> {
                 let is_dir = entry.file_type().map_or(false, |t| t.is_dir());
                 let candidate = format!(
                     "{}{}{}",
-                    dir_str,
+                    display_dir,
                     name,
                     if is_dir { "/" } else { "" }
                 );

@@ -199,6 +199,7 @@ impl CStringVec {
 /// - `stdout_fd`: stdout に接続する fd（`None` なら継承）
 /// - `stderr_fd`: stderr に接続する fd（`None` なら継承）
 /// - `fds_to_close`: 子プロセスで閉じる fd のリスト（パイプの未使用端など）
+/// - `extra_dup2s`: 追加の fd 複製リスト（`2>&1` 等）。各タプル `(src_fd, dst_fd)` で `dup2(dst, src)` を実行
 pub fn spawn(
     args: &[&str],
     pgid: libc::pid_t,
@@ -206,6 +207,7 @@ pub fn spawn(
     stdout_fd: Option<i32>,
     stderr_fd: Option<i32>,
     fds_to_close: &[i32],
+    extra_dup2s: &[(i32, i32)],
 ) -> Result<libc::pid_t, SpawnError> {
     let argv = CStringVec::from_args(args);
 
@@ -234,6 +236,11 @@ pub fn spawn(
         if fd != libc::STDERR_FILENO {
             actions.add_close(fd);
         }
+    }
+
+    // fd 複製: 2>&1 等の処理。dup2(dst, src) で src が dst のコピーを指す。
+    for &(src, dst) in extra_dup2s {
+        actions.add_dup2(dst, src);
     }
 
     for &fd in fds_to_close {

@@ -25,7 +25,8 @@ pub struct Shell {
     pub shell_pgid: pid_t,
     /// ターミナルのファイルディスクリプタ（通常 STDIN_FILENO）。
     pub terminal_fd: i32,
-    /// `$PATH` 内コマンドのキャッシュ。executor での PATH 検索最適化用。
+    /// `$PATH` 内コマンドのキャッシュ。executor での PATH 検索最適化用（将来使用予定）。
+    #[allow(dead_code)]
     pub path_cache: PathCache,
 }
 

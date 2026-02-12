@@ -10,6 +10,7 @@
 //! - 出力: `pwd`, `echo`
 //! - 環境変数: `export`, `unset`
 //! - ジョブコントロール: `jobs`, `fg`, `bg`
+//! - 情報: `type`
 
 use std::env;
 use std::io::Write;
@@ -25,7 +26,8 @@ use crate::shell::Shell;
 /// - [`highlight`](crate::highlight): コマンドの有効性判定（緑/赤の着色）
 /// - [`complete`](crate::complete): ビルトイン名のリストを補完候補に使用（`BUILTINS` 定数と同期）
 pub fn is_builtin(name: &str) -> bool {
-    matches!(name, "exit" | "cd" | "pwd" | "echo" | "export" | "unset" | "jobs" | "fg" | "bg")
+    matches!(name, "exit" | "cd" | "pwd" | "echo" | "export" | "unset"
+                 | "jobs" | "fg" | "bg" | "type")
 }
 
 /// ビルトインコマンドの実行を試みる。
@@ -47,6 +49,7 @@ pub fn try_exec(shell: &mut Shell, args: &[&str], stdout: &mut dyn Write) -> Opt
         "jobs" => Some(builtin_jobs(shell, stdout)),
         "fg" => Some(builtin_fg(shell, args)),
         "bg" => Some(builtin_bg(shell, args)),
+        "type" => Some(builtin_type(args, stdout)),
         _ => None,
     }
 }
@@ -153,6 +156,44 @@ fn builtin_unset(args: &[&str]) -> i32 {
         env::remove_var(arg);
     }
     0
+}
+
+// ── type ビルトイン ──────────────────────────────────────────────────
+
+/// `type name [name ...]` — コマンドの所在を表示する。ビルトインか外部コマンドかを判定。
+fn builtin_type(args: &[&str], stdout: &mut dyn Write) -> i32 {
+    if args.len() <= 1 {
+        let _ = writeln!(stdout, "type: usage: type name [name ...]");
+        return 1;
+    }
+    let mut status = 0;
+    for &name in &args[1..] {
+        if is_builtin(name) {
+            let _ = writeln!(stdout, "{} is a shell builtin", name);
+        } else if let Some(path) = find_in_path(name) {
+            let _ = writeln!(stdout, "{} is {}", name, path);
+        } else {
+            let _ = writeln!(stdout, "rush: type: {}: not found", name);
+            status = 1;
+        }
+    }
+    status
+}
+
+/// `$PATH` 内でコマンド名を検索し、最初に見つかった実行可能ファイルのフルパスを返す。
+fn find_in_path(name: &str) -> Option<String> {
+    use std::os::unix::fs::PermissionsExt;
+    let path_var = env::var("PATH").ok()?;
+    for dir in path_var.split(':') {
+        let full = format!("{}/{}", dir, name);
+        let p = Path::new(&full);
+        if let Ok(meta) = p.metadata() {
+            if meta.is_file() && meta.permissions().mode() & 0o111 != 0 {
+                return Some(full);
+            }
+        }
+    }
+    None
 }
 
 // ── ジョブコントロールビルトイン ─────────────────────────────────────
@@ -391,8 +432,50 @@ mod tests {
         assert!(is_builtin("jobs"));
         assert!(is_builtin("fg"));
         assert!(is_builtin("bg"));
+        assert!(is_builtin("type"));
         assert!(!is_builtin("ls"));
         assert!(!is_builtin("grep"));
+    }
+
+    #[test]
+    fn type_builtin_reports_builtin() {
+        let mut shell = Shell::new();
+        let mut buf = Vec::new();
+        let status = try_exec(&mut shell, &["type", "echo"], &mut buf).unwrap();
+        assert_eq!(status, 0);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains("shell builtin"));
+    }
+
+    #[test]
+    fn type_builtin_reports_not_found() {
+        let mut shell = Shell::new();
+        let mut buf = Vec::new();
+        let status = try_exec(&mut shell, &["type", "nonexistent_cmd_xyz"], &mut buf).unwrap();
+        assert_eq!(status, 1);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains("not found"));
+    }
+
+    #[test]
+    fn type_no_args() {
+        let mut shell = Shell::new();
+        let mut buf = Vec::new();
+        let status = try_exec(&mut shell, &["type"], &mut buf).unwrap();
+        assert_eq!(status, 1);
+    }
+
+    #[test]
+    fn type_external_command() {
+        let mut shell = Shell::new();
+        let mut buf = Vec::new();
+        // /bin/ls or /usr/bin/ls should exist on any Unix system
+        let status = try_exec(&mut shell, &["type", "ls"], &mut buf).unwrap();
+        let output = String::from_utf8(buf).unwrap();
+        // Should either be found or not, but no crash
+        if status == 0 {
+            assert!(output.contains("ls is /"));
+        }
     }
 
     #[test]

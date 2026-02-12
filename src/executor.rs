@@ -1,11 +1,12 @@
 //! コマンド実行: コマンドリスト条件付き実行、ビルトイン判定、リダイレクト適用、
-//! パイプライン接続、glob 展開、ジョブ制御。
+//! パイプライン接続、展開パイプライン（コマンド置換 → チルダ → glob）、ジョブ制御。
 //!
 //! - [`execute`]: コマンドリスト（`&&`/`||`/`;`）全体を条件付きで実行
-//! - 単一ビルトイン（非 background）: fork なしの高速パス（[`execute_builtin`]）
+//! - 単一ビルトイン（非 background、非 FdDup）: fork なしの高速パス（[`execute_builtin`]）
 //! - それ以外: 統一 spawn パス（[`execute_job`]）
-//!   - 各コマンドの引数を [`glob::expand_args`] でパス名展開してから実行
+//!   - 各コマンドの引数を `expand_args_full` で統一展開（コマンド置換 → チルダ → glob）
 //!   - `posix_spawnp` でプロセスグループ設定 + シグナル `SIG_DFL` リセット
+//!   - fd 複製（`2>&1` 等）は `extra_dup2s` で spawn に渡す
 //!   - foreground: `tcsetpgrp` でターミナル制御を渡し、`waitpid(WUNTRACED)` で待機
 //!   - background: ジョブテーブルに登録して即座に返る
 
@@ -19,6 +20,123 @@ use crate::job;
 use crate::parser::{self, CommandList, Connector, Pipeline, RedirectKind};
 use crate::shell::Shell;
 use crate::spawn;
+
+/// コマンド置換 + チルダ展開 + glob 展開を統一的に適用する。
+fn expand_args_full(args: &[std::borrow::Cow<'_, str>], shell: &mut Shell) -> Vec<String> {
+    let mut result = Vec::new();
+    for arg in args {
+        // 1. コマンド置換
+        let sub_expanded = if arg.contains("$(") || arg.contains('`') {
+            std::borrow::Cow::Owned(expand_command_subs(arg, shell))
+        } else {
+            arg.clone()
+        };
+        // 2. チルダ展開
+        let tilde_expanded = parser::expand_tilde(&sub_expanded);
+        // 3. glob 展開
+        if glob::has_glob_chars(&tilde_expanded) {
+            result.extend(glob::expand(&tilde_expanded));
+        } else {
+            result.push(tilde_expanded.into_owned());
+        }
+    }
+    result
+}
+
+/// コマンド文字列を実行して stdout の出力を取得する（コマンド置換用）。
+fn execute_capture(cmd_str: &str, shell: &mut Shell) -> String {
+    let mut pipefd = [0i32; 2];
+    if unsafe { libc::pipe(pipefd.as_mut_ptr()) } != 0 {
+        return String::new();
+    }
+
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        unsafe { libc::close(pipefd[0]); libc::close(pipefd[1]); }
+        return String::new();
+    }
+
+    if pid == 0 {
+        // 子プロセス: stdout をパイプに接続
+        unsafe {
+            libc::close(pipefd[0]);
+            libc::dup2(pipefd[1], libc::STDOUT_FILENO);
+            libc::close(pipefd[1]);
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::signal(libc::SIGTSTP, libc::SIG_DFL);
+        }
+        match parser::parse(cmd_str, shell.last_status) {
+            Ok(Some(list)) => {
+                let status = execute(shell, &list, cmd_str);
+                std::process::exit(status);
+            }
+            _ => std::process::exit(1),
+        }
+    }
+
+    // 親プロセス: パイプから出力を読み取り
+    unsafe { libc::close(pipefd[1]); }
+    let mut output = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = unsafe {
+            libc::read(pipefd[0], buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+        };
+        if n <= 0 { break; }
+        output.extend_from_slice(&buf[..n as usize]);
+    }
+    unsafe { libc::close(pipefd[0]); }
+    let mut status = 0i32;
+    unsafe { libc::waitpid(pid, &mut status, 0); }
+
+    String::from_utf8_lossy(&output).trim_end_matches('\n').to_string()
+}
+
+/// 文字列内の $(...) と `...` を展開する。
+fn expand_command_subs(s: &str, shell: &mut Shell) -> String {
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    let mut result = String::new();
+    let mut pos = 0;
+
+    while pos < len {
+        if bytes[pos] == b'$' && pos + 1 < len && bytes[pos + 1] == b'(' {
+            pos += 2;
+            let start = pos;
+            let mut depth = 1;
+            while pos < len && depth > 0 {
+                match bytes[pos] {
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 { break; }
+                    }
+                    b'\'' => { pos += 1; while pos < len && bytes[pos] != b'\'' { pos += 1; } }
+                    b'"' => { pos += 1; while pos < len && bytes[pos] != b'"' {
+                        if bytes[pos] == b'\\' { pos += 1; }
+                        pos += 1;
+                    }}
+                    _ => {}
+                }
+                pos += 1;
+            }
+            let inner = &s[start..pos];
+            if pos < len { pos += 1; } // skip ')'
+            result.push_str(&execute_capture(inner, shell));
+        } else if bytes[pos] == b'`' {
+            pos += 1;
+            let start = pos;
+            while pos < len && bytes[pos] != b'`' { pos += 1; }
+            let inner = &s[start..pos];
+            if pos < len { pos += 1; }
+            result.push_str(&execute_capture(inner, shell));
+        } else {
+            result.push(bytes[pos] as char);
+            pos += 1;
+        }
+    }
+    result
+}
 
 /// コマンドリスト全体を実行し、終了ステータスを返す。
 ///
@@ -55,10 +173,15 @@ pub fn execute(shell: &mut Shell, list: &CommandList<'_>, cmd_text: &str) -> i32
 fn execute_pipeline(shell: &mut Shell, pipeline: &Pipeline<'_>, cmd_text: &str) -> i32 {
     // 単一ビルトイン（非 background）→ fork なしの高速パス
     if pipeline.commands.len() == 1 && !pipeline.background {
-        let expanded = glob::expand_args(&pipeline.commands[0].args);
-        let args: Vec<&str> = expanded.iter().map(|s| s.as_str()).collect();
-        if builtins::is_builtin(args[0]) {
-            return execute_builtin(shell, &pipeline.commands[0], &expanded);
+        let cmd = &pipeline.commands[0];
+        // FdDup があれば spawn パスにフォールバック
+        let has_fd_dup = cmd.redirects.iter().any(|r| matches!(r.kind, RedirectKind::FdDup { .. }));
+        if !has_fd_dup {
+            let expanded = expand_args_full(&cmd.args, shell);
+            let args: Vec<&str> = expanded.iter().map(|s| s.as_str()).collect();
+            if !args.is_empty() && builtins::is_builtin(args[0]) {
+                return execute_builtin(shell, cmd, &expanded);
+            }
         }
     }
 
@@ -120,6 +243,7 @@ struct RedirectFds {
     stdin_fd: Option<i32>,
     stdout_fd: Option<i32>,
     stderr_fd: Option<i32>,
+    dup_actions: Vec<(i32, i32)>, // (src_fd, dst_fd) — spawn で適用
 }
 
 /// リダイレクト先ファイルを開き、raw fd を返す。
@@ -130,6 +254,7 @@ fn open_redirect_fds(redirects: &[parser::Redirect<'_>]) -> Result<RedirectFds, 
         stdin_fd: None,
         stdout_fd: None,
         stderr_fd: None,
+        dup_actions: Vec::new(),
     };
 
     for r in redirects {
@@ -179,6 +304,9 @@ fn open_redirect_fds(redirects: &[parser::Redirect<'_>]) -> Result<RedirectFds, 
                     1
                 })?;
                 fds.stderr_fd = Some(f.into_raw_fd());
+            }
+            RedirectKind::FdDup { src_fd, dst_fd } => {
+                fds.dup_actions.push((src_fd, dst_fd));
             }
         }
     }
@@ -244,8 +372,8 @@ fn execute_job(shell: &mut Shell, pipeline: &Pipeline<'_>, cmd_text: &str) -> i3
     for i in 0..n {
         let cmd = &pipeline.commands[i];
 
-        // glob 展開
-        let expanded = glob::expand_args(&cmd.args);
+        // コマンド置換 + チルダ + glob 展開
+        let expanded = expand_args_full(&cmd.args, shell);
         let args: Vec<&str> = expanded.iter().map(|s| s.as_str()).collect();
 
         // stdin/stdout の決定（パイプ接続）
@@ -306,6 +434,7 @@ fn execute_job(shell: &mut Shell, pipeline: &Pipeline<'_>, cmd_text: &str) -> i3
             stdout_fd,
             redir_fds.stderr_fd,
             &close_fds_buf[..close_count],
+            &redir_fds.dup_actions,
         ) {
             Ok(child_pid) => {
                 // 親側でもプロセスグループを設定（レースコンディション防止）

@@ -123,7 +123,7 @@ fn main() {
     println!("\n--- Spawn (posix_spawnp) ---");
 
     results.push(bench("spawn", "/bin/true (posix_spawnp)", 1_000, || {
-        match rush::spawn::spawn(&["/bin/true"], 0, None, None, None, &[]) {
+        match rush::spawn::spawn(&["/bin/true"], 0, None, None, None, &[], &[]) {
             Ok(pid) => {
                 let mut status = 0i32;
                 unsafe { libc::waitpid(pid, &mut status, 0); }
@@ -157,6 +157,27 @@ fn main() {
 
     results.push(bench("glob", "expand *.rs", 1_000, || {
         let _ = rush::glob::expand("*.rs");
+    }));
+
+    for r in &results {
+        r.print();
+    }
+
+    // ── チルダ展開ベンチマーク ──
+    println!("\n--- Tilde expansion ---");
+
+    results.clear();
+
+    results.push(bench("tilde", "expand_tilde(\"~\")", 10_000, || {
+        let _ = rush::parser::expand_tilde("~");
+    }));
+
+    results.push(bench("tilde", "expand_tilde(\"~/Documents\")", 10_000, || {
+        let _ = rush::parser::expand_tilde("~/Documents");
+    }));
+
+    results.push(bench("tilde", "expand_tilde(\"hello\") (no-op)", 10_000, || {
+        let _ = rush::parser::expand_tilde("hello");
     }));
 
     for r in &results {

@@ -74,10 +74,10 @@
 
 | モジュール | 責務 | 高速化手法 |
 |-----------|------|-----------|
-| `parser` | 入力をAST（コマンド列）に変換 | ゼロコピー (`Cow::Borrowed`) |
-| `executor` | コマンドの実行・パイプライン接続 | ビルトイン in-process、スタック配列 |
-| `spawn` | 外部コマンドの起動 (`posix_spawnp`) | fork+exec 回避、RAII ラッパー |
-| `builtins` | cd, echo, export 等の組込コマンド | fork 不要、直接実行 |
+| `parser` | 入力をAST（コマンド列）に変換。チルダ展開、コマンド置換パススルー、fd 複製 | ゼロコピー (`Cow::Borrowed`) |
+| `executor` | コマンド実行・パイプライン接続。展開パイプライン: コマンド置換 → チルダ → glob | ビルトイン in-process、スタック配列 |
+| `spawn` | 外部コマンドの起動 (`posix_spawnp`)。fd 複製 (`2>&1`) 対応 | fork+exec 回避、RAII ラッパー |
+| `builtins` | exit, cd, pwd, echo, export, unset, jobs, fg, bg, type | fork 不要、直接実行 |
 | `job` | ジョブコントロール (bg/fg/jobs) | waitpid 手動 reap |
 | `editor` | 行編集 (raw モード、キー入力) | libc 直接操作、1 回の write(2) |
 | `highlight` | シンタックスハイライト・PATH キャッシュ | HashSet キャッシュ、変更検出 |
@@ -119,6 +119,23 @@
 - スタック配列化 (`executor.rs`): パイプ `[[i32;2]; 7]` / PID `[pid_t; 8]` / close fd `[i32; 16]`
 - PATH キャッシュ統合 (`shell.rs`): `PathCache` を Shell に追加
 - ベンチマーク整備 (`benches/bench_main.rs`): パーサー・ビルトイン・spawn・E2E 計測
+
+### Phase 7: Advanced Syntax ✅
+- 複合コマンド: `&&` (AND), `||` (OR), `;` (順次実行)
+- エスケープ: `\"`, `\\`, `\$`（ダブルクォート内）, `\X`（裸ワード内）
+- `${VAR}` 展開（接尾辞安全な変数展開）
+- glob 展開 (`*.rs`, `?` パターン)
+
+### Phase 8: Shell Extensions ✅
+- コマンド置換: `$(cmd)`, `` `cmd` ``（fork + pipe + waitpid で stdout をキャプチャ）
+- チルダ展開: `~` → `$HOME`, `~/path`, `~user`（`getpwnam`）, `VAR=~/path`
+- fd 複製リダイレクト: `2>&1`, `>&2`（`posix_spawn_file_actions_adddup2` で実装）
+- `type` ビルトイン: コマンドの所在表示（ビルトイン / 外部コマンドの PATH 検索）
+- `~/.rushrc` 読み込み: 起動時に RC ファイルを行単位で実行（コメント `#` 対応）
+- Tab 補完のチルダ対応: `~/` プレフィックスを展開してディレクトリを検索
+- シンタックスハイライト拡張: `$(cmd)` / バッククォートをシアン、`2>&1` をシアンで着色
+- 展開パイプライン統一: `expand_args_full`（コマンド置換 → チルダ → glob の順序で適用）
+- ベンチマーク追加: チルダ展開の計測
 
 ## Speed Comparison Targets
 
