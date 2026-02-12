@@ -30,7 +30,7 @@ pub fn is_builtin(name: &str) -> bool {
     matches!(name, "exit" | "cd" | "pwd" | "echo" | "export" | "unset"
                  | "jobs" | "fg" | "bg" | "type" | "source" | "."
                  | "alias" | "unalias" | "history"
-                 | "command" | "builtin" | "read" | "exec")
+                 | "command" | "builtin" | "read" | "exec" | "wait")
 }
 
 /// ビルトインコマンドの実行を試みる。
@@ -60,6 +60,7 @@ pub fn try_exec(shell: &mut Shell, args: &[&str], stdout: &mut dyn Write) -> Opt
         "builtin" => Some(builtin_builtin(shell, args, stdout)),
         "read" => Some(builtin_read(args)),
         "exec" => Some(builtin_exec(args)),
+        "wait" => Some(builtin_wait(shell, args)),
         _ => None,
     }
 }
@@ -367,6 +368,65 @@ fn builtin_bg(shell: &mut Shell, args: &[&str]) -> i32 {
 
     eprintln!("[{}]+ {} &", job_id, command);
     0
+}
+
+// ── wait ────────────────────────────────────────────────────────────
+
+/// `wait [%N]` — バックグラウンドジョブの完了を待機する。
+/// 引数なしなら全バックグラウンドジョブを待つ。`%N` で特定ジョブを待つ。
+fn builtin_wait(shell: &mut Shell, args: &[&str]) -> i32 {
+    if args.len() > 1 {
+        // 特定ジョブを待機
+        let job_id = match parse_job_arg(shell, args) {
+            Ok(id) => id,
+            Err(status) => return status,
+        };
+        let pgid = match shell.jobs.get(job_id) {
+            Some(job) => job.pgid,
+            None => {
+                eprintln!("rush: wait: %{}: no such job", job_id);
+                return 127;
+            }
+        };
+        // waitpid で完了まで待機
+        loop {
+            let mut raw_status: i32 = 0;
+            let pid = unsafe { libc::waitpid(-pgid, &mut raw_status, libc::WUNTRACED) };
+            if pid <= 0 {
+                break;
+            }
+            shell.jobs.mark_pid(pid, raw_status);
+            if let Some(job) = shell.jobs.get(job_id) {
+                match job.status() {
+                    JobStatus::Done(code) => {
+                        if let Some(job) = shell.jobs.get_mut(job_id) {
+                            job.notified = true;
+                        }
+                        shell.jobs.remove_done();
+                        return code;
+                    }
+                    JobStatus::Stopped => return 148,
+                    JobStatus::Running => continue,
+                }
+            } else {
+                break;
+            }
+        }
+        0
+    } else {
+        // 全バックグラウンドジョブを待機
+        loop {
+            let mut raw_status: i32 = 0;
+            let pid = unsafe { libc::waitpid(-1, &mut raw_status, libc::WUNTRACED) };
+            if pid <= 0 {
+                break;
+            }
+            shell.jobs.mark_pid(pid, raw_status);
+        }
+        // 完了済みジョブを通知・削除
+        job::notify_and_clean(&mut shell.jobs);
+        0
+    }
 }
 
 // ── exec ────────────────────────────────────────────────────────────
