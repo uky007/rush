@@ -649,6 +649,8 @@ fn execute_job(shell: &mut Shell, pipeline: &Pipeline<'_>, cmd_text: &str) -> i3
 
     if pipeline.background {
         // バックグラウンド: ジョブテーブルに追加
+        shell.last_bg_pid = pgid;
+        std::env::set_var("RUSH_LAST_BG_PID", pgid.to_string());
         let job_id = shell
             .jobs
             .insert(pgid, display_cmd.to_string(), active_pids.to_vec());

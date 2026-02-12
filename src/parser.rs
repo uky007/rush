@@ -8,7 +8,7 @@
 //! - パイプライン: `cmd1 | cmd2 | cmd3`
 //! - リダイレクト: `>`, `>>`, `<`, `2>`
 //! - クォート: シングル (`'...'`) / ダブル (`"..."`)
-//! - 変数展開: `$VAR`, `${VAR}`, `$?`（ダブルクォート内・裸ワードで展開、シングルクォートではリテラル）
+//! - 変数展開: `$VAR`, `${VAR}`, `$?`, `$$`, `$!`, `$0`（ダブルクォート内・裸ワードで展開、シングルクォートではリテラル）
 //! - パラメータ展開: `${var:-default}`, `${var:=val}`, `${var:+alt}`, `${var:?msg}`,
 //!   `${#var}`, `${var%pat}`, `${var%%pat}`, `${var#pat}`, `${var##pat}`,
 //!   `${var/pat/repl}`, `${var//pat/repl}`
@@ -273,6 +273,19 @@ fn expand_variables(s: &str, last_status: i32) -> Cow<'_, str> {
             }
             b'?' => {
                 result.push_str(&last_status.to_string());
+                pos += 1;
+            }
+            b'$' => {
+                result.push_str(&unsafe { libc::getpid() }.to_string());
+                pos += 1;
+            }
+            b'!' => {
+                let bg_pid = std::env::var("RUSH_LAST_BG_PID").unwrap_or_else(|_| "0".into());
+                result.push_str(&bg_pid);
+                pos += 1;
+            }
+            b'0' => {
+                result.push_str("rush");
                 pos += 1;
             }
             b'{' => {
@@ -780,6 +793,19 @@ impl<'a> Tokenizer<'a> {
             }
             b'?' => {
                 buf.push_str(&self.last_status.to_string());
+                self.pos += 1;
+            }
+            b'$' => {
+                buf.push_str(&unsafe { libc::getpid() }.to_string());
+                self.pos += 1;
+            }
+            b'!' => {
+                let bg_pid = std::env::var("RUSH_LAST_BG_PID").unwrap_or_else(|_| "0".into());
+                buf.push_str(&bg_pid);
+                self.pos += 1;
+            }
+            b'0' => {
+                buf.push_str("rush");
                 self.pos += 1;
             }
             b'{' => {
@@ -1565,6 +1591,27 @@ mod tests {
     }
 
     #[test]
+    fn expand_dollar_dollar() {
+        let list = parse("echo $$", 0).unwrap().unwrap();
+        let val: i32 = list.items[0].pipeline.commands[0].args[1].parse().unwrap();
+        assert!(val > 0); // should be a valid PID
+    }
+
+    #[test]
+    fn expand_dollar_bang() {
+        std::env::set_var("RUSH_LAST_BG_PID", "12345");
+        let list = parse("echo $!", 0).unwrap().unwrap();
+        assert_eq!(list.items[0].pipeline.commands[0].args[1], "12345");
+        std::env::remove_var("RUSH_LAST_BG_PID");
+    }
+
+    #[test]
+    fn expand_dollar_zero() {
+        let list = parse("echo $0", 0).unwrap().unwrap();
+        assert_eq!(list.items[0].pipeline.commands[0].args[1], "rush");
+    }
+
+    #[test]
     fn expand_undefined_var() {
         std::env::remove_var("RUSH_NONEXISTENT_VAR_XYZ");
         let list = parse("echo $RUSH_NONEXISTENT_VAR_XYZ", 0).unwrap().unwrap();
@@ -1604,8 +1651,9 @@ mod tests {
 
     #[test]
     fn dollar_before_non_ident() {
-        let list = parse("echo $!", 0).unwrap().unwrap();
-        assert_eq!(list.items[0].pipeline.commands[0].args[1], "$!");
+        // $@ is not a special variable — treated as literal "$@"
+        let list = parse("echo $@", 0).unwrap().unwrap();
+        assert_eq!(list.items[0].pipeline.commands[0].args[1], "$@");
     }
 
     #[test]
