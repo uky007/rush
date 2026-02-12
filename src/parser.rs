@@ -6,7 +6,7 @@
 //! ## 対応構文
 //!
 //! - パイプライン: `cmd1 | cmd2 | cmd3`
-//! - リダイレクト: `>`, `>>`, `<`, `2>`
+//! - リダイレクト: `>`, `>>`, `<`, `2>`, `2>>`
 //! - クォート: シングル (`'...'`) / ダブル (`"..."`)
 //! - 変数展開: `$VAR`, `${VAR}`, `$?`, `$$`, `$!`, `$0`（ダブルクォート内・裸ワードで展開、シングルクォートではリテラル）
 //! - パラメータ展開: `${var:-default}`, `${var:=val}`, `${var:+alt}`, `${var:?msg}`,
@@ -90,6 +90,8 @@ pub enum RedirectKind {
     Input,
     /// `2>` — stderr を上書き
     Stderr,
+    /// `2>>` — stderr を追記
+    StderrAppend,
     /// `N>&M` — fd 複製（src_fd を dst_fd のコピーにする）
     FdDup { src_fd: i32, dst_fd: i32 },
 }
@@ -688,6 +690,7 @@ enum Token<'a> {
     RedirectAppend, // >>
     RedirectIn,     // <
     RedirectErr,    // 2>
+    RedirectErrAppend, // 2>>
     FdDupPrefix(i32), // N>& — src_fd は N、次の Word が dst_fd
 }
 
@@ -902,6 +905,10 @@ impl<'a> Iterator for Tokenizer<'a> {
             b'2' if self.peek_at(1) == Some(b'>') && self.peek_at(2) == Some(b'&') => {
                 self.pos += 3;
                 Some(Ok(Token::FdDupPrefix(2)))
+            }
+            b'2' if self.peek_at(1) == Some(b'>') && self.peek_at(2) == Some(b'>') => {
+                self.pos += 3;
+                Some(Ok(Token::RedirectErrAppend))
             }
             b'2' if self.peek_at(1) == Some(b'>') => {
                 self.pos += 2;
@@ -1234,12 +1241,13 @@ pub fn parse(input: &str, last_status: i32) -> Result<Option<CommandList<'_>>, P
                 });
                 background = false;
             }
-            Token::RedirectOut | Token::RedirectAppend | Token::RedirectIn | Token::RedirectErr => {
+            Token::RedirectOut | Token::RedirectAppend | Token::RedirectIn | Token::RedirectErr | Token::RedirectErrAppend => {
                 let kind = match token {
                     Token::RedirectOut => RedirectKind::Output,
                     Token::RedirectAppend => RedirectKind::Append,
                     Token::RedirectIn => RedirectKind::Input,
                     Token::RedirectErr => RedirectKind::Stderr,
+                    Token::RedirectErrAppend => RedirectKind::StderrAppend,
                     _ => unreachable!(),
                 };
                 match tokens.next() {
@@ -1420,6 +1428,14 @@ mod tests {
         let p = &list.items[0].pipeline;
         assert_eq!(p.commands[0].redirects[0].kind, RedirectKind::Stderr);
         assert_eq!(p.commands[0].redirects[0].target, "err.txt");
+    }
+
+    #[test]
+    fn redirect_stderr_append() {
+        let list = parse("cmd 2>> err.log", 0).unwrap().unwrap();
+        let p = &list.items[0].pipeline;
+        assert_eq!(p.commands[0].redirects[0].kind, RedirectKind::StderrAppend);
+        assert_eq!(p.commands[0].redirects[0].target, "err.log");
     }
 
     #[test]

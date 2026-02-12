@@ -453,6 +453,16 @@ fn open_redirect_fds(redirects: &[parser::Redirect<'_>]) -> Result<RedirectFds, 
                 })?;
                 fds.stderr_fd = Some(f.into_raw_fd());
             }
+            RedirectKind::StderrAppend => {
+                if let Some(old) = fds.stderr_fd {
+                    unsafe { libc::close(old); }
+                }
+                let f = OpenOptions::new().create(true).append(true).open(target).map_err(|e| {
+                    eprintln!("rush: {}: {}", target, e);
+                    1
+                })?;
+                fds.stderr_fd = Some(f.into_raw_fd());
+            }
             RedirectKind::FdDup { src_fd, dst_fd } => {
                 fds.dup_actions.push((src_fd, dst_fd));
             }
