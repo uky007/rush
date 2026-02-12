@@ -6,7 +6,7 @@
 //! ## 対応構文
 //!
 //! - パイプライン: `cmd1 | cmd2 | cmd3`
-//! - リダイレクト: `>`, `>>`, `<`, `2>`, `2>>`
+//! - リダイレクト: `>`, `>>`, `<`, `2>`, `2>>`, `<<DELIM`（ヒアドキュメント）, `<<<`（ヒアストリング）
 //! - クォート: シングル (`'...'`) / ダブル (`"..."`)
 //! - 変数展開: `$VAR`, `${VAR}`, `$?`, `$$`, `$!`, `$0`, `$RANDOM`, `$SECONDS`（ダブルクォート内・裸ワードで展開、シングルクォートではリテラル）
 //! - パラメータ展開: `${var:-default}`, `${var:=val}`, `${var:+alt}`, `${var:?msg}`,
@@ -101,6 +101,10 @@ pub enum RedirectKind {
     StderrAppend,
     /// `N>&M` — fd 複製（src_fd を dst_fd のコピーにする）
     FdDup { src_fd: i32, dst_fd: i32 },
+    /// `<<DELIM` — ヒアドキュメント（stdin にテキストブロックを供給）
+    HereDoc,
+    /// `<<<` — ヒアストリング（stdin に文字列を供給）
+    HereString,
 }
 
 // ── Error ───────────────────────────────────────────────────────────
@@ -731,6 +735,8 @@ enum Token<'a> {
     RedirectErr,    // 2>
     RedirectErrAppend, // 2>>
     FdDupPrefix(i32), // N>& — src_fd は N、次の Word が dst_fd
+    HereDoc,          // <<
+    HereString,       // <<<
 }
 
 /// 入力文字列をトークン列に変換するイテレータ。
@@ -939,8 +945,16 @@ impl<'a> Iterator for Tokenizer<'a> {
                 }
             }
             b'<' => {
-                self.pos += 1;
-                Some(Ok(Token::RedirectIn))
+                if self.peek_at(1) == Some(b'<') && self.peek_at(2) == Some(b'<') {
+                    self.pos += 3;
+                    Some(Ok(Token::HereString))
+                } else if self.peek_at(1) == Some(b'<') {
+                    self.pos += 2;
+                    Some(Ok(Token::HereDoc))
+                } else {
+                    self.pos += 1;
+                    Some(Ok(Token::RedirectIn))
+                }
             }
             // トークン先頭の `2>` のみ。`file2>` 等の途中はWordとして読まれる。
             b'2' if self.peek_at(1) == Some(b'>') && self.peek_at(2) == Some(b'&') => {
@@ -1201,6 +1215,39 @@ impl<'a> Iterator for Tokenizer<'a> {
 
 // ── Parser ──────────────────────────────────────────────────────────
 
+/// コマンドリスト内にヒアドキュメントのデリミタを返す。
+/// ヒアドキュメントがなければ空の Vec を返す。
+pub fn heredoc_delimiters(list: &CommandList<'_>) -> Vec<String> {
+    let mut delims = Vec::new();
+    for item in &list.items {
+        for cmd in &item.pipeline.commands {
+            for r in &cmd.redirects {
+                if r.kind == RedirectKind::HereDoc {
+                    delims.push(r.target.to_string());
+                }
+            }
+        }
+    }
+    delims
+}
+
+/// ヒアドキュメントの body を target に設定する（デリミタ → 本文テキストに置換）。
+pub fn fill_heredoc_bodies(list: &mut CommandList<'_>, bodies: &[String]) {
+    let mut idx = 0;
+    for item in &mut list.items {
+        for cmd in &mut item.pipeline.commands {
+            for r in &mut cmd.redirects {
+                if r.kind == RedirectKind::HereDoc {
+                    if idx < bodies.len() {
+                        r.target = Cow::Owned(bodies[idx].clone());
+                    }
+                    idx += 1;
+                }
+            }
+        }
+    }
+}
+
 /// 入力文字列をパースして `CommandList` AST を返す。
 ///
 /// - 空入力 → `Ok(None)`
@@ -1314,6 +1361,26 @@ pub fn parse(input: &str, last_status: i32) -> Result<Option<CommandList<'_>>, P
                 match tokens.next() {
                     Some(Ok(Token::Word(target))) => {
                         redirects.push(Redirect { kind, target });
+                    }
+                    Some(Err(e)) => return Err(e),
+                    _ => return Err(ParseError::MissingRedirectTarget),
+                }
+            }
+            Token::HereDoc => {
+                // <<DELIM — ヒアドキュメント（デリミタをターゲットに格納）
+                match tokens.next() {
+                    Some(Ok(Token::Word(delim))) => {
+                        redirects.push(Redirect { kind: RedirectKind::HereDoc, target: delim });
+                    }
+                    Some(Err(e)) => return Err(e),
+                    _ => return Err(ParseError::MissingRedirectTarget),
+                }
+            }
+            Token::HereString => {
+                // <<<word — ヒアストリング
+                match tokens.next() {
+                    Some(Ok(Token::Word(word))) => {
+                        redirects.push(Redirect { kind: RedirectKind::HereString, target: word });
                     }
                     Some(Err(e)) => return Err(e),
                     _ => return Err(ParseError::MissingRedirectTarget),
@@ -1497,6 +1564,38 @@ mod tests {
         let p = &list.items[0].pipeline;
         assert_eq!(p.commands[0].redirects[0].kind, RedirectKind::StderrAppend);
         assert_eq!(p.commands[0].redirects[0].target, "err.log");
+    }
+
+    #[test]
+    fn here_string() {
+        let list = parse("cat <<<hello", 0).unwrap().unwrap();
+        let p = &list.items[0].pipeline;
+        assert_eq!(p.commands[0].args[0], "cat");
+        assert_eq!(p.commands[0].redirects[0].kind, RedirectKind::HereString);
+        assert_eq!(p.commands[0].redirects[0].target, "hello");
+    }
+
+    #[test]
+    fn here_string_with_space() {
+        let list = parse("cat <<< word", 0).unwrap().unwrap();
+        let p = &list.items[0].pipeline;
+        assert_eq!(p.commands[0].redirects[0].kind, RedirectKind::HereString);
+        assert_eq!(p.commands[0].redirects[0].target, "word");
+    }
+
+    #[test]
+    fn here_doc_delimiter() {
+        let list = parse("cat <<EOF", 0).unwrap().unwrap();
+        let p = &list.items[0].pipeline;
+        assert_eq!(p.commands[0].redirects[0].kind, RedirectKind::HereDoc);
+        assert_eq!(p.commands[0].redirects[0].target, "EOF");
+    }
+
+    #[test]
+    fn here_doc_delimiters_fn() {
+        let list = parse("cat <<EOF", 0).unwrap().unwrap();
+        let delims = heredoc_delimiters(&list);
+        assert_eq!(delims, vec!["EOF"]);
     }
 
     #[test]

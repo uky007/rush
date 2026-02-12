@@ -490,10 +490,44 @@ fn open_redirect_fds(redirects: &[parser::Redirect<'_>]) -> Result<RedirectFds, 
             RedirectKind::FdDup { src_fd, dst_fd } => {
                 fds.dup_actions.push((src_fd, dst_fd));
             }
+            RedirectKind::HereDoc => {
+                // <<DELIM — target にはデリミタ文字列が入っている
+                // REPL の継続行入力で本体が蓄積されているはずだが、
+                // 非インタラクティブ実行時は target に本体テキストが入る
+                if let Some(old) = fds.stdin_fd {
+                    unsafe { libc::close(old); }
+                }
+                let fd = create_pipe_from_string(target);
+                fds.stdin_fd = Some(fd);
+            }
+            RedirectKind::HereString => {
+                // <<<word — word + 改行を stdin に供給
+                if let Some(old) = fds.stdin_fd {
+                    unsafe { libc::close(old); }
+                }
+                let content = format!("{}\n", target);
+                let fd = create_pipe_from_string(&content);
+                fds.stdin_fd = Some(fd);
+            }
         }
     }
 
     Ok(fds)
+}
+
+/// 文字列をパイプの書き込み側に書き込み、読み取り側の fd を返す。
+/// ヒアドキュメント・ヒアストリング用。
+fn create_pipe_from_string(content: &str) -> i32 {
+    let mut pipe_fds: [i32; 2] = [0; 2];
+    unsafe { libc::pipe(pipe_fds.as_mut_ptr()); }
+    let read_fd = pipe_fds[0];
+    let write_fd = pipe_fds[1];
+    let bytes = content.as_bytes();
+    unsafe {
+        libc::write(write_fd, bytes.as_ptr() as *const libc::c_void, bytes.len());
+        libc::close(write_fd);
+    }
+    read_fd
 }
 
 /// パイプライン（単一 or 複数コマンド）を子プロセスとして実行する。

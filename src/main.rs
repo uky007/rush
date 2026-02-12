@@ -137,14 +137,38 @@ fn expand_alias(line: &str, aliases: &HashMap<String, String>) -> String {
 
 /// 文字列を 1 行ずつ（または単一コマンドとして）パースして実行する。
 fn run_string(shell: &mut Shell, input: &str) {
-    for line in input.lines() {
-        let trimmed = line.trim();
+    let lines: Vec<&str> = input.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let trimmed = lines[i].trim();
+        i += 1;
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
         let expanded = expand_alias(trimmed, &shell.aliases);
         match parser::parse(&expanded, shell.last_status) {
-            Ok(Some(list)) => {
+            Ok(Some(mut list)) => {
+                // ヒアドキュメントの本文を収集
+                let delims = parser::heredoc_delimiters(&list);
+                if !delims.is_empty() {
+                    let mut bodies = Vec::new();
+                    for delim in &delims {
+                        let mut body = String::new();
+                        while i < lines.len() {
+                            let line = lines[i];
+                            i += 1;
+                            if line.trim() == delim.as_str() {
+                                break;
+                            }
+                            if !body.is_empty() {
+                                body.push('\n');
+                            }
+                            body.push_str(line);
+                        }
+                        bodies.push(body);
+                    }
+                    parser::fill_heredoc_bodies(&mut list, &bodies);
+                }
                 let cmd_text = expanded.trim().to_string();
                 shell.last_status = executor::execute(shell, &list, &cmd_text);
             }
@@ -256,7 +280,31 @@ fn main() {
 
                     // パース: 不完全入力なら `> ` プロンプトで継続行を読み取る
                     match parser::parse(&accumulated, shell.last_status) {
-                        Ok(Some(list)) => {
+                        Ok(Some(mut list)) => {
+                            // ヒアドキュメントの本文を対話的に収集
+                            let delims = parser::heredoc_delimiters(&list);
+                            if !delims.is_empty() {
+                                let mut bodies = Vec::new();
+                                for delim in &delims {
+                                    let mut body = String::new();
+                                    loop {
+                                        match editor.read_line("> ") {
+                                            Some(line) => {
+                                                if line.trim() == delim.as_str() {
+                                                    break;
+                                                }
+                                                if !body.is_empty() {
+                                                    body.push('\n');
+                                                }
+                                                body.push_str(&line);
+                                            }
+                                            None => break,
+                                        }
+                                    }
+                                    bodies.push(body);
+                                }
+                                parser::fill_heredoc_bodies(&mut list, &bodies);
+                            }
                             let cmd_text = accumulated.trim().to_string();
                             shell.last_status = executor::execute(&mut shell, &list, &cmd_text);
                             break;
