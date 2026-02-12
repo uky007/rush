@@ -4,7 +4,7 @@
 //! `try_exec()` が `Some(status)` を返せばビルトインとして処理済み、
 //! `None` なら外部コマンドとしてexecutorに委ねる。
 //!
-//! ## 対応ビルトイン（23 種）
+//! ## 対応ビルトイン（26 種）
 //!
 //! - シェル制御: `exit`, `cd`（`cd -` / OLDPWD 対応）, `exec`
 //! - 出力: `pwd`, `echo`（`-n` 対応）
@@ -17,6 +17,7 @@
 //! - フロー制御: `true` / `:`（常に 0）, `false`（常に 1）, `return`（source からの早期脱出）
 //! - 条件判定: `test` / `[`（文字列・整数・ファイル判定、`!` 否定）
 //! - 出力: `printf`（`%s`, `%d`, `%x`, `%o`, 幅指定、ゼロパディング、エスケープ）
+//! - ディレクトリスタック: `pushd`（スタックに積んで移動）, `popd`（ポップして移動）, `dirs`（一覧）
 //! - 履歴: `history`（main.rs で特別扱い、`-c` クリア、`N` 件表示）
 
 use std::env;
@@ -39,7 +40,8 @@ pub fn is_builtin(name: &str) -> bool {
                  | "alias" | "unalias" | "history"
                  | "command" | "builtin" | "read" | "exec" | "wait"
                  | "true" | "false" | ":" | "return"
-                 | "test" | "[" | "printf")
+                 | "test" | "[" | "printf"
+                 | "pushd" | "popd" | "dirs")
 }
 
 /// ビルトインコマンドの実行を試みる。
@@ -75,6 +77,9 @@ pub fn try_exec(shell: &mut Shell, args: &[&str], stdout: &mut dyn Write) -> Opt
         "return" => Some(builtin_return(shell, args)),
         "test" | "[" => Some(builtin_test(args)),
         "printf" => Some(builtin_printf(args, stdout)),
+        "pushd" => Some(builtin_pushd(shell, args, stdout)),
+        "popd" => Some(builtin_popd(shell, args, stdout)),
+        "dirs" => Some(builtin_dirs(shell, stdout)),
         _ => None,
     }
 }
@@ -687,6 +692,81 @@ fn builtin_source(shell: &mut Shell, args: &[&str]) -> i32 {
     shell.last_status
 }
 
+// ── pushd / popd / dirs ─────────────────────────────────────────────
+
+/// `pushd [dir]` — カレントディレクトリをスタックに積んで dir に移動する。
+/// 引数なしならスタックトップとカレントを交換する。
+fn builtin_pushd(shell: &mut Shell, args: &[&str], stdout: &mut dyn Write) -> i32 {
+    let cwd = match env::current_dir() {
+        Ok(p) => p.to_string_lossy().to_string(),
+        Err(e) => {
+            eprintln!("rush: pushd: {}", e);
+            return 1;
+        }
+    };
+
+    if args.len() > 1 {
+        let target = args[1];
+        if let Err(e) = env::set_current_dir(Path::new(target)) {
+            eprintln!("rush: pushd: {}: {}", target, e);
+            return 1;
+        }
+        shell.dir_stack.push(cwd);
+    } else {
+        // 引数なし: スタックトップとカレントを交換
+        if let Some(top) = shell.dir_stack.pop() {
+            if let Err(e) = env::set_current_dir(Path::new(&top)) {
+                eprintln!("rush: pushd: {}: {}", top, e);
+                shell.dir_stack.push(top);
+                return 1;
+            }
+            shell.dir_stack.push(cwd);
+        } else {
+            eprintln!("rush: pushd: no other directory");
+            return 1;
+        }
+    }
+    // スタック表示
+    print_dir_stack(shell, stdout);
+    0
+}
+
+/// `popd` — スタックからディレクトリをポップして移動する。
+fn builtin_popd(shell: &mut Shell, _args: &[&str], stdout: &mut dyn Write) -> i32 {
+    match shell.dir_stack.pop() {
+        Some(dir) => {
+            if let Err(e) = env::set_current_dir(Path::new(&dir)) {
+                eprintln!("rush: popd: {}: {}", dir, e);
+                shell.dir_stack.push(dir);
+                return 1;
+            }
+            print_dir_stack(shell, stdout);
+            0
+        }
+        None => {
+            eprintln!("rush: popd: directory stack empty");
+            1
+        }
+    }
+}
+
+/// `dirs` — ディレクトリスタックを表示する。
+fn builtin_dirs(shell: &Shell, stdout: &mut dyn Write) -> i32 {
+    print_dir_stack(shell, stdout);
+    0
+}
+
+/// ディレクトリスタックを表示する（カレントディレクトリ + スタック）。
+fn print_dir_stack(shell: &Shell, stdout: &mut dyn Write) {
+    if let Ok(cwd) = env::current_dir() {
+        let _ = write!(stdout, "{}", cwd.display());
+    }
+    for dir in shell.dir_stack.iter().rev() {
+        let _ = write!(stdout, " {}", dir);
+    }
+    let _ = writeln!(stdout);
+}
+
 // ── printf ──────────────────────────────────────────────────────────
 
 /// `printf format [args...]` — フォーマット文字列に従って出力する。
@@ -1254,5 +1334,45 @@ mod tests {
         let mut buf = Vec::new();
         builtin_printf(&["printf", "100%%"], &mut buf);
         assert_eq!(String::from_utf8(buf).unwrap(), "100%");
+    }
+
+    #[test]
+    fn pushd_and_popd() {
+        let orig = env::current_dir().unwrap();
+        let tmp = env::temp_dir().canonicalize().unwrap();
+        let mut shell = Shell::new();
+        let mut buf = Vec::new();
+
+        // pushd to tmp
+        let status = builtin_pushd(&mut shell, &["pushd", tmp.to_str().unwrap()], &mut buf);
+        assert_eq!(status, 0);
+        assert_eq!(shell.dir_stack.len(), 1);
+
+        // popd back to orig
+        let mut buf2 = Vec::new();
+        let status = builtin_popd(&mut shell, &["popd"], &mut buf2);
+        assert_eq!(status, 0);
+        assert_eq!(env::current_dir().unwrap(), orig);
+        assert_eq!(shell.dir_stack.len(), 0);
+
+        let _ = env::set_current_dir(&orig);
+    }
+
+    #[test]
+    fn popd_empty_stack() {
+        let mut shell = Shell::new();
+        let mut buf = Vec::new();
+        let status = builtin_popd(&mut shell, &["popd"], &mut buf);
+        assert_eq!(status, 1);
+    }
+
+    #[test]
+    fn dirs_shows_current() {
+        let shell = Shell::new();
+        let mut buf = Vec::new();
+        let status = builtin_dirs(&shell, &mut buf);
+        assert_eq!(status, 0);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(!output.trim().is_empty());
     }
 }

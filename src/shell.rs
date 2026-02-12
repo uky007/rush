@@ -38,6 +38,8 @@ pub struct Shell {
     pub source_depth: usize,
     /// `return` が呼ばれたら true にセットし、`source` のループを中断する。
     pub should_return: bool,
+    /// ディレクトリスタック（`pushd`/`popd` 用）。スタックトップが最新。
+    pub dir_stack: Vec<String>,
 }
 
 impl Shell {
@@ -54,6 +56,7 @@ impl Shell {
             last_bg_pid: 0,
             source_depth: 0,
             should_return: false,
+            dir_stack: Vec::new(),
         }
     }
 }
