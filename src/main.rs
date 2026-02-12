@@ -167,28 +167,56 @@ fn main() {
             Some(line) if !line.trim().is_empty() => {
                 editor.add_history(&line);
                 // エイリアス展開（コマンド位置の最初の単語のみ、再帰ガード付き）
-                let line = expand_alias(&line, &shell.aliases);
+                let mut accumulated = expand_alias(&line, &shell.aliases);
 
-                // history ビルトイン: editor へのアクセスが必要なため main.rs で特別扱い
-                let trimmed = line.trim();
-                if trimmed == "history" || trimmed.starts_with("history ") {
-                    shell.last_status = handle_history(&mut editor, trimmed);
-                    if shell.should_exit { break; }
-                    continue;
-                }
-
-                // パース: CommandList<'_> は line を借用 → execute 後に drop
-                // cmd_text はジョブテーブルの表示用コマンド文字列として execute に渡す
-                let cmd_text = line.trim().to_string();
-                match parser::parse(&line, shell.last_status) {
-                    Ok(Some(list)) => {
-                        shell.last_status = executor::execute(&mut shell, &list, &cmd_text);
+                // 継続行入力ループ: 末尾 `\`、未完了パイプ/演算子、未閉クォートに対応
+                loop {
+                    // 末尾 `\` → バックスラッシュを除去して次行を連結
+                    let trimmed_end = accumulated.trim_end();
+                    if trimmed_end.ends_with('\\') {
+                        accumulated = trimmed_end[..trimmed_end.len() - 1].to_string();
+                        match editor.read_line("> ") {
+                            Some(next) => {
+                                accumulated.push_str(&next);
+                                continue;
+                            }
+                            None => break,
+                        }
                     }
-                    Ok(None) => continue,
-                    Err(e) => {
-                        eprintln!("rush: {}", e);
-                        shell.last_status = 2;
-                        continue;
+
+                    // history ビルトイン: editor へのアクセスが必要なため main.rs で特別扱い
+                    let cmd_trimmed = accumulated.trim();
+                    if cmd_trimmed == "history" || cmd_trimmed.starts_with("history ") {
+                        shell.last_status = handle_history(&mut editor, cmd_trimmed);
+                        break;
+                    }
+
+                    // パース: 不完全入力なら `> ` プロンプトで継続行を読み取る
+                    match parser::parse(&accumulated, shell.last_status) {
+                        Ok(Some(list)) => {
+                            let cmd_text = accumulated.trim().to_string();
+                            shell.last_status = executor::execute(&mut shell, &list, &cmd_text);
+                            break;
+                        }
+                        Ok(None) => break,
+                        Err(parser::ParseError::IncompleteInput)
+                        | Err(parser::ParseError::UnterminatedQuote(_)) => {
+                            match editor.read_line("> ") {
+                                Some(next) => {
+                                    accumulated.push('\n');
+                                    accumulated.push_str(&next);
+                                }
+                                None => {
+                                    println!();
+                                    break;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("rush: {}", e);
+                            shell.last_status = 2;
+                            break;
+                        }
                     }
                 }
             }

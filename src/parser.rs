@@ -103,6 +103,8 @@ pub enum ParseError {
     EmptyPipelineSegment,
     /// fd 複製リダイレクトの dst_fd が不正。
     BadFdRedirect,
+    /// 入力が不完全（末尾の `|`, `&&`, `||` 等）。対話モードでは継続行入力のトリガー。
+    IncompleteInput,
 }
 
 impl fmt::Display for ParseError {
@@ -112,6 +114,7 @@ impl fmt::Display for ParseError {
             Self::MissingRedirectTarget => write!(f, "syntax error: missing redirect target"),
             Self::EmptyPipelineSegment => write!(f, "syntax error near unexpected token"),
             Self::BadFdRedirect => write!(f, "syntax error: invalid file descriptor in redirect"),
+            Self::IncompleteInput => write!(f, "syntax error: unexpected end of input"),
         }
     }
 }
@@ -1233,9 +1236,9 @@ pub fn parse(input: &str, last_status: i32) -> Result<Option<CommandList<'_>>, P
         }
     }
 
-    // 末尾パイプ: commands があるが args がない → パイプの後にコマンドがない
+    // 末尾パイプ: commands があるが args がない → 継続行入力のトリガー
     if !commands.is_empty() && args.is_empty() && redirects.is_empty() {
-        return Err(ParseError::EmptyPipelineSegment);
+        return Err(ParseError::IncompleteInput);
     }
 
     // 最終パイプラインの処理
@@ -1257,10 +1260,10 @@ pub fn parse(input: &str, last_status: i32) -> Result<Option<CommandList<'_>>, P
         return Ok(None);
     }
 
-    // 末尾 &&/|| チェック: 最後の項目が And/Or なら後続コマンドなしエラー
+    // 末尾 &&/|| チェック: 最後の項目が And/Or なら継続行入力のトリガー
     if let Some(last) = items.last() {
         if matches!(last.connector, Connector::And | Connector::Or) {
-            return Err(ParseError::EmptyPipelineSegment);
+            return Err(ParseError::IncompleteInput);
         }
     }
 
@@ -1474,7 +1477,7 @@ mod tests {
 
     #[test]
     fn err_trailing_pipe() {
-        assert_eq!(parse("ls |", 0), Err(ParseError::EmptyPipelineSegment));
+        assert_eq!(parse("ls |", 0), Err(ParseError::IncompleteInput));
     }
 
     #[test]
@@ -1692,7 +1695,7 @@ mod tests {
 
     #[test]
     fn err_trailing_and() {
-        assert_eq!(parse("cmd &&", 0), Err(ParseError::EmptyPipelineSegment));
+        assert_eq!(parse("cmd &&", 0), Err(ParseError::IncompleteInput));
     }
 
     #[test]
@@ -1703,7 +1706,7 @@ mod tests {
 
     #[test]
     fn err_trailing_or() {
-        assert_eq!(parse("cmd ||", 0), Err(ParseError::EmptyPipelineSegment));
+        assert_eq!(parse("cmd ||", 0), Err(ParseError::IncompleteInput));
     }
 
     // ── エスケープテスト ──
@@ -1975,5 +1978,40 @@ mod tests {
     fn arith_in_double_quotes() {
         let list = parse("echo \"result=$((1+2))\"", 0).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "result=3");
+    }
+
+    // ── 継続行入力テスト ──
+
+    #[test]
+    fn incomplete_trailing_pipe() {
+        assert_eq!(parse("ls |", 0), Err(ParseError::IncompleteInput));
+        // 継続入力後の再パースは成功する
+        let list = parse("ls |\ngrep foo", 0).unwrap().unwrap();
+        assert_eq!(list.items[0].pipeline.commands.len(), 2);
+    }
+
+    #[test]
+    fn incomplete_trailing_and() {
+        assert_eq!(parse("true &&", 0), Err(ParseError::IncompleteInput));
+        let list = parse("true &&\necho ok", 0).unwrap().unwrap();
+        assert_eq!(list.items.len(), 2);
+        assert_eq!(list.items[0].connector, Connector::And);
+    }
+
+    #[test]
+    fn incomplete_trailing_or() {
+        assert_eq!(parse("false ||", 0), Err(ParseError::IncompleteInput));
+        let list = parse("false ||\necho ok", 0).unwrap().unwrap();
+        assert_eq!(list.items.len(), 2);
+        assert_eq!(list.items[0].connector, Connector::Or);
+    }
+
+    #[test]
+    fn multiline_quoted_string() {
+        // 最初のパースは UnterminatedQuote
+        assert!(matches!(parse("echo \"hello", 0), Err(ParseError::UnterminatedQuote('"'))));
+        // 継続入力後は成功
+        let list = parse("echo \"hello\nworld\"", 0).unwrap().unwrap();
+        assert_eq!(list.items[0].pipeline.commands[0].args[1], "hello\nworld");
     }
 }
