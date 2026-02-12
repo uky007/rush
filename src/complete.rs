@@ -24,7 +24,7 @@ use crate::parser;
 /// コマンド名補完に使うビルトイン一覧（アルファベット順）。
 ///
 /// [`builtins::is_builtin`](crate::builtins::is_builtin) と同期させること。
-const BUILTINS: &[&str] = &[".", "alias", "bg", "builtin", "cd", "command", "echo", "exit", "export", "fg", "history", "jobs", "pwd", "read", "source", "type", "unalias", "unset"];
+const BUILTINS: &[&str] = &[".", "alias", "bg", "builtin", "cd", "command", "echo", "exec", "exit", "export", "fg", "history", "jobs", "pwd", "read", "source", "type", "unalias", "unset"];
 
 /// Tab 補完の結果。候補リストと補完対象の単語位置を持つ。
 pub struct CompletionResult {

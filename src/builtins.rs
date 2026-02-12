@@ -30,7 +30,7 @@ pub fn is_builtin(name: &str) -> bool {
     matches!(name, "exit" | "cd" | "pwd" | "echo" | "export" | "unset"
                  | "jobs" | "fg" | "bg" | "type" | "source" | "."
                  | "alias" | "unalias" | "history"
-                 | "command" | "builtin" | "read")
+                 | "command" | "builtin" | "read" | "exec")
 }
 
 /// ビルトインコマンドの実行を試みる。
@@ -59,6 +59,7 @@ pub fn try_exec(shell: &mut Shell, args: &[&str], stdout: &mut dyn Write) -> Opt
         "command" => Some(builtin_command(shell, args, stdout)),
         "builtin" => Some(builtin_builtin(shell, args, stdout)),
         "read" => Some(builtin_read(args)),
+        "exec" => Some(builtin_exec(args)),
         _ => None,
     }
 }
@@ -366,6 +367,37 @@ fn builtin_bg(shell: &mut Shell, args: &[&str]) -> i32 {
 
     eprintln!("[{}]+ {} &", job_id, command);
     0
+}
+
+// ── exec ────────────────────────────────────────────────────────────
+
+/// `exec cmd [args...]` — シェルプロセスを `execvp` で置換する。引数なしなら no-op。
+fn builtin_exec(args: &[&str]) -> i32 {
+    if args.len() < 2 {
+        return 0; // 引数なし → no-op
+    }
+    // シグナルハンドラを SIG_DFL に復元
+    unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_DFL);
+        libc::signal(libc::SIGTSTP, libc::SIG_DFL);
+        libc::signal(libc::SIGTTOU, libc::SIG_DFL);
+        libc::signal(libc::SIGTTIN, libc::SIG_DFL);
+    }
+    let c_args: Vec<std::ffi::CString> = args[1..]
+        .iter()
+        .map(|s| std::ffi::CString::new(*s).unwrap_or_default())
+        .collect();
+    let c_ptrs: Vec<*const libc::c_char> = c_args
+        .iter()
+        .map(|s| s.as_ptr())
+        .chain(std::iter::once(std::ptr::null()))
+        .collect();
+    unsafe {
+        libc::execvp(c_ptrs[0], c_ptrs.as_ptr());
+    }
+    // execvp が返った場合はエラー
+    eprintln!("rush: exec: {}: {}", args[1], std::io::Error::last_os_error());
+    126
 }
 
 // ── read ────────────────────────────────────────────────────────────
