@@ -4,7 +4,7 @@
 //! `try_exec()` が `Some(status)` を返せばビルトインとして処理済み、
 //! `None` なら外部コマンドとしてexecutorに委ねる。
 //!
-//! ## 対応ビルトイン（20 種）
+//! ## 対応ビルトイン（22 種）
 //!
 //! - シェル制御: `exit`, `cd`（`cd -` / OLDPWD 対応）, `exec`
 //! - 出力: `pwd`, `echo`（`-n` 対応）
@@ -15,6 +15,7 @@
 //! - 情報: `type`
 //! - 実行制御: `command`（`-v` パス表示、エイリアスバイパス）, `builtin`（ビルトイン限定実行）
 //! - フロー制御: `true` / `:`（常に 0）, `false`（常に 1）, `return`（source からの早期脱出）
+//! - 条件判定: `test` / `[`（文字列・整数・ファイル判定、`!` 否定）
 //! - 履歴: `history`（main.rs で特別扱い、`-c` クリア、`N` 件表示）
 
 use std::env;
@@ -36,7 +37,8 @@ pub fn is_builtin(name: &str) -> bool {
                  | "jobs" | "fg" | "bg" | "type" | "source" | "."
                  | "alias" | "unalias" | "history"
                  | "command" | "builtin" | "read" | "exec" | "wait"
-                 | "true" | "false" | ":" | "return")
+                 | "true" | "false" | ":" | "return"
+                 | "test" | "[")
 }
 
 /// ビルトインコマンドの実行を試みる。
@@ -70,6 +72,7 @@ pub fn try_exec(shell: &mut Shell, args: &[&str], stdout: &mut dyn Write) -> Opt
         "true" | ":" => Some(0),
         "false" => Some(1),
         "return" => Some(builtin_return(shell, args)),
+        "test" | "[" => Some(builtin_test(args)),
         _ => None,
     }
 }
@@ -682,6 +685,102 @@ fn builtin_source(shell: &mut Shell, args: &[&str]) -> i32 {
     shell.last_status
 }
 
+// ── test / [ ────────────────────────────────────────────────────────
+
+/// `test expr` / `[ expr ]` — 条件式を評価する。
+///
+/// 対応演算子:
+/// - 文字列: `-n STR`, `-z STR`, `STR = STR`, `STR != STR`
+/// - 整数: `-eq`, `-ne`, `-lt`, `-le`, `-gt`, `-ge`
+/// - ファイル: `-e`, `-f`, `-d`, `-r`, `-w`, `-x`, `-s`
+/// - 論理: `!`（否定）
+fn builtin_test(args: &[&str]) -> i32 {
+    let is_bracket = args[0] == "[";
+    let test_args = if is_bracket {
+        // `[` の場合、末尾の `]` を除去
+        if args.last() != Some(&"]") {
+            eprintln!("rush: [: missing `]'");
+            return 2;
+        }
+        &args[1..args.len() - 1]
+    } else {
+        &args[1..]
+    };
+
+    if eval_test(test_args) { 0 } else { 1 }
+}
+
+/// test の条件式を再帰的に評価する。
+fn eval_test(args: &[&str]) -> bool {
+    match args.len() {
+        0 => false,
+        1 => !args[0].is_empty(),
+        2 => eval_unary(args[0], args[1]),
+        3 => {
+            if args[0] == "!" {
+                return !eval_test(&args[1..]);
+            }
+            eval_binary(args[0], args[1], args[2])
+        }
+        4 => {
+            if args[0] == "!" {
+                !eval_test(&args[1..])
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+/// 単項演算子: `-n`, `-z`, `-e`, `-f`, `-d`, `-r`, `-w`, `-x`, `-s`
+fn eval_unary(op: &str, operand: &str) -> bool {
+    match op {
+        "-n" => !operand.is_empty(),
+        "-z" => operand.is_empty(),
+        "-e" => Path::new(operand).exists(),
+        "-f" => Path::new(operand).is_file(),
+        "-d" => Path::new(operand).is_dir(),
+        "-r" => check_access(operand, libc::R_OK),
+        "-w" => check_access(operand, libc::W_OK),
+        "-x" => check_access(operand, libc::X_OK),
+        "-s" => std::fs::metadata(operand).map(|m| m.len() > 0).unwrap_or(false),
+        "!" => operand.is_empty(), // `! STR` → true if STR is empty
+        _ => false,
+    }
+}
+
+/// `access(2)` でファイルアクセス権をチェックする。
+fn check_access(path: &str, mode: i32) -> bool {
+    let c_path = match std::ffi::CString::new(path) {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+    unsafe { libc::access(c_path.as_ptr(), mode) == 0 }
+}
+
+/// 二項演算子: `=`, `!=`, `-eq`, `-ne`, `-lt`, `-le`, `-gt`, `-ge`
+fn eval_binary(left: &str, op: &str, right: &str) -> bool {
+    match op {
+        "=" | "==" => left == right,
+        "!=" => left != right,
+        "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge" => {
+            let l = left.parse::<i64>().unwrap_or(0);
+            let r = right.parse::<i64>().unwrap_or(0);
+            match op {
+                "-eq" => l == r,
+                "-ne" => l != r,
+                "-lt" => l < r,
+                "-le" => l <= r,
+                "-gt" => l > r,
+                "-ge" => l >= r,
+                _ => unreachable!(),
+            }
+        }
+        _ => false,
+    }
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -896,5 +995,66 @@ mod tests {
         let status = try_exec(&mut shell, &["return", "42"], &mut buf).unwrap();
         assert_eq!(status, 42);
         assert!(shell.should_return);
+    }
+
+    #[test]
+    fn test_string_nonempty() {
+        assert_eq!(builtin_test(&["test", "hello"]), 0);
+        assert_eq!(builtin_test(&["test", ""]), 1);
+    }
+
+    #[test]
+    fn test_dash_n_z() {
+        assert_eq!(builtin_test(&["test", "-n", "hello"]), 0);
+        assert_eq!(builtin_test(&["test", "-n", ""]), 1);
+        assert_eq!(builtin_test(&["test", "-z", ""]), 0);
+        assert_eq!(builtin_test(&["test", "-z", "hello"]), 1);
+    }
+
+    #[test]
+    fn test_string_eq_ne() {
+        assert_eq!(builtin_test(&["test", "a", "=", "a"]), 0);
+        assert_eq!(builtin_test(&["test", "a", "=", "b"]), 1);
+        assert_eq!(builtin_test(&["test", "a", "!=", "b"]), 0);
+        assert_eq!(builtin_test(&["test", "a", "!=", "a"]), 1);
+    }
+
+    #[test]
+    fn test_integer_comparisons() {
+        assert_eq!(builtin_test(&["test", "5", "-eq", "5"]), 0);
+        assert_eq!(builtin_test(&["test", "5", "-ne", "3"]), 0);
+        assert_eq!(builtin_test(&["test", "3", "-lt", "5"]), 0);
+        assert_eq!(builtin_test(&["test", "5", "-gt", "3"]), 0);
+        assert_eq!(builtin_test(&["test", "5", "-le", "5"]), 0);
+        assert_eq!(builtin_test(&["test", "5", "-ge", "5"]), 0);
+        assert_eq!(builtin_test(&["test", "5", "-lt", "3"]), 1);
+    }
+
+    #[test]
+    fn test_file_exists() {
+        assert_eq!(builtin_test(&["test", "-e", "Cargo.toml"]), 0);
+        assert_eq!(builtin_test(&["test", "-e", "nonexistent_xyz"]), 1);
+        assert_eq!(builtin_test(&["test", "-f", "Cargo.toml"]), 0);
+        assert_eq!(builtin_test(&["test", "-d", "src"]), 0);
+        assert_eq!(builtin_test(&["test", "-d", "Cargo.toml"]), 1);
+    }
+
+    #[test]
+    fn test_negation() {
+        assert_eq!(builtin_test(&["test", "!", "hello"]), 1);
+        assert_eq!(builtin_test(&["test", "!", ""]), 0);
+        assert_eq!(builtin_test(&["test", "!", "-f", "Cargo.toml"]), 1);
+    }
+
+    #[test]
+    fn test_bracket_syntax() {
+        assert_eq!(builtin_test(&["[", "hello", "]"]), 0);
+        assert_eq!(builtin_test(&["[", "-f", "Cargo.toml", "]"]), 0);
+        assert_eq!(builtin_test(&["[", "a", "=", "a", "]"]), 0);
+    }
+
+    #[test]
+    fn test_bracket_missing_close() {
+        assert_eq!(builtin_test(&["[", "hello"]), 2);
     }
 }
