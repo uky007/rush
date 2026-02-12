@@ -5,8 +5,8 @@
 //!
 //! ## 主な機能
 //!
-//! - カーソル移動（←→、Home/End、Ctrl+A/E）
-//! - 編集操作（Ctrl+K/U/W: 行末/行頭/単語単位の削除）
+//! - カーソル移動（←→、Home/End、Ctrl+A/E、Alt+F/B 単語単位移動）
+//! - 編集操作（Ctrl+K/U/W/Alt+D: 削除 → キルリング保存、Ctrl+Y: ヤンク）
 //! - 履歴ナビゲーション（↑↓キー）
 //! - Ctrl+R 逆方向インクリメンタル検索
 //! - Tab 補完（コマンド名 + ファイル名）
@@ -149,6 +149,14 @@ pub enum Key {
     CtrlR,
     /// Ctrl+W（`0x17`）— 直前の単語を削除。
     CtrlW,
+    /// Ctrl+Y（`0x19`）— キルリングからヤンク（貼り付け）。
+    CtrlY,
+    /// Alt+F（`ESC f`）— 次の単語末尾へ移動。
+    AltF,
+    /// Alt+B（`ESC b`）— 前の単語先頭へ移動。
+    AltB,
+    /// Alt+D（`ESC d`）— 次の単語を削除。
+    AltD,
     /// 未対応のバイト列。無視される。
     Unknown,
 }
@@ -183,7 +191,10 @@ fn read_escape_seq(fd: i32) -> Key {
     }
 
     match read_byte(fd) {
-        Some(b'[') => {}
+        Some(b'[') => {} // CSI sequence — fall through to parse
+        Some(b'f') | Some(b'F') => return Key::AltF,
+        Some(b'b') | Some(b'B') => return Key::AltB,
+        Some(b'd') | Some(b'D') => return Key::AltD,
         _ => return Key::Unknown,
     }
 
@@ -267,6 +278,7 @@ fn read_key(fd: i32) -> Key {
         18 => Key::CtrlR,
         21 => Key::CtrlU,
         23 => Key::CtrlW,
+        25 => Key::CtrlY,
         b if b >= 32 && b < 127 => Key::Char(b as char),
         // UTF-8 マルチバイト
         b if b & 0xE0 == 0xC0 => read_utf8(fd, b, 2),
@@ -300,6 +312,8 @@ pub struct LineEditor {
     /// `$PATH` 内コマンドのキャッシュ。ハイライトと補完で共有。
     /// Shell の PathCache とは別インスタンス（ライフタイム分離）。
     path_cache: PathCache,
+    /// キルリング。Ctrl+K/U/W/Alt+D で削除したテキストを保持し、Ctrl+Y で貼り付ける。
+    kill_ring: String,
 }
 
 impl LineEditor {
@@ -313,6 +327,7 @@ impl LineEditor {
             history: History::new(),
             fd: libc::STDIN_FILENO,
             path_cache: PathCache::new(),
+            kill_ring: String::new(),
         }
     }
 
@@ -382,6 +397,10 @@ impl LineEditor {
                 Key::CtrlK => self.kill_to_end(),
                 Key::CtrlU => self.kill_to_start(),
                 Key::CtrlW => self.kill_word_back(),
+                Key::CtrlY => self.yank(),
+                Key::AltF => self.move_word_forward(),
+                Key::AltB => self.move_word_back(),
+                Key::AltD => self.kill_word_forward(),
                 Key::CtrlL => {
                     self.clear_screen(prompt);
                     continue;
@@ -449,18 +468,20 @@ impl LineEditor {
         self.cursor = self.buf.len();
     }
 
-    /// Ctrl+K: カーソルから行末まで削除。
+    /// Ctrl+K: カーソルから行末まで削除。削除テキストをキルリングに保存。
     fn kill_to_end(&mut self) {
+        self.kill_ring = self.buf[self.cursor..].to_string();
         self.buf.truncate(self.cursor);
     }
 
-    /// Ctrl+U: 行頭からカーソルまで削除。
+    /// Ctrl+U: 行頭からカーソルまで削除。削除テキストをキルリングに保存。
     fn kill_to_start(&mut self) {
+        self.kill_ring = self.buf[..self.cursor].to_string();
         self.buf.drain(..self.cursor);
         self.cursor = 0;
     }
 
-    /// Ctrl+W: 直前の単語を削除する。
+    /// Ctrl+W: 直前の単語を削除する。削除テキストをキルリングに保存。
     ///
     /// カーソル手前の空白をスキップし、次の空白まで（または行頭まで）を削除する。
     /// UTF-8 文字境界を正しく処理する。
@@ -482,8 +503,78 @@ impl LineEditor {
         }
 
         let byte_pos = if idx == 0 { 0 } else { chars[idx].0 };
+        self.kill_ring = self.buf[byte_pos..self.cursor].to_string();
         self.buf.drain(byte_pos..self.cursor);
         self.cursor = byte_pos;
+    }
+
+    /// Ctrl+Y: キルリングからカーソル位置に貼り付ける。
+    fn yank(&mut self) {
+        if !self.kill_ring.is_empty() {
+            self.buf.insert_str(self.cursor, &self.kill_ring);
+            self.cursor += self.kill_ring.len();
+        }
+    }
+
+    /// Alt+F: 次の単語末尾へカーソルを移動する。
+    fn move_word_forward(&mut self) {
+        let after = &self.buf[self.cursor..];
+        let chars: Vec<(usize, char)> = after.char_indices().collect();
+        let mut idx = 0;
+        // 空白をスキップ
+        while idx < chars.len() && chars[idx].1.is_whitespace() {
+            idx += 1;
+        }
+        // 単語文字をスキップ
+        while idx < chars.len() && !chars[idx].1.is_whitespace() {
+            idx += 1;
+        }
+        if idx < chars.len() {
+            self.cursor += chars[idx].0;
+        } else {
+            self.cursor = self.buf.len();
+        }
+    }
+
+    /// Alt+B: 前の単語先頭へカーソルを移動する。
+    fn move_word_back(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let before = &self.buf[..self.cursor];
+        let chars: Vec<(usize, char)> = before.char_indices().collect();
+        let mut idx = chars.len();
+        // 末尾の空白をスキップ
+        while idx > 0 && chars[idx - 1].1.is_whitespace() {
+            idx -= 1;
+        }
+        // 単語文字をスキップ
+        while idx > 0 && !chars[idx - 1].1.is_whitespace() {
+            idx -= 1;
+        }
+        self.cursor = if idx == 0 { 0 } else { chars[idx].0 };
+    }
+
+    /// Alt+D: カーソル位置から次の単語末尾まで削除する。
+    fn kill_word_forward(&mut self) {
+        let after = &self.buf[self.cursor..];
+        let chars: Vec<(usize, char)> = after.char_indices().collect();
+        let mut idx = 0;
+        // 空白をスキップ
+        while idx < chars.len() && chars[idx].1.is_whitespace() {
+            idx += 1;
+        }
+        // 単語文字をスキップ
+        while idx < chars.len() && !chars[idx].1.is_whitespace() {
+            idx += 1;
+        }
+        let end = if idx < chars.len() {
+            self.cursor + chars[idx].0
+        } else {
+            self.buf.len()
+        };
+        self.kill_ring = self.buf[self.cursor..end].to_string();
+        self.buf.drain(self.cursor..end);
     }
 
     /// Ctrl+L: 画面クリア + 再描画。
@@ -719,6 +810,7 @@ mod tests {
             history: History::new(),
             fd: libc::STDIN_FILENO,
             path_cache: PathCache::new(),
+            kill_ring: String::new(),
         }
     }
 
@@ -868,5 +960,50 @@ mod tests {
         ed.delete_char_before();
         assert_eq!(ed.buf, "あう");
         assert_eq!(ed.cursor, 3);
+    }
+
+    #[test]
+    fn kill_ring_and_yank() {
+        let mut ed = test_editor();
+        ed.buf = "hello world".to_string();
+        ed.cursor = 5;
+        ed.kill_to_end();
+        assert_eq!(ed.kill_ring, " world");
+        ed.yank();
+        assert_eq!(ed.buf, "hello world");
+    }
+
+    #[test]
+    fn kill_to_start_saves_ring() {
+        let mut ed = test_editor();
+        ed.buf = "hello world".to_string();
+        ed.cursor = 5;
+        ed.kill_to_start();
+        assert_eq!(ed.kill_ring, "hello");
+    }
+
+    #[test]
+    fn move_word_forward_and_back() {
+        let mut ed = test_editor();
+        ed.buf = "echo hello world".to_string();
+        ed.cursor = 0;
+        ed.move_word_forward();
+        assert_eq!(ed.cursor, 4);
+        ed.move_word_forward();
+        assert_eq!(ed.cursor, 10);
+        ed.move_word_back();
+        assert_eq!(ed.cursor, 5);
+        ed.move_word_back();
+        assert_eq!(ed.cursor, 0);
+    }
+
+    #[test]
+    fn kill_word_forward() {
+        let mut ed = test_editor();
+        ed.buf = "echo hello world".to_string();
+        ed.cursor = 5;
+        ed.kill_word_forward();
+        assert_eq!(ed.buf, "echo  world");
+        assert_eq!(ed.kill_ring, "hello");
     }
 }
