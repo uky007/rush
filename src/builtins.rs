@@ -4,13 +4,17 @@
 //! `try_exec()` が `Some(status)` を返せばビルトインとして処理済み、
 //! `None` なら外部コマンドとしてexecutorに委ねる。
 //!
-//! ## 対応ビルトイン
+//! ## 対応ビルトイン（20 種）
 //!
-//! - シェル制御: `exit`, `cd`
-//! - 出力: `pwd`, `echo`
-//! - 環境変数: `export`, `unset`
-//! - ジョブコントロール: `jobs`, `fg`, `bg`
+//! - シェル制御: `exit`, `cd`（`cd -` / OLDPWD 対応）, `exec`
+//! - 出力: `pwd`, `echo`（`-n` 対応）
+//! - 環境変数: `export`, `unset`, `read`（`-p` プロンプト、IFS 分割、`REPLY`）
+//! - ジョブコントロール: `jobs`, `fg`, `bg`, `wait`
+//! - エイリアス: `alias`, `unalias`（`-a` 全削除）
+//! - スクリプト: `source` / `.`（ファイル行単位実行）
 //! - 情報: `type`
+//! - 実行制御: `command`（`-v` パス表示、エイリアスバイパス）, `builtin`（ビルトイン限定実行）
+//! - 履歴: `history`（main.rs で特別扱い、`-c` クリア、`N` 件表示）
 
 use std::env;
 use std::io::Write;

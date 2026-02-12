@@ -14,6 +14,16 @@
 //!
 //! `nav_index` は `entries` のインデックスで、`entries.len()` は「現在の入力」を指す。
 //! ↑で `nav_index` を減少、↓で増加し、末尾に到達すると `saved_buf`（保存した入力）を復元する。
+//!
+//! ## 逆方向検索 (Ctrl+R)
+//!
+//! [`History::search_back`] で `from` 位置から逆方向にクエリを含むエントリを検索する。
+//! [`editor`](crate::editor) の Ctrl+R ループから呼ばれ、インクリメンタルに候補を絞り込む。
+//!
+//! ## ビルトイン連携
+//!
+//! - [`entries()`](History::entries): `history` ビルトインの一覧表示用
+//! - [`clear()`](History::clear): `history -c` による履歴クリア
 
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};

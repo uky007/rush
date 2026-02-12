@@ -74,16 +74,16 @@
 
 | モジュール | 責務 | 高速化手法 |
 |-----------|------|-----------|
-| `parser` | 入力をAST（コマンド列）に変換。チルダ展開、コマンド置換パススルー、fd 複製 | ゼロコピー (`Cow::Borrowed`) |
-| `executor` | コマンド実行・パイプライン接続。展開パイプライン: コマンド置換 → チルダ → glob | ビルトイン in-process、スタック配列 |
+| `parser` | 入力をAST（コマンド列）に変換。変数展開、パラメータ展開、算術展開、継続行検出 | ゼロコピー (`Cow::Borrowed`) |
+| `executor` | コマンド実行・パイプライン接続。展開パイプライン: コマンド置換 → チルダ → ブレース → glob | ビルトイン in-process、スタック配列 |
 | `spawn` | 外部コマンドの起動 (`posix_spawnp`)。fd 複製 (`2>&1`) 対応 | fork+exec 回避、RAII ラッパー |
-| `builtins` | exit, cd, pwd, echo, export, unset, jobs, fg, bg, type | fork 不要、直接実行 |
-| `job` | ジョブコントロール (bg/fg/jobs) | waitpid 手動 reap |
-| `editor` | 行編集 (raw モード、キー入力) | libc 直接操作、1 回の write(2) |
+| `builtins` | cd, pwd, echo, export, unset, source, read, exec, wait, type, command, builtin 等 20 種 | fork 不要、直接実行 |
+| `job` | ジョブコントロール (bg/fg/jobs/wait) | waitpid 手動 reap |
+| `editor` | 行編集 (raw モード、Ctrl+R 逆方向検索、Tab 補完、シンタックスハイライト) | libc 直接操作、1 回の write(2) |
 | `highlight` | シンタックスハイライト・PATH キャッシュ | HashSet キャッシュ、変更検出 |
-| `complete` | Tab 補完（コマンド名、ファイル名） | PATH キャッシュ共有 |
-| `history` | コマンド履歴 (~/.rush_history) | 追記モード永続化 |
-| `shell` | シェルのグローバル状態 | PATH キャッシュ統合 |
+| `complete` | Tab 補完（コマンド名、ファイル名、`&&`/`||`/`;` 後のコマンド位置認識） | PATH キャッシュ共有 |
+| `history` | コマンド履歴 (~/.rush_history)、逆方向検索、ナビゲーション | 追記モード永続化 |
+| `shell` | シェルのグローバル状態（エイリアスマップ含む） | PATH キャッシュ統合 |
 
 ## Implementation Phases
 
@@ -136,6 +136,21 @@
 - シンタックスハイライト拡張: `$(cmd)` / バッククォートをシアン、`2>&1` をシアンで着色
 - 展開パイプライン統一: `expand_args_full`（コマンド置換 → チルダ → glob の順序で適用）
 - ベンチマーク追加: チルダ展開の計測
+
+### Phase 9: Practical Daily-Use Features ✅
+- **`cd -`**: `OLDPWD` 追跡、`cd -` で前ディレクトリに移動
+- **`source` / `.`**: ファイルを行単位で実行（RC ファイル読み込みと同パターン）
+- **`alias` / `unalias`**: エイリアス定義・一覧・削除（再帰ガード付き展開、`unalias -a` 対応）
+- **`history` ビルトイン**: `history` / `history N` / `history -c`（editor 所有の履歴に直接アクセス）
+- **Ctrl+R 逆方向検索**: `(reverse-i-search)'query': match` 形式のインクリメンタル検索
+- **`command` / `builtin`**: `command -v` でパス表示、`command` でエイリアスバイパス、`builtin` でビルトインのみ実行
+- **`read`**: `read VAR` / `read -p "prompt" VAR` / 複数変数 IFS 分割 / `REPLY` デフォルト
+- **`exec`**: `execvp` でシェルプロセスを置換（シグナル復元付き）
+- **`wait`**: `wait` で全ジョブ待機 / `wait %N` で特定ジョブ待機
+- **文字列パラメータ展開**: `${var:-default}`, `${var:=default}`, `${var:+alt}`, `${var:?msg}`, `${#var}`, `${var%pat}`, `${var%%pat}`, `${var#pat}`, `${var##pat}`, `${var/pat/repl}`, `${var//pat/repl}`
+- **算術展開 `$(( ))`**: 再帰下降パーサー（`+`, `-`, `*`, `/`, `%`, 括弧、変数参照、i64 演算）
+- **ブレース展開**: `{a,b,c}` カンマ展開、`{1..5}` 数値レンジ、`{a..z}` 文字レンジ、ネスト対応
+- **継続行入力**: 末尾 `\`・未完了パイプ/演算子・未閉クォートで `> ` プロンプトによる複数行入力
 
 ## Speed Comparison Targets
 
