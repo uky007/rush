@@ -11,6 +11,7 @@
 //! - 変数展開: `$VAR`, `${VAR}`, `$?`（ダブルクォート内・裸ワードで展開、シングルクォートではリテラル）
 //! - チルダ展開: `~` → `$HOME`, `~/path`, `~user`, `VAR=~/path`
 //! - コマンド置換パススルー: `$(cmd)`, `` `cmd` `` — パーサーでは展開せずリテラル保持、executor で展開
+//! - 算術展開: `$((expr))` — 四則演算・剰余・括弧・変数参照を i64 で計算
 //! - バックグラウンド実行: `cmd &`（パイプラインの末尾に `&` を指定）
 //! - 複合コマンド: `&&` (AND), `||` (OR), `;` (順次実行)
 //! - fd 複製: `2>&1`, `>&2`（fd 複製リダイレクト）
@@ -200,36 +201,68 @@ fn expand_variables(s: &str, last_status: i32) -> Cow<'_, str> {
 
         match bytes[pos] {
             b'(' => {
-                // $(...) — コマンド置換。executor で展開するのでリテラル保持。
-                result.push_str("$(");
-                pos += 1; // skip '('
-                let mut depth = 1;
-                while pos < len && depth > 0 {
-                    match bytes[pos] {
-                        b'(' => depth += 1,
-                        b')' => {
-                            depth -= 1;
-                            if depth == 0 {
-                                pos += 1;
-                                break;
+                if pos + 1 < len && bytes[pos + 1] == b'(' {
+                    // $((expr)) — 算術展開
+                    pos += 2; // skip '(('
+                    let expr_start = pos;
+                    let mut paren_depth: i32 = 0;
+                    let mut found = false;
+                    while pos < len {
+                        match bytes[pos] {
+                            b'(' => paren_depth += 1,
+                            b')' => {
+                                if paren_depth > 0 {
+                                    paren_depth -= 1;
+                                } else if pos + 1 < len && bytes[pos + 1] == b')' {
+                                    let expr = &s[expr_start..pos];
+                                    result.push_str(&eval_arithmetic(expr, last_status));
+                                    pos += 2; // skip '))'
+                                    found = true;
+                                    break;
+                                } else {
+                                    break;
+                                }
                             }
+                            _ => {}
                         }
-                        b'\'' => {
-                            result.push(bytes[pos] as char);
-                            pos += 1;
-                            while pos < len && bytes[pos] != b'\'' {
-                                result.push(bytes[pos] as char);
-                                pos += 1;
-                            }
-                        }
-                        _ => {}
-                    }
-                    if depth > 0 {
-                        result.push(bytes[pos] as char);
                         pos += 1;
                     }
+                    if !found {
+                        result.push_str("$((");
+                        pos = expr_start;
+                    }
+                } else {
+                    // $(...) — コマンド置換。executor で展開するのでリテラル保持。
+                    result.push_str("$(");
+                    pos += 1; // skip '('
+                    let mut depth = 1;
+                    while pos < len && depth > 0 {
+                        match bytes[pos] {
+                            b'(' => depth += 1,
+                            b')' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    pos += 1;
+                                    break;
+                                }
+                            }
+                            b'\'' => {
+                                result.push(bytes[pos] as char);
+                                pos += 1;
+                                while pos < len && bytes[pos] != b'\'' {
+                                    result.push(bytes[pos] as char);
+                                    pos += 1;
+                                }
+                            }
+                            _ => {}
+                        }
+                        if depth > 0 {
+                            result.push(bytes[pos] as char);
+                            pos += 1;
+                        }
+                    }
+                    result.push(')');
                 }
-                result.push(')');
             }
             b'?' => {
                 result.push_str(&last_status.to_string());
@@ -476,6 +509,151 @@ fn glob_replace_all(val: &str, pattern: &str, replacement: &str) -> String {
     result
 }
 
+// ── Arithmetic expansion ────────────────────────────────────────────
+
+/// `$((expr))` の算術式を評価し、結果を文字列で返す。
+/// 式中の `$VAR` は先に変数展開し、裸の変数名は環境変数として参照する。
+fn eval_arithmetic(expr: &str, last_status: i32) -> String {
+    let expanded = expand_variables(expr, last_status);
+    let mut parser = ArithParser::new(&expanded);
+    match parser.parse_expr() {
+        Some(val) => val.to_string(),
+        None => "0".to_string(),
+    }
+}
+
+/// 算術式の再帰下降パーサー。
+/// 優先順位: 加減算 < 乗除剰余 < 単項 +/- < 括弧・数値・変数
+struct ArithParser<'a> {
+    input: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> ArithParser<'a> {
+    fn new(s: &'a str) -> Self {
+        Self { input: s.as_bytes(), pos: 0 }
+    }
+
+    fn skip_ws(&mut self) {
+        while self.pos < self.input.len() && self.input[self.pos].is_ascii_whitespace() {
+            self.pos += 1;
+        }
+    }
+
+    /// 最上位: 加減算
+    fn parse_expr(&mut self) -> Option<i64> {
+        let mut left = self.parse_term()?;
+        loop {
+            self.skip_ws();
+            if self.pos >= self.input.len() { break; }
+            match self.input[self.pos] {
+                b'+' => {
+                    self.pos += 1;
+                    let right = self.parse_term()?;
+                    left = left.wrapping_add(right);
+                }
+                b'-' => {
+                    self.pos += 1;
+                    let right = self.parse_term()?;
+                    left = left.wrapping_sub(right);
+                }
+                _ => break,
+            }
+        }
+        Some(left)
+    }
+
+    /// 乗除算・剰余
+    fn parse_term(&mut self) -> Option<i64> {
+        let mut left = self.parse_unary()?;
+        loop {
+            self.skip_ws();
+            if self.pos >= self.input.len() { break; }
+            match self.input[self.pos] {
+                b'*' => {
+                    self.pos += 1;
+                    let right = self.parse_unary()?;
+                    left = left.wrapping_mul(right);
+                }
+                b'/' => {
+                    self.pos += 1;
+                    let right = self.parse_unary()?;
+                    if right == 0 {
+                        eprintln!("rush: division by 0");
+                        return Some(0);
+                    }
+                    left /= right;
+                }
+                b'%' => {
+                    self.pos += 1;
+                    let right = self.parse_unary()?;
+                    if right == 0 {
+                        eprintln!("rush: division by 0");
+                        return Some(0);
+                    }
+                    left %= right;
+                }
+                _ => break,
+            }
+        }
+        Some(left)
+    }
+
+    /// 単項演算子: +, -
+    fn parse_unary(&mut self) -> Option<i64> {
+        self.skip_ws();
+        if self.pos >= self.input.len() { return Some(0); }
+        match self.input[self.pos] {
+            b'-' => {
+                self.pos += 1;
+                let val = self.parse_unary()?;
+                Some(val.wrapping_neg())
+            }
+            b'+' => {
+                self.pos += 1;
+                self.parse_unary()
+            }
+            _ => self.parse_primary(),
+        }
+    }
+
+    /// 基本要素: 数値リテラル、変数名、括弧
+    fn parse_primary(&mut self) -> Option<i64> {
+        self.skip_ws();
+        if self.pos >= self.input.len() { return Some(0); }
+        match self.input[self.pos] {
+            b'(' => {
+                self.pos += 1;
+                let val = self.parse_expr()?;
+                self.skip_ws();
+                if self.pos < self.input.len() && self.input[self.pos] == b')' {
+                    self.pos += 1;
+                }
+                Some(val)
+            }
+            b'0'..=b'9' => {
+                let start = self.pos;
+                while self.pos < self.input.len() && self.input[self.pos].is_ascii_digit() {
+                    self.pos += 1;
+                }
+                let num_str = std::str::from_utf8(&self.input[start..self.pos]).ok()?;
+                Some(num_str.parse::<i64>().unwrap_or(0))
+            }
+            b if is_var_start(b) => {
+                // 変数参照（算術コンテキストでは裸の名前も変数として扱う）
+                let start = self.pos;
+                while self.pos < self.input.len() && is_var_char(self.input[self.pos]) {
+                    self.pos += 1;
+                }
+                let var_name = std::str::from_utf8(&self.input[start..self.pos]).ok()?;
+                let val = std::env::var(var_name).unwrap_or_default();
+                Some(val.parse::<i64>().unwrap_or(0))
+            }
+            _ => Some(0),
+        }
+    }
+}
+
 // ── Tokenizer (crate-private) ───────────────────────────────────────
 
 /// トークナイザが生成する内部トークン型。
@@ -530,36 +708,68 @@ impl<'a> Tokenizer<'a> {
         let len = bytes.len();
         match bytes[self.pos] {
             b'(' => {
-                // $(...) — コマンド置換。リテラル保持。
-                buf.push_str("$(");
-                self.pos += 1; // skip '('
-                let mut depth = 1;
-                while self.pos < len && depth > 0 {
-                    match bytes[self.pos] {
-                        b'(' => depth += 1,
-                        b')' => {
-                            depth -= 1;
-                            if depth == 0 {
-                                self.pos += 1;
-                                break;
+                if self.pos + 1 < len && bytes[self.pos + 1] == b'(' {
+                    // $((expr)) — 算術展開
+                    self.pos += 2; // skip '(('
+                    let expr_start = self.pos;
+                    let mut paren_depth: i32 = 0;
+                    let mut found = false;
+                    while self.pos < len {
+                        match bytes[self.pos] {
+                            b'(' => paren_depth += 1,
+                            b')' => {
+                                if paren_depth > 0 {
+                                    paren_depth -= 1;
+                                } else if self.pos + 1 < len && bytes[self.pos + 1] == b')' {
+                                    let expr = &self.input[expr_start..self.pos];
+                                    buf.push_str(&eval_arithmetic(expr, self.last_status));
+                                    self.pos += 2; // skip '))'
+                                    found = true;
+                                    break;
+                                } else {
+                                    break;
+                                }
                             }
+                            _ => {}
                         }
-                        b'\'' => {
-                            buf.push(bytes[self.pos] as char);
-                            self.pos += 1;
-                            while self.pos < len && bytes[self.pos] != b'\'' {
-                                buf.push(bytes[self.pos] as char);
-                                self.pos += 1;
-                            }
-                        }
-                        _ => {}
-                    }
-                    if depth > 0 {
-                        buf.push(bytes[self.pos] as char);
                         self.pos += 1;
                     }
+                    if !found {
+                        buf.push_str("$((");
+                        self.pos = expr_start;
+                    }
+                } else {
+                    // $(...) — コマンド置換。リテラル保持。
+                    buf.push_str("$(");
+                    self.pos += 1; // skip '('
+                    let mut depth = 1;
+                    while self.pos < len && depth > 0 {
+                        match bytes[self.pos] {
+                            b'(' => depth += 1,
+                            b')' => {
+                                depth -= 1;
+                                if depth == 0 {
+                                    self.pos += 1;
+                                    break;
+                                }
+                            }
+                            b'\'' => {
+                                buf.push(bytes[self.pos] as char);
+                                self.pos += 1;
+                                while self.pos < len && bytes[self.pos] != b'\'' {
+                                    buf.push(bytes[self.pos] as char);
+                                    self.pos += 1;
+                                }
+                            }
+                            _ => {}
+                        }
+                        if depth > 0 {
+                            buf.push(bytes[self.pos] as char);
+                            self.pos += 1;
+                        }
+                    }
+                    buf.push(')');
                 }
-                buf.push(')');
             }
             b'?' => {
                 buf.push_str(&self.last_status.to_string());
@@ -1703,5 +1913,67 @@ mod tests {
         let list = parse("echo ${RUSH_TEST_PREP//hello/bye}", 0).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "bye world bye");
         std::env::remove_var("RUSH_TEST_PREP");
+    }
+
+    // ── 算術展開テスト ──
+
+    #[test]
+    fn arith_basic() {
+        let list = parse("echo $((1+2))", 0).unwrap().unwrap();
+        assert_eq!(list.items[0].pipeline.commands[0].args[1], "3");
+    }
+
+    #[test]
+    fn arith_precedence() {
+        let list = parse("echo $((2+3*4))", 0).unwrap().unwrap();
+        assert_eq!(list.items[0].pipeline.commands[0].args[1], "14");
+    }
+
+    #[test]
+    fn arith_parens() {
+        let list = parse("echo $((2*(3+4)))", 0).unwrap().unwrap();
+        assert_eq!(list.items[0].pipeline.commands[0].args[1], "14");
+    }
+
+    #[test]
+    fn arith_div_mod() {
+        let list = parse("echo $((10/3))", 0).unwrap().unwrap();
+        assert_eq!(list.items[0].pipeline.commands[0].args[1], "3");
+        let list = parse("echo $((10%3))", 0).unwrap().unwrap();
+        assert_eq!(list.items[0].pipeline.commands[0].args[1], "1");
+    }
+
+    #[test]
+    fn arith_negative() {
+        let list = parse("echo $((-5+3))", 0).unwrap().unwrap();
+        assert_eq!(list.items[0].pipeline.commands[0].args[1], "-2");
+    }
+
+    #[test]
+    fn arith_spaces() {
+        let list = parse("echo $(( 10 + 20 ))", 0).unwrap().unwrap();
+        assert_eq!(list.items[0].pipeline.commands[0].args[1], "30");
+    }
+
+    #[test]
+    fn arith_variable() {
+        std::env::set_var("RUSH_TEST_ARITH", "7");
+        let list = parse("echo $((RUSH_TEST_ARITH+3))", 0).unwrap().unwrap();
+        assert_eq!(list.items[0].pipeline.commands[0].args[1], "10");
+        std::env::remove_var("RUSH_TEST_ARITH");
+    }
+
+    #[test]
+    fn arith_dollar_variable() {
+        std::env::set_var("RUSH_TEST_ARITH2", "5");
+        let list = parse("echo $(($RUSH_TEST_ARITH2*2))", 0).unwrap().unwrap();
+        assert_eq!(list.items[0].pipeline.commands[0].args[1], "10");
+        std::env::remove_var("RUSH_TEST_ARITH2");
+    }
+
+    #[test]
+    fn arith_in_double_quotes() {
+        let list = parse("echo \"result=$((1+2))\"", 0).unwrap().unwrap();
+        assert_eq!(list.items[0].pipeline.commands[0].args[1], "result=3");
     }
 }
