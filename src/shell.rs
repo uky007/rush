@@ -40,6 +40,8 @@ pub struct Shell {
     pub should_return: bool,
     /// ディレクトリスタック（`pushd`/`popd` 用）。スタックトップが最新。
     pub dir_stack: Vec<String>,
+    /// トラップハンドラ（シグナル番号 → コマンド文字列）。`trap 'cmd' SIGNAL` で設定。
+    pub traps: HashMap<i32, String>,
 }
 
 impl Shell {
@@ -57,6 +59,7 @@ impl Shell {
             source_depth: 0,
             should_return: false,
             dir_stack: Vec::new(),
+            traps: HashMap::new(),
         }
     }
 }

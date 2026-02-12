@@ -4,7 +4,7 @@
 //! `try_exec()` が `Some(status)` を返せばビルトインとして処理済み、
 //! `None` なら外部コマンドとしてexecutorに委ねる。
 //!
-//! ## 対応ビルトイン（26 種）
+//! ## 対応ビルトイン（27 種）
 //!
 //! - シェル制御: `exit`, `cd`（`cd -` / OLDPWD 対応）, `exec`
 //! - 出力: `pwd`, `echo`（`-n` 対応）
@@ -18,6 +18,7 @@
 //! - 条件判定: `test` / `[`（文字列・整数・ファイル判定、`!` 否定）
 //! - 出力: `printf`（`%s`, `%d`, `%x`, `%o`, 幅指定、ゼロパディング、エスケープ）
 //! - ディレクトリスタック: `pushd`（スタックに積んで移動）, `popd`（ポップして移動）, `dirs`（一覧）
+//! - シグナル: `trap`（`trap 'cmd' SIGNAL`、一覧、`-` でリセット）
 //! - 履歴: `history`（main.rs で特別扱い、`-c` クリア、`N` 件表示）
 
 use std::env;
@@ -41,7 +42,8 @@ pub fn is_builtin(name: &str) -> bool {
                  | "command" | "builtin" | "read" | "exec" | "wait"
                  | "true" | "false" | ":" | "return"
                  | "test" | "[" | "printf"
-                 | "pushd" | "popd" | "dirs")
+                 | "pushd" | "popd" | "dirs"
+                 | "trap")
 }
 
 /// ビルトインコマンドの実行を試みる。
@@ -80,6 +82,7 @@ pub fn try_exec(shell: &mut Shell, args: &[&str], stdout: &mut dyn Write) -> Opt
         "pushd" => Some(builtin_pushd(shell, args, stdout)),
         "popd" => Some(builtin_popd(shell, args, stdout)),
         "dirs" => Some(builtin_dirs(shell, stdout)),
+        "trap" => Some(builtin_trap(shell, args, stdout)),
         _ => None,
     }
 }
@@ -690,6 +693,87 @@ fn builtin_source(shell: &mut Shell, args: &[&str]) -> i32 {
     }
     shell.source_depth -= 1;
     shell.last_status
+}
+
+// ── trap ────────────────────────────────────────────────────────────
+
+/// `trap [command] [signal ...]` — シグナルに対するトラップハンドラを設定する。
+///
+/// - `trap 'cmd' INT` — SIGINT を受信したときに cmd を実行
+/// - `trap '' SIGNAL` — シグナルを無視
+/// - `trap - SIGNAL` — デフォルトに戻す
+/// - `trap` — 設定済みトラップを一覧表示
+fn builtin_trap(shell: &mut Shell, args: &[&str], stdout: &mut dyn Write) -> i32 {
+    if args.len() <= 1 {
+        // 一覧表示
+        let mut entries: Vec<_> = shell.traps.iter().collect();
+        entries.sort_by_key(|(sig, _)| *sig);
+        for (sig, cmd) in entries {
+            let name = signal_name(*sig).unwrap_or("?");
+            let _ = writeln!(stdout, "trap -- '{}' {}", cmd, name);
+        }
+        return 0;
+    }
+
+    if args.len() < 3 {
+        eprintln!("rush: trap: usage: trap [-] command signal [signal ...]");
+        return 2;
+    }
+
+    let command = args[1];
+    for &sig_name in &args[2..] {
+        match parse_signal(sig_name) {
+            Some(sig) => {
+                if command == "-" {
+                    shell.traps.remove(&sig);
+                } else {
+                    shell.traps.insert(sig, command.to_string());
+                }
+            }
+            None => {
+                eprintln!("rush: trap: {}: invalid signal specification", sig_name);
+                return 1;
+            }
+        }
+    }
+    0
+}
+
+/// シグナル名を番号に変換する。
+fn parse_signal(name: &str) -> Option<i32> {
+    // 数値指定
+    if let Ok(n) = name.parse::<i32>() {
+        return Some(n);
+    }
+    // 名前指定（SIG プレフィックスは省略可）
+    let upper = name.to_uppercase();
+    let upper = upper.strip_prefix("SIG").unwrap_or(&upper);
+    match upper {
+        "HUP" => Some(libc::SIGHUP),
+        "INT" => Some(libc::SIGINT),
+        "QUIT" => Some(libc::SIGQUIT),
+        "TERM" => Some(libc::SIGTERM),
+        "USR1" => Some(libc::SIGUSR1),
+        "USR2" => Some(libc::SIGUSR2),
+        "ALRM" => Some(libc::SIGALRM),
+        "EXIT" => Some(0), // EXIT は特殊（シェル終了時）
+        _ => None,
+    }
+}
+
+/// シグナル番号を名前に変換する。
+fn signal_name(sig: i32) -> Option<&'static str> {
+    match sig {
+        0 => Some("EXIT"),
+        n if n == libc::SIGHUP => Some("HUP"),
+        n if n == libc::SIGINT => Some("INT"),
+        n if n == libc::SIGQUIT => Some("QUIT"),
+        n if n == libc::SIGTERM => Some("TERM"),
+        n if n == libc::SIGUSR1 => Some("USR1"),
+        n if n == libc::SIGUSR2 => Some("USR2"),
+        n if n == libc::SIGALRM => Some("ALRM"),
+        _ => None,
+    }
 }
 
 // ── pushd / popd / dirs ─────────────────────────────────────────────
@@ -1363,6 +1447,42 @@ mod tests {
         let mut shell = Shell::new();
         let mut buf = Vec::new();
         let status = builtin_popd(&mut shell, &["popd"], &mut buf);
+        assert_eq!(status, 1);
+    }
+
+    #[test]
+    fn trap_set_and_list() {
+        let mut shell = Shell::new();
+        let mut buf = Vec::new();
+        // Set trap
+        let status = builtin_trap(&mut shell, &["trap", "echo caught", "INT"], &mut buf);
+        assert_eq!(status, 0);
+        assert_eq!(shell.traps.get(&libc::SIGINT), Some(&"echo caught".to_string()));
+
+        // List traps
+        let mut buf2 = Vec::new();
+        let status = builtin_trap(&mut shell, &["trap"], &mut buf2);
+        assert_eq!(status, 0);
+        let output = String::from_utf8(buf2).unwrap();
+        assert!(output.contains("echo caught"));
+        assert!(output.contains("INT"));
+    }
+
+    #[test]
+    fn trap_remove() {
+        let mut shell = Shell::new();
+        let mut buf = Vec::new();
+        shell.traps.insert(libc::SIGINT, "echo caught".to_string());
+        let status = builtin_trap(&mut shell, &["trap", "-", "INT"], &mut buf);
+        assert_eq!(status, 0);
+        assert!(!shell.traps.contains_key(&libc::SIGINT));
+    }
+
+    #[test]
+    fn trap_invalid_signal() {
+        let mut shell = Shell::new();
+        let mut buf = Vec::new();
+        let status = builtin_trap(&mut shell, &["trap", "echo x", "BOGUS"], &mut buf);
         assert_eq!(status, 1);
     }
 
