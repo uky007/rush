@@ -19,6 +19,7 @@
 //! - 複合コマンド: `&&` (AND), `||` (OR), `;` (順次実行)
 //! - fd 複製: `2>&1`, `>&2`（fd 複製リダイレクト）
 //! - エスケープ: `\"`, `\\`, `\$`（ダブルクォート内）, `\X`（裸ワード）
+//! - インライン代入: `VAR=val cmd`（コマンド先頭の `VAR=val` を代入として検出）
 //! - 継続行検出: 末尾の `|`, `&&`, `||` を [`ParseError::IncompleteInput`] として報告
 
 use std::borrow::Cow;
@@ -66,10 +67,16 @@ pub struct Pipeline<'a> {
 ///
 /// `Cow<'a, str>` を採用: クォートなしトークンは `Borrowed`（ゼロコピー）。
 /// 変数展開が発生すると `Owned` になる。
+///
+/// `assignments` はコマンド行先頭の `VAR=val` 形式の代入。
+/// コマンドが続く場合は子プロセスの環境変数としてのみ設定し、
+/// コマンドがない場合はシェル自身の環境変数として設定する。
 #[derive(Debug, PartialEq)]
 pub struct Command<'a> {
     pub args: Vec<Cow<'a, str>>,
     pub redirects: Vec<Redirect<'a>>,
+    /// コマンド先頭の `VAR=val` 代入リスト。
+    pub assignments: Vec<(String, String)>,
 }
 
 /// ファイルリダイレクト指定。種別とターゲットファイルパスを持つ。
@@ -1173,19 +1180,37 @@ pub fn parse(input: &str, last_status: i32) -> Result<Option<CommandList<'_>>, P
     let mut commands: Vec<Command<'_>> = Vec::new();
     let mut args: Vec<Cow<'_, str>> = Vec::new();
     let mut redirects: Vec<Redirect<'_>> = Vec::new();
+    let mut assignments: Vec<(String, String)> = Vec::new();
     let mut background = false;
 
     while let Some(result) = tokens.next() {
         let token = result?;
         match token {
-            Token::Word(w) => args.push(w),
-            Token::Pipe => {
+            Token::Word(w) => {
+                // コマンド先頭の VAR=val を代入として検出
+                // 条件: args が空（まだコマンド名を見ていない）かつ有効な識別子=値の形式
                 if args.is_empty() {
+                    if let Some(eq_pos) = w.find('=') {
+                        let name = &w[..eq_pos];
+                        if !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                            && !name.as_bytes()[0].is_ascii_digit()
+                        {
+                            let value = w[eq_pos + 1..].to_string();
+                            assignments.push((name.to_string(), value));
+                            continue;
+                        }
+                    }
+                }
+                args.push(w);
+            }
+            Token::Pipe => {
+                if args.is_empty() && assignments.is_empty() {
                     return Err(ParseError::EmptyPipelineSegment);
                 }
                 commands.push(Command {
                     args: std::mem::take(&mut args),
                     redirects: std::mem::take(&mut redirects),
+                    assignments: std::mem::take(&mut assignments),
                 });
             }
             Token::And | Token::Or | Token::Semi => {
@@ -1196,17 +1221,18 @@ pub fn parse(input: &str, last_status: i32) -> Result<Option<CommandList<'_>>, P
                 };
 
                 // `;` の前に何もなくてもスキップ（bash 互換）
-                if args.is_empty() && commands.is_empty() {
+                if args.is_empty() && commands.is_empty() && assignments.is_empty() {
                     if matches!(connector, Connector::Seq) {
                         continue; // 先頭 `;` や `;;` はスキップ
                     }
                     return Err(ParseError::EmptyPipelineSegment);
                 }
 
-                if !args.is_empty() {
+                if !args.is_empty() || !assignments.is_empty() {
                     commands.push(Command {
                         args: std::mem::take(&mut args),
                         redirects: std::mem::take(&mut redirects),
+                        assignments: std::mem::take(&mut assignments),
                     });
                 }
 
@@ -1220,15 +1246,16 @@ pub fn parse(input: &str, last_status: i32) -> Result<Option<CommandList<'_>>, P
                 background = false;
             }
             Token::Ampersand => {
-                if args.is_empty() && commands.is_empty() {
+                if args.is_empty() && commands.is_empty() && assignments.is_empty() {
                     return Err(ParseError::EmptyPipelineSegment);
                 }
 
                 // `&` の後にコマンドが続くケースをサポート（`cmd1 & cmd2`）
-                if !args.is_empty() {
+                if !args.is_empty() || !assignments.is_empty() {
                     commands.push(Command {
                         args: std::mem::take(&mut args),
                         redirects: std::mem::take(&mut redirects),
+                        assignments: std::mem::take(&mut assignments),
                     });
                 }
 
@@ -1275,13 +1302,13 @@ pub fn parse(input: &str, last_status: i32) -> Result<Option<CommandList<'_>>, P
     }
 
     // 末尾パイプ: commands があるが args がない → 継続行入力のトリガー
-    if !commands.is_empty() && args.is_empty() && redirects.is_empty() {
+    if !commands.is_empty() && args.is_empty() && redirects.is_empty() && assignments.is_empty() {
         return Err(ParseError::IncompleteInput);
     }
 
     // 最終パイプラインの処理
-    if !args.is_empty() {
-        commands.push(Command { args, redirects });
+    if !args.is_empty() || !assignments.is_empty() {
+        commands.push(Command { args, redirects, assignments });
     } else if !redirects.is_empty() {
         // リダイレクトのみ（コマンドなし）
         return Err(ParseError::EmptyPipelineSegment);
@@ -2081,5 +2108,41 @@ mod tests {
         // 継続入力後は成功
         let list = parse("echo \"hello\nworld\"", 0).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "hello\nworld");
+    }
+
+    #[test]
+    fn inline_assignment_only() {
+        let list = parse("FOO=bar", 0).unwrap().unwrap();
+        let cmd = &list.items[0].pipeline.commands[0];
+        assert!(cmd.args.is_empty());
+        assert_eq!(cmd.assignments, vec![("FOO".to_string(), "bar".to_string())]);
+    }
+
+    #[test]
+    fn inline_assignment_with_command() {
+        let list = parse("FOO=bar echo hello", 0).unwrap().unwrap();
+        let cmd = &list.items[0].pipeline.commands[0];
+        assert_eq!(cmd.args[0], "echo");
+        assert_eq!(cmd.args[1], "hello");
+        assert_eq!(cmd.assignments, vec![("FOO".to_string(), "bar".to_string())]);
+    }
+
+    #[test]
+    fn multiple_assignments() {
+        let list = parse("A=1 B=2 cmd", 0).unwrap().unwrap();
+        let cmd = &list.items[0].pipeline.commands[0];
+        assert_eq!(cmd.args[0], "cmd");
+        assert_eq!(cmd.assignments.len(), 2);
+        assert_eq!(cmd.assignments[0], ("A".to_string(), "1".to_string()));
+        assert_eq!(cmd.assignments[1], ("B".to_string(), "2".to_string()));
+    }
+
+    #[test]
+    fn assignment_not_after_command() {
+        // FOO=bar should not be treated as assignment when after a command word
+        let list = parse("echo FOO=bar", 0).unwrap().unwrap();
+        let cmd = &list.items[0].pipeline.commands[0];
+        assert!(cmd.assignments.is_empty());
+        assert_eq!(cmd.args[1], "FOO=bar");
     }
 }

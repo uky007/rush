@@ -322,13 +322,37 @@ fn execute_pipeline(shell: &mut Shell, pipeline: &Pipeline<'_>, cmd_text: &str) 
     // 単一ビルトイン（非 background）→ fork なしの高速パス
     if pipeline.commands.len() == 1 && !pipeline.background {
         let cmd = &pipeline.commands[0];
+
+        // 代入のみ（コマンドなし）→ シェル環境に設定
+        if cmd.args.is_empty() && !cmd.assignments.is_empty() {
+            for (name, value) in &cmd.assignments {
+                std::env::set_var(name, value);
+            }
+            return 0;
+        }
+
         // FdDup があれば spawn パスにフォールバック
         let has_fd_dup = cmd.redirects.iter().any(|r| matches!(r.kind, RedirectKind::FdDup { .. }));
         if !has_fd_dup {
             let expanded = expand_args_full(&cmd.args, shell);
             let args: Vec<&str> = expanded.iter().map(|s| s.as_str()).collect();
             if !args.is_empty() && builtins::is_builtin(args[0]) {
-                return execute_builtin(shell, cmd, &expanded);
+                // ビルトイン: 代入を一時的にシェル環境に設定し、実行後に復元
+                let saved: Vec<(String, Option<String>)> = cmd.assignments.iter()
+                    .map(|(k, v)| {
+                        let old = std::env::var(k).ok();
+                        std::env::set_var(k, v);
+                        (k.clone(), old)
+                    })
+                    .collect();
+                let status = execute_builtin(shell, cmd, &expanded);
+                for (k, old) in saved {
+                    match old {
+                        Some(v) => std::env::set_var(&k, &v),
+                        None => std::env::remove_var(&k),
+                    }
+                }
+                return status;
             }
         }
     }
@@ -530,6 +554,15 @@ fn execute_job(shell: &mut Shell, pipeline: &Pipeline<'_>, cmd_text: &str) -> i3
     for i in 0..n {
         let cmd = &pipeline.commands[i];
 
+        // インライン代入を環境変数に設定（子プロセスに継承される）
+        let saved_env: Vec<(String, Option<String>)> = cmd.assignments.iter()
+            .map(|(k, v)| {
+                let old = std::env::var(k).ok();
+                std::env::set_var(k, v);
+                (k.clone(), old)
+            })
+            .collect();
+
         // コマンド置換 + チルダ + glob 展開
         let expanded = expand_args_full(&cmd.args, shell);
         let args: Vec<&str> = expanded.iter().map(|s| s.as_str()).collect();
@@ -633,6 +666,14 @@ fn execute_job(shell: &mut Shell, pipeline: &Pipeline<'_>, cmd_text: &str) -> i3
         }
         if let Some(fd) = redir_fds.stderr_fd {
             unsafe { libc::close(fd); }
+        }
+
+        // インライン代入を復元（子プロセスにのみ影響させるため）
+        for (k, old) in saved_env {
+            match old {
+                Some(v) => std::env::set_var(&k, &v),
+                None => std::env::remove_var(&k),
+            }
         }
     }
 
