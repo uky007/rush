@@ -30,7 +30,7 @@ pub fn is_builtin(name: &str) -> bool {
     matches!(name, "exit" | "cd" | "pwd" | "echo" | "export" | "unset"
                  | "jobs" | "fg" | "bg" | "type" | "source" | "."
                  | "alias" | "unalias" | "history"
-                 | "command" | "builtin")
+                 | "command" | "builtin" | "read")
 }
 
 /// ビルトインコマンドの実行を試みる。
@@ -58,6 +58,7 @@ pub fn try_exec(shell: &mut Shell, args: &[&str], stdout: &mut dyn Write) -> Opt
         "unalias" => Some(builtin_unalias(shell, args)),
         "command" => Some(builtin_command(shell, args, stdout)),
         "builtin" => Some(builtin_builtin(shell, args, stdout)),
+        "read" => Some(builtin_read(args)),
         _ => None,
     }
 }
@@ -364,6 +365,57 @@ fn builtin_bg(shell: &mut Shell, args: &[&str]) -> i32 {
     }
 
     eprintln!("[{}]+ {} &", job_id, command);
+    0
+}
+
+// ── read ────────────────────────────────────────────────────────────
+
+/// `read [-p prompt] VAR [VAR2 ...]` — stdin から 1 行読んで変数に代入する。
+/// 複数変数時は IFS で分割。変数省略時は REPLY に代入。
+fn builtin_read(args: &[&str]) -> i32 {
+    let mut vars: Vec<&str> = Vec::new();
+    let mut prompt_str: Option<&str> = None;
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "-p" && i + 1 < args.len() {
+            prompt_str = Some(args[i + 1]);
+            i += 2;
+        } else {
+            vars.push(args[i]);
+            i += 1;
+        }
+    }
+
+    // プロンプト表示
+    if let Some(p) = prompt_str {
+        eprint!("{}", p);
+    }
+
+    // stdin から 1 行読み取り
+    let mut line = String::new();
+    match std::io::stdin().read_line(&mut line) {
+        Ok(0) => return 1, // EOF
+        Ok(_) => {}
+        Err(_) => return 1,
+    }
+    let line = line.trim_end_matches('\n').trim_end_matches('\r');
+
+    if vars.is_empty() {
+        // 変数省略時は REPLY に代入
+        env::set_var("REPLY", line);
+    } else if vars.len() == 1 {
+        env::set_var(vars[0], line);
+    } else {
+        // IFS で分割（デフォルト: スペース/タブ/改行）
+        let parts: Vec<&str> = line.splitn(vars.len(), |c: char| c == ' ' || c == '\t').collect();
+        for (j, var) in vars.iter().enumerate() {
+            if j < parts.len() {
+                env::set_var(var, parts[j]);
+            } else {
+                env::set_var(var, "");
+            }
+        }
+    }
     0
 }
 
