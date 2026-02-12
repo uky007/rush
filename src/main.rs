@@ -15,6 +15,7 @@
 //! | [`builtins`] | ビルトイン（`exit`, `cd`, `pwd`, `echo`, `export`, `unset`, `jobs`, `fg`, `bg`） |
 //! | [`job`] | ジョブコントロール（バックグラウンド実行、Ctrl+Z サスペンド、`fg`/`bg` 復帰） |
 //! | [`shell`] | シェルのグローバル状態（終了ステータス、ジョブテーブル、プロセスグループ） |
+//! | [`spawn`] | `posix_spawnp` ラッパー（外部コマンド起動の高速化） |
 
 mod builtins;
 mod complete;
@@ -25,12 +26,13 @@ mod history;
 mod job;
 mod parser;
 mod shell;
+mod spawn;
 
 use shell::Shell;
 
 fn main() {
     // シグナル設定: シェル自体は SIGINT/SIGTSTP/SIGTTOU/SIGTTIN を無視する。
-    // 子プロセスは pre_exec で SIG_DFL にリセットされる。
+    // 子プロセスは posix_spawnattr の POSIX_SPAWN_SETSIGDEF で SIG_DFL にリセットされる。
     unsafe {
         libc::signal(libc::SIGINT, libc::SIG_IGN);
         libc::signal(libc::SIGTSTP, libc::SIG_IGN);

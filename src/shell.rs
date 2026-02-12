@@ -1,10 +1,16 @@
 //! シェルのグローバル状態を保持するモジュール。
 //!
 //! 環境変数は `std::env` を直接使用し、子プロセスへの自動継承を活用する。
-//! ジョブテーブル（[`JobTable`]）とプロセスグループ/ターミナル制御に必要な情報を保持する。
+//! ジョブテーブル（[`JobTable`]）、プロセスグループ/ターミナル制御、
+//! `$PATH` キャッシュ（[`PathCache`]）を保持する。
+//!
+//! [`PathCache`] は [`editor`](crate::editor) とは別インスタンスで管理される。
+//! エディタの PathCache はハイライト・補完用で `read_line` 呼び出し毎にリフレッシュされ、
+//! Shell の PathCache は executor での将来的な PATH 検索最適化用に保持される。
 
 use libc::pid_t;
 
+use crate::highlight::PathCache;
 use crate::job::JobTable;
 
 /// シェルの実行状態。REPLループ全体で共有される。
@@ -19,6 +25,8 @@ pub struct Shell {
     pub shell_pgid: pid_t,
     /// ターミナルのファイルディスクリプタ（通常 STDIN_FILENO）。
     pub terminal_fd: i32,
+    /// `$PATH` 内コマンドのキャッシュ。executor での PATH 検索最適化用。
+    pub path_cache: PathCache,
 }
 
 impl Shell {
@@ -30,6 +38,7 @@ impl Shell {
             jobs: JobTable::new(),
             shell_pgid,
             terminal_fd: libc::STDIN_FILENO,
+            path_cache: PathCache::new(),
         }
     }
 }

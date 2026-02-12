@@ -29,9 +29,9 @@
 
 - **ビルトインコマンドはin-process実行** — fork/execを回避し、cd/echo/export等を直接実行
 - **`posix_spawn()` 優先** — 外部コマンドはfork+execではなくposix_spawnで生成（macOSで2-5倍高速）
-- **ゼロコピーパース** — 入力文字列への参照でトークン化、String割り当てを最小化
-- **アリーナアロケーション** — コマンドライン毎にbump allocatorで一括確保・一括解放
-- **遅延初期化** — プロンプトを即座に表示、設定・履歴・補完はバックグラウンドで読み込み
+- **ゼロコピーパース** — 入力文字列への参照（`Cow::Borrowed`）でトークン化、String割り当てを最小化
+- **スタック配列化** — パイプ/PID 配列を 8 段以下はスタックに確保し、ヒープ割り当てを排除
+- **PATH キャッシュ** — `$PATH` 内コマンドを `HashSet` でキャッシュし、変更検出で自動再構築
 
 ### 2. Simple and Minimal — シンプルに保つ
 
@@ -43,43 +43,47 @@
 
 - 外部クレートに頼りすぎず、コア部分は自作して理解を深める
 - パーサー、プロセス管理、ジョブコントロールは自前実装
-- 行編集は既存クレート（reedline等）の利用も検討
+- 行編集も `libc` のみで自前実装（raw モード、termios 操作）
 
 ## Architecture Overview
 
 ```
-┌─────────────────────────────────────────────┐
-│                   main loop                  │
-│  prompt → read_line → parse → execute → loop │
-└─────┬───────┬──────────┬──────────┬─────────┘
+┌──────────────────────────────────────────────┐
+│                   main loop                   │
+│  prompt → read_line → parse → execute → loop  │
+└─────┬───────┬──────────┬──────────┬──────────┘
       │       │          │          │
       v       v          v          v
   ┌───────┐ ┌──────┐ ┌───────┐ ┌──────────┐
-  │Prompt │ │Line  │ │Parser │ │Executor  │
-  │Render │ │Editor│ │(zero- │ │          │
-  │(async)│ │      │ │ copy) │ │ builtin  │
-  └───────┘ └──────┘ └───┬───┘ │ external │
-                         │     │ pipeline │
-                         v     └──────────┘
-                    ┌─────────┐
-                    │   AST   │
-                    │ (arena  │
-                    │  alloc) │
-                    └─────────┘
+  │Shell  │ │Line  │ │Parser │ │Executor  │
+  │(state)│ │Editor│ │(zero- │ │          │
+  │       │ │      │ │ copy) │ │ builtin  │
+  └───────┘ └──┬───┘ └───┬───┘ │ external │
+               │         │     │ pipeline │
+          ┌────┴────┐    v     └────┬─────┘
+          │highlight│ ┌─────┐      │
+          │complete │ │ AST │      v
+          │history  │ │(Cow)│ ┌─────────┐
+          └─────────┘ └─────┘ │ spawn   │
+                              │(posix_  │
+                              │ spawnp) │
+                              └─────────┘
 ```
 
 ### Core Modules
 
 | モジュール | 責務 | 高速化手法 |
 |-----------|------|-----------|
-| `parser` | 入力をAST（コマンド列）に変換 | ゼロコピー、アリーナ割当 |
-| `executor` | コマンドの実行・プロセス生成 | ビルトインin-process、posix_spawn |
-| `builtins` | cd, echo, export等の組込コマンド | fork不要、直接実行 |
-| `pipeline` | パイプライン接続・リダイレクト | pipe(2)直接操作 |
-| `job` | ジョブコントロール (bg/fg) | シグナル管理 |
-| `line_editor` | 行編集・履歴・補完 | 非同期補完、差分描画 |
-| `prompt` | プロンプト文字列の生成 | バックグラウンド計算 |
-| `env` | 環境変数・PATHキャッシュ | ハッシュマップキャッシュ |
+| `parser` | 入力をAST（コマンド列）に変換 | ゼロコピー (`Cow::Borrowed`) |
+| `executor` | コマンドの実行・パイプライン接続 | ビルトイン in-process、スタック配列 |
+| `spawn` | 外部コマンドの起動 (`posix_spawnp`) | fork+exec 回避、RAII ラッパー |
+| `builtins` | cd, echo, export 等の組込コマンド | fork 不要、直接実行 |
+| `job` | ジョブコントロール (bg/fg/jobs) | waitpid 手動 reap |
+| `editor` | 行編集 (raw モード、キー入力) | libc 直接操作、1 回の write(2) |
+| `highlight` | シンタックスハイライト・PATH キャッシュ | HashSet キャッシュ、変更検出 |
+| `complete` | Tab 補完（コマンド名、ファイル名） | PATH キャッシュ共有 |
+| `history` | コマンド履歴 (~/.rush_history) | 追記モード永続化 |
+| `shell` | シェルのグローバル状態 | PATH キャッシュ統合 |
 
 ## Implementation Phases
 
@@ -87,34 +91,34 @@
 - REPLループ (`main.rs`): プロンプト表示 → 入力読み取り → コマンド実行 → ループ
 - シェル状態管理 (`shell.rs`): 終了ステータスと終了フラグ
 - ビルトイン (`builtins.rs`): `exit [N]`, `cd [dir]`
-- コマンド実行 (`executor.rs`): ビルトイン優先 → `std::process::Command` で外部コマンド
+- コマンド実行 (`executor.rs`): ビルトイン優先 → 外部コマンド spawn
 - SIGINTを無視してCtrl+Cからシェルを保護
 - プロンプトに終了ステータスを表示 (`[N] rush$ `)
 
-### Phase 2: Parser
+### Phase 2: Parser ✅
 - パイプライン (`cmd1 | cmd2 | cmd3`)
 - リダイレクト (`>`, `<`, `>>`, `2>`)
 - クォート処理 (`"..."`, `'...'`)
 
-### Phase 3: Builtins
+### Phase 3: Builtins ✅
 - cd, pwd, echo, export, unset, exit
 - 環境変数展開 (`$HOME`, `$PATH`)
 
-### Phase 4: Job Control
+### Phase 4: Job Control ✅
 - バックグラウンド実行 (`&`)
 - Ctrl+Z (SIGTSTP) / fg / bg
 - ジョブ一覧 (jobs)
 
-### Phase 5: Line Editing
+### Phase 5: Line Editing ✅
 - カーソル移動、履歴 (↑↓)
 - Tab補完
 - シンタックスハイライト
 
-### Phase 6: Performance Tuning
-- posix_spawn() 導入
-- PATHキャッシュ
-- アリーナアロケーション最適化
-- ベンチマーク整備・計測
+### Phase 6: Performance Tuning ✅
+- `posix_spawnp()` 導入 (`spawn.rs`): fork+exec → posix_spawn で外部コマンド起動を高速化
+- スタック配列化 (`executor.rs`): パイプ `[[i32;2]; 7]` / PID `[pid_t; 8]` / close fd `[i32; 16]`
+- PATH キャッシュ統合 (`shell.rs`): `PathCache` を Shell に追加
+- ベンチマーク整備 (`benches/bench_main.rs`): パーサー・ビルトイン・spawn・E2E 計測
 
 ## Speed Comparison Targets
 
@@ -135,6 +139,12 @@ rushはbash並の起動速度を維持しつつ、コマンド実行のオーバ
 
 ```bash
 cargo build --release
+```
+
+## Benchmarking
+
+```bash
+cargo bench
 ```
 
 ## License

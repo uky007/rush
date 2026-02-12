@@ -270,6 +270,10 @@ fn read_key(fd: i32) -> Key {
 /// REPL ループの開始時に [`LineEditor::new`] で生成し、
 /// 毎プロンプトで [`LineEditor::read_line`] を呼ぶ。
 /// raw モードは `read_line` 内でのみ有効であり、コマンド実行中は cooked モードに戻る。
+///
+/// [`PathCache`] は [`Shell`](crate::shell::Shell) とは別インスタンスで保持する。
+/// エディタのライフタイムとシェルのライフタイムを分離し、borrow checker との
+/// 整合性を維持するための設計判断。
 pub struct LineEditor {
     /// 現在の入力テキスト。UTF-8 文字列。
     buf: String,
@@ -281,6 +285,7 @@ pub struct LineEditor {
     /// 入力に使うファイルディスクリプタ（通常 `STDIN_FILENO`）。
     fd: i32,
     /// `$PATH` 内コマンドのキャッシュ。ハイライトと補完で共有。
+    /// Shell の PathCache とは別インスタンス（ライフタイム分離）。
     path_cache: PathCache,
 }
 

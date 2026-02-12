@@ -38,6 +38,10 @@ const RESET: &str = "\x1b[0m";
 
 /// `$PATH` 内の実行可能コマンド名をキャッシュする。
 /// `$PATH` が変更されたら自動的に再構築する。
+///
+/// 複数箇所でインスタンスが保持される:
+/// - [`LineEditor`](crate::editor::LineEditor): ハイライト・Tab 補完用（`read_line` 毎にリフレッシュ）
+/// - [`Shell`](crate::shell::Shell): executor での PATH 検索最適化用
 pub struct PathCache {
     /// `$PATH` 内の全実行可能コマンド名。
     commands: HashSet<String>,

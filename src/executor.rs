@@ -2,21 +2,19 @@
 //!
 //! - 単一ビルトイン（非 background）: fork なしの高速パス（[`execute_builtin`]）
 //! - それ以外: 統一 spawn パス（[`execute_job`]）
-//!   - `pre_exec` でプロセスグループ設定 + シグナルリセット
-//!   - `std::mem::forget(child)` で Rust の Child 管理を放棄し、`waitpid` で手動 reap
+//!   - `posix_spawnp` でプロセスグループ設定 + シグナル `SIG_DFL` リセット
 //!   - foreground: `tcsetpgrp` でターミナル制御を渡し、`waitpid(WUNTRACED)` で待機
 //!   - background: ジョブテーブルに登録して即座に返る
 
 use std::fs::{File, OpenOptions};
 use std::io;
-use std::os::unix::io::FromRawFd;
-use std::os::unix::process::CommandExt;
-use std::process::{Command, Stdio};
+use std::os::unix::io::IntoRawFd;
 
 use crate::builtins;
 use crate::job;
 use crate::parser::{self, Pipeline, RedirectKind};
 use crate::shell::Shell;
+use crate::spawn;
 
 /// パイプライン全体を実行し、終了ステータスを返す。
 ///
@@ -90,90 +88,196 @@ fn open_builtin_stdout(redirects: &[parser::Redirect<'_>]) -> Result<Option<File
 
 // ── 統一 spawn パス ─────────────────────────────────────────────────
 
+/// リダイレクト先の fd 情報。`open_redirect_fds` が返す。
+struct RedirectFds {
+    stdin_fd: Option<i32>,
+    stdout_fd: Option<i32>,
+    stderr_fd: Option<i32>,
+}
+
+/// リダイレクト先ファイルを開き、raw fd を返す。
+///
+/// 開いた fd は呼び出し側（spawn 後の親プロセス）で close する責任がある。
+fn open_redirect_fds(redirects: &[parser::Redirect<'_>]) -> Result<RedirectFds, i32> {
+    let mut fds = RedirectFds {
+        stdin_fd: None,
+        stdout_fd: None,
+        stderr_fd: None,
+    };
+
+    for r in redirects {
+        let target = r.target.as_ref();
+        match r.kind {
+            RedirectKind::Output => {
+                // 前の stdout_fd があれば close
+                if let Some(old) = fds.stdout_fd {
+                    unsafe { libc::close(old); }
+                }
+                let f = File::create(target).map_err(|e| {
+                    eprintln!("rush: {}: {}", target, e);
+                    1
+                })?;
+                fds.stdout_fd = Some(f.into_raw_fd());
+            }
+            RedirectKind::Append => {
+                if let Some(old) = fds.stdout_fd {
+                    unsafe { libc::close(old); }
+                }
+                let f = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(target)
+                    .map_err(|e| {
+                        eprintln!("rush: {}: {}", target, e);
+                        1
+                    })?;
+                fds.stdout_fd = Some(f.into_raw_fd());
+            }
+            RedirectKind::Input => {
+                if let Some(old) = fds.stdin_fd {
+                    unsafe { libc::close(old); }
+                }
+                let f = File::open(target).map_err(|e| {
+                    eprintln!("rush: {}: {}", target, e);
+                    1
+                })?;
+                fds.stdin_fd = Some(f.into_raw_fd());
+            }
+            RedirectKind::Stderr => {
+                if let Some(old) = fds.stderr_fd {
+                    unsafe { libc::close(old); }
+                }
+                let f = File::create(target).map_err(|e| {
+                    eprintln!("rush: {}: {}", target, e);
+                    1
+                })?;
+                fds.stderr_fd = Some(f.into_raw_fd());
+            }
+        }
+    }
+
+    Ok(fds)
+}
+
 /// パイプライン（単一 or 複数コマンド）を子プロセスとして実行する。
 ///
 /// 処理の流れ:
-/// 1. N-1 個のパイプを作成
-/// 2. 各コマンドを spawn（`pre_exec` でプロセスグループ参加 + シグナル `SIG_DFL` リセット）
+/// 1. N-1 個のパイプを作成（8 段以下はスタック配列）
+/// 2. 各コマンドの fd を `posix_spawnp` で起動
 /// 3. 親側でも `setpgid` を呼び、レースコンディションを防止
-/// 4. `std::mem::forget(child)` で Rust の `Child` 管理を放棄（`waitpid` で手動 reap するため）
-/// 5. background → ジョブテーブルに追加し `[N] pgid` を表示
+/// 4. background → ジョブテーブルに追加し `[N] pgid` を表示
 ///    foreground → `tcsetpgrp` でターミナルを渡し、`wait_for_fg` で待機。
 ///    停止検出時はジョブテーブルに Stopped として登録。
 fn execute_job(shell: &mut Shell, pipeline: &Pipeline<'_>, cmd_text: &str) -> i32 {
     let n = pipeline.commands.len();
 
-    // N-1 個のパイプを作成
-    let mut pipes: Vec<[i32; 2]> = Vec::with_capacity(n.saturating_sub(1));
-    for _ in 0..n.saturating_sub(1) {
-        let mut fds = [0i32; 2];
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+    // ── パイプ作成（8 段以下はスタック配列、超過時はヒープフォールバック）──
+    let mut pipe_stack: [[i32; 2]; 7] = [[-1; 2]; 7];
+    let pipe_count = n.saturating_sub(1);
+    let mut pipe_heap: Vec<[i32; 2]> = Vec::new();
+
+    let pipes: &mut [[i32; 2]] = if pipe_count <= 7 {
+        &mut pipe_stack[..pipe_count]
+    } else {
+        pipe_heap.resize(pipe_count, [-1; 2]);
+        &mut pipe_heap
+    };
+
+    for p in pipes.iter_mut() {
+        if unsafe { libc::pipe(p.as_mut_ptr()) } != 0 {
             eprintln!("rush: pipe: {}", std::io::Error::last_os_error());
-            for p in &pipes {
-                unsafe {
-                    libc::close(p[0]);
-                    libc::close(p[1]);
-                }
+            // 既に作成済みのパイプを close
+            for created in pipes.iter() {
+                if created[0] >= 0 { unsafe { libc::close(created[0]); } }
+                if created[1] >= 0 { unsafe { libc::close(created[1]); } }
             }
             return 1;
         }
-        pipes.push(fds);
     }
 
-    let mut pids: Vec<libc::pid_t> = Vec::with_capacity(n);
-    let mut pgid: libc::pid_t = 0; // 最初の子の PID がグループリーダーになる
+    // ── PID 配列（8 個以下はスタック）──
+    let mut pid_stack: [libc::pid_t; 8] = [0; 8];
+    let mut pid_heap: Vec<libc::pid_t> = Vec::new();
+    let mut pid_count: usize = 0;
+
+    let pids: &mut [libc::pid_t] = if n <= 8 {
+        &mut pid_stack[..n]
+    } else {
+        pid_heap.resize(n, 0);
+        &mut pid_heap
+    };
+
+    let mut pgid: libc::pid_t = 0;
     let mut spawn_error = false;
     let mut error_status = 1i32;
+
+    // ── close 対象 fd 収集用スタック配列 ──
+    let mut close_fds_buf: [i32; 16] = [-1; 16];
 
     for i in 0..n {
         let cmd = &pipeline.commands[i];
         let args: Vec<&str> = cmd.args.iter().map(|a| a.as_ref()).collect();
-        let mut command = Command::new(args[0]);
-        command.args(&args[1..]);
 
-        // 前段パイプの read_fd を stdin に接続
+        // stdin/stdout の決定（パイプ接続）
+        let mut stdin_fd: Option<i32> = None;
+        let mut stdout_fd: Option<i32> = None;
+
         if i > 0 {
-            let fd = pipes[i - 1][0];
-            pipes[i - 1][0] = -1; // consumed
-            command.stdin(unsafe { Stdio::from_raw_fd(fd) });
+            stdin_fd = Some(pipes[i - 1][0]);
         }
-
-        // 次段パイプの write_fd を stdout に接続
         if i < n - 1 {
-            let fd = pipes[i][1];
-            pipes[i][1] = -1; // consumed
-            command.stdout(unsafe { Stdio::from_raw_fd(fd) });
+            stdout_fd = Some(pipes[i][1]);
         }
 
-        // コマンド個別のリダイレクト
-        if let Err(status) = apply_redirects(&mut command, &cmd.redirects) {
-            error_status = status;
-            spawn_error = true;
-            break;
+        // リダイレクトの fd を開く
+        let redir_fds = match open_redirect_fds(&cmd.redirects) {
+            Ok(fds) => fds,
+            Err(status) => {
+                error_status = status;
+                spawn_error = true;
+                break;
+            }
+        };
+
+        // リダイレクトの fd でパイプの fd を上書き
+        if redir_fds.stdin_fd.is_some() {
+            stdin_fd = redir_fds.stdin_fd;
+        }
+        if redir_fds.stdout_fd.is_some() {
+            stdout_fd = redir_fds.stdout_fd;
         }
 
-        // pre_exec: プロセスグループ設定 + シグナルリセット
-        let pgid_for_child = pgid;
-        unsafe {
-            command.pre_exec(move || {
-                let target = if pgid_for_child == 0 {
-                    libc::getpid()
-                } else {
-                    pgid_for_child
-                };
-                libc::setpgid(0, target);
-                libc::signal(libc::SIGINT, libc::SIG_DFL);
-                libc::signal(libc::SIGTSTP, libc::SIG_DFL);
-                libc::signal(libc::SIGTTOU, libc::SIG_DFL);
-                libc::signal(libc::SIGTTIN, libc::SIG_DFL);
-                Ok(())
-            });
+        // 子プロセスで close すべき fd を収集
+        let mut close_count = 0;
+        for j in 0..pipe_count {
+            // パイプの read end
+            if pipes[j][0] >= 0 {
+                let fd = pipes[j][0];
+                // 今回 stdin として使う fd は close しない（dup2 後に close される）
+                if stdin_fd != Some(fd) && close_count < close_fds_buf.len() {
+                    close_fds_buf[close_count] = fd;
+                    close_count += 1;
+                }
+            }
+            // パイプの write end
+            if pipes[j][1] >= 0 {
+                let fd = pipes[j][1];
+                if stdout_fd != Some(fd) && close_count < close_fds_buf.len() {
+                    close_fds_buf[close_count] = fd;
+                    close_count += 1;
+                }
+            }
         }
 
-        match command.spawn() {
-            Ok(child) => {
-                let child_pid = child.id() as libc::pid_t;
-
+        match spawn::spawn(
+            &args,
+            pgid,
+            stdin_fd,
+            stdout_fd,
+            redir_fds.stderr_fd,
+            &close_fds_buf[..close_count],
+        ) {
+            Ok(child_pid) => {
                 // 親側でもプロセスグループを設定（レースコンディション防止）
                 if pgid == 0 {
                     pgid = child_pid;
@@ -182,32 +286,50 @@ fn execute_job(shell: &mut Shell, pipeline: &Pipeline<'_>, cmd_text: &str) -> i3
                     libc::setpgid(child_pid, pgid);
                 }
 
-                pids.push(child_pid);
-
-                // Rust の Child を forget し、waitpid で手動 reap する
-                std::mem::forget(child);
+                pids[pid_count] = child_pid;
+                pid_count += 1;
             }
             Err(e) => {
-                error_status = spawn_error_status(args[0], &e);
+                eprintln!("{}", e);
+                error_status = e.exit_status();
                 spawn_error = true;
                 break;
             }
         }
+
+        // 消費したパイプ fd を親側で close
+        if i > 0 && pipes[i - 1][0] >= 0 {
+            unsafe { libc::close(pipes[i - 1][0]); }
+            pipes[i - 1][0] = -1;
+        }
+        if i < n - 1 && pipes[i][1] >= 0 {
+            unsafe { libc::close(pipes[i][1]); }
+            pipes[i][1] = -1;
+        }
+
+        // リダイレクト用に開いた fd を親側で close
+        if let Some(fd) = redir_fds.stdin_fd {
+            unsafe { libc::close(fd); }
+        }
+        if let Some(fd) = redir_fds.stdout_fd {
+            unsafe { libc::close(fd); }
+        }
+        if let Some(fd) = redir_fds.stderr_fd {
+            unsafe { libc::close(fd); }
+        }
     }
 
-    // 未消費の fd を close
-    for fds in &pipes {
-        if fds[0] >= 0 {
-            unsafe { libc::close(fds[0]) };
-        }
-        if fds[1] >= 0 {
-            unsafe { libc::close(fds[1]) };
-        }
+    // 未消費のパイプ fd を close
+    for p in pipes.iter() {
+        if p[0] >= 0 { unsafe { libc::close(p[0]); } }
+        if p[1] >= 0 { unsafe { libc::close(p[1]); } }
     }
+
+    let active_pids = &pids[..pid_count];
 
     if spawn_error {
         // エラー時: 既に spawn したプロセスを待機してクリーンアップ
-        for &pid in &pids {
+        for &pid in active_pids {
             unsafe {
                 libc::waitpid(pid, std::ptr::null_mut(), 0);
             }
@@ -220,7 +342,9 @@ fn execute_job(shell: &mut Shell, pipeline: &Pipeline<'_>, cmd_text: &str) -> i3
 
     if pipeline.background {
         // バックグラウンド: ジョブテーブルに追加
-        let job_id = shell.jobs.insert(pgid, display_cmd.to_string(), pids);
+        let job_id = shell
+            .jobs
+            .insert(pgid, display_cmd.to_string(), active_pids.to_vec());
         eprintln!("[{}] {}", job_id, pgid);
         0
     } else {
@@ -234,7 +358,9 @@ fn execute_job(shell: &mut Shell, pipeline: &Pipeline<'_>, cmd_text: &str) -> i3
 
         if stopped {
             // Ctrl+Z で停止: ジョブテーブルに追加
-            let job_id = shell.jobs.insert(pgid, display_cmd.to_string(), pids);
+            let job_id = shell
+                .jobs
+                .insert(pgid, display_cmd.to_string(), active_pids.to_vec());
             // 停止状態をマーク（insert 後のプロセスは stopped=false なので更新する）
             if let Some(job) = shell.jobs.get_mut(job_id) {
                 for proc in &mut job.processes {
@@ -245,70 +371,5 @@ fn execute_job(shell: &mut Shell, pipeline: &Pipeline<'_>, cmd_text: &str) -> i3
         }
 
         status
-    }
-}
-
-// ── リダイレクト適用 ─────────────────────────────────────────────────
-
-/// リダイレクトを `Command` に適用する。
-///
-/// ファイルオープンに失敗した場合はエラーメッセージを出力し `Err(1)` を返す。
-/// 成功時、開いた `File` の所有権は `Command` に移転する。
-fn apply_redirects(command: &mut Command, redirects: &[parser::Redirect<'_>]) -> Result<(), i32> {
-    for r in redirects {
-        let target = r.target.as_ref();
-        match r.kind {
-            RedirectKind::Output => {
-                let f = File::create(target).map_err(|e| {
-                    eprintln!("rush: {}: {}", target, e);
-                    1
-                })?;
-                command.stdout(f);
-            }
-            RedirectKind::Append => {
-                let f = OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(target)
-                    .map_err(|e| {
-                        eprintln!("rush: {}: {}", target, e);
-                        1
-                    })?;
-                command.stdout(f);
-            }
-            RedirectKind::Input => {
-                let f = File::open(target).map_err(|e| {
-                    eprintln!("rush: {}: {}", target, e);
-                    1
-                })?;
-                command.stdin(f);
-            }
-            RedirectKind::Stderr => {
-                let f = File::create(target).map_err(|e| {
-                    eprintln!("rush: {}: {}", target, e);
-                    1
-                })?;
-                command.stderr(f);
-            }
-        }
-    }
-    Ok(())
-}
-
-// ── ヘルパー ─────────────────────────────────────────────────────────
-
-/// spawn 失敗時のエラーメッセージ出力と終了コード決定。
-///
-/// 127 = command not found, 126 = permission denied, 1 = その他。
-fn spawn_error_status(name: &str, e: &std::io::Error) -> i32 {
-    if e.kind() == std::io::ErrorKind::NotFound {
-        eprintln!("rush: {}: command not found", name);
-        127
-    } else if e.kind() == std::io::ErrorKind::PermissionDenied {
-        eprintln!("rush: {}: permission denied", name);
-        126
-    } else {
-        eprintln!("rush: {}: {}", name, e);
-        1
     }
 }
