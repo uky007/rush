@@ -238,20 +238,27 @@ fn expand_variables(s: &str, last_status: i32) -> Cow<'_, str> {
             b'{' => {
                 pos += 1; // skip '{'
                 let var_start = pos;
-                while pos < len && bytes[pos] != b'}' && is_var_char(bytes[pos]) {
+                // 閉じ '}' を探す（ネストしないが、`:`, `#`, `%`, `/` 等を含む）
+                let mut depth = 1;
+                while pos < len && depth > 0 {
+                    match bytes[pos] {
+                        b'{' => depth += 1,
+                        b'}' => {
+                            depth -= 1;
+                            if depth == 0 { break; }
+                        }
+                        _ => {}
+                    }
                     pos += 1;
                 }
                 if pos < len && bytes[pos] == b'}' {
-                    let var_name = &s[var_start..pos];
+                    let inner = &s[var_start..pos];
                     pos += 1; // skip '}'
-                    if !var_name.is_empty() {
-                        if let Ok(val) = std::env::var(var_name) {
-                            result.push_str(&val);
-                        }
+                    if !inner.is_empty() {
+                        result.push_str(&expand_braced_param(inner, last_status));
                     }
-                    // 未定義 → 空文字（何も追加しない）
                 } else {
-                    // 閉じ '}' がない or 不正文字 → リテラル "${"
+                    // 閉じ '}' がない → リテラル "${"
                     result.push_str("${");
                     pos = var_start; // 戻して再スキャン
                 }
@@ -290,6 +297,183 @@ fn is_var_start(b: u8) -> bool {
 /// 変数名の継続文字として有効か（ASCII英数字 or `_`）
 fn is_var_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// `${...}` 内のパラメータ展開を処理する。
+/// 対応: `${var:-default}`, `${var:=default}`, `${var:+alt}`, `${var:?msg}`,
+///       `${#var}`, `${var%pat}`, `${var%%pat}`, `${var#pat}`, `${var##pat}`,
+///       `${var/pat/repl}`, `${var//pat/repl}`
+fn expand_braced_param(inner: &str, last_status: i32) -> String {
+    // ${#var} — 文字数
+    if let Some(var_name) = inner.strip_prefix('#') {
+        let val = std::env::var(var_name).unwrap_or_default();
+        return val.chars().count().to_string();
+    }
+
+    // 変数名を先に抽出（英数字 + _）
+    let bytes = inner.as_bytes();
+    let mut name_end = 0;
+    while name_end < bytes.len() && is_var_char(bytes[name_end]) {
+        name_end += 1;
+    }
+
+    // 変数名の後に演算子がなければ通常の ${VAR}
+    if name_end == bytes.len() {
+        return std::env::var(inner).unwrap_or_default();
+    }
+
+    let var_name = &inner[..name_end];
+    let val = std::env::var(var_name).unwrap_or_default();
+    let op_and_rest = &inner[name_end..];
+
+    // ${var:-default}, ${var:=default}, ${var:+alt}, ${var:?msg}
+    if op_and_rest.starts_with(":-") {
+        let operand = &op_and_rest[2..];
+        return if val.is_empty() { expand_variables(operand, last_status).into_owned() } else { val };
+    }
+    if op_and_rest.starts_with(":=") {
+        let operand = &op_and_rest[2..];
+        if val.is_empty() {
+            let def = expand_variables(operand, last_status).into_owned();
+            std::env::set_var(var_name, &def);
+            return def;
+        }
+        return val;
+    }
+    if op_and_rest.starts_with(":+") {
+        let operand = &op_and_rest[2..];
+        return if val.is_empty() { String::new() } else { expand_variables(operand, last_status).into_owned() };
+    }
+    if op_and_rest.starts_with(":?") {
+        let operand = &op_and_rest[2..];
+        if val.is_empty() {
+            let msg = if operand.is_empty() { "parameter null or not set" } else { operand };
+            eprintln!("rush: {}: {}", var_name, msg);
+            return String::new();
+        }
+        return val;
+    }
+    // ${var%%pat} — 最長後方一致を削除
+    if op_and_rest.starts_with("%%") {
+        return strip_suffix_longest(&val, &op_and_rest[2..]);
+    }
+    // ${var%pat} — 最短後方一致を削除
+    if op_and_rest.starts_with('%') {
+        return strip_suffix_shortest(&val, &op_and_rest[1..]);
+    }
+    // ${var##pat} — 最長前方一致を削除
+    if op_and_rest.starts_with("##") {
+        return strip_prefix_longest(&val, &op_and_rest[2..]);
+    }
+    // ${var#pat} — 最短前方一致を削除
+    if op_and_rest.starts_with('#') {
+        return strip_prefix_shortest(&val, &op_and_rest[1..]);
+    }
+    // ${var//pat/repl} or ${var/pat/repl}
+    if op_and_rest.starts_with('/') {
+        let rest = &op_and_rest[1..];
+        let (global, pattern_rest) = if rest.starts_with('/') {
+            (true, &rest[1..])
+        } else {
+            (false, rest)
+        };
+        let (pattern, replacement) = if let Some(sep) = pattern_rest.find('/') {
+            (&pattern_rest[..sep], &pattern_rest[sep + 1..])
+        } else {
+            (pattern_rest, "")
+        };
+        return if global {
+            glob_replace_all(&val, pattern, replacement)
+        } else {
+            glob_replace_first(&val, pattern, replacement)
+        };
+    }
+
+    // フォールバック: 通常の ${VAR}
+    val
+}
+
+/// glob パターンで最短前方一致を削除する。
+fn strip_prefix_shortest(val: &str, pattern: &str) -> String {
+    for end in 0..=val.len() {
+        if !val.is_char_boundary(end) { continue; }
+        if crate::glob::matches_pattern(pattern, &val[..end]) {
+            return val[end..].to_string();
+        }
+    }
+    val.to_string()
+}
+
+/// glob パターンで最長前方一致を削除する。
+fn strip_prefix_longest(val: &str, pattern: &str) -> String {
+    for end in (0..=val.len()).rev() {
+        if !val.is_char_boundary(end) { continue; }
+        if crate::glob::matches_pattern(pattern, &val[..end]) {
+            return val[end..].to_string();
+        }
+    }
+    val.to_string()
+}
+
+/// glob パターンで最短後方一致を削除する。
+fn strip_suffix_shortest(val: &str, pattern: &str) -> String {
+    for start in (0..=val.len()).rev() {
+        if !val.is_char_boundary(start) { continue; }
+        if crate::glob::matches_pattern(pattern, &val[start..]) {
+            return val[..start].to_string();
+        }
+    }
+    val.to_string()
+}
+
+/// glob パターンで最長後方一致を削除する。
+fn strip_suffix_longest(val: &str, pattern: &str) -> String {
+    for start in 0..=val.len() {
+        if !val.is_char_boundary(start) { continue; }
+        if crate::glob::matches_pattern(pattern, &val[start..]) {
+            return val[..start].to_string();
+        }
+    }
+    val.to_string()
+}
+
+/// glob パターンで最初の一致を置換する。
+fn glob_replace_first(val: &str, pattern: &str, replacement: &str) -> String {
+    for start in 0..val.len() {
+        if !val.is_char_boundary(start) { continue; }
+        for end in start + 1..=val.len() {
+            if !val.is_char_boundary(end) { continue; }
+            if crate::glob::matches_pattern(pattern, &val[start..end]) {
+                return format!("{}{}{}", &val[..start], replacement, &val[end..]);
+            }
+        }
+    }
+    val.to_string()
+}
+
+/// glob パターンで全ての一致を置換する。
+fn glob_replace_all(val: &str, pattern: &str, replacement: &str) -> String {
+    let mut result = String::new();
+    let mut pos = 0;
+    while pos < val.len() {
+        if !val.is_char_boundary(pos) { pos += 1; continue; }
+        let mut matched = false;
+        for end in (pos + 1..=val.len()).rev() {
+            if !val.is_char_boundary(end) { continue; }
+            if crate::glob::matches_pattern(pattern, &val[pos..end]) {
+                result.push_str(replacement);
+                pos = end;
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            let ch = val[pos..].chars().next().unwrap();
+            result.push(ch);
+            pos += ch.len_utf8();
+        }
+    }
+    result
 }
 
 // ── Tokenizer (crate-private) ───────────────────────────────────────
@@ -384,19 +568,24 @@ impl<'a> Tokenizer<'a> {
             b'{' => {
                 self.pos += 1; // skip '{'
                 let var_start = self.pos;
-                while self.pos < len
-                    && bytes[self.pos] != b'}'
-                    && is_var_char(bytes[self.pos])
-                {
+                // 閉じ '}' を探す（パラメータ展開の特殊文字を含む可能性あり）
+                let mut depth = 1;
+                while self.pos < len && depth > 0 {
+                    match bytes[self.pos] {
+                        b'{' => depth += 1,
+                        b'}' => {
+                            depth -= 1;
+                            if depth == 0 { break; }
+                        }
+                        _ => {}
+                    }
                     self.pos += 1;
                 }
                 if self.pos < len && bytes[self.pos] == b'}' {
-                    let var_name = &self.input[var_start..self.pos];
+                    let inner = &self.input[var_start..self.pos];
                     self.pos += 1; // skip '}'
-                    if !var_name.is_empty() {
-                        if let Ok(val) = std::env::var(var_name) {
-                            buf.push_str(&val);
-                        }
+                    if !inner.is_empty() {
+                        buf.push_str(&expand_braced_param(inner, self.last_status));
                     }
                 } else {
                     buf.push_str("${");
@@ -1450,5 +1639,69 @@ mod tests {
     fn cmd_sub_in_double_quotes() {
         let list = parse("echo \"today is $(date)\"", 0).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "today is $(date)");
+    }
+
+    // ── パラメータ展開テスト ──
+
+    #[test]
+    fn param_default() {
+        std::env::remove_var("RUSH_TEST_PDEF");
+        let list = parse("echo ${RUSH_TEST_PDEF:-hello}", 0).unwrap().unwrap();
+        assert_eq!(list.items[0].pipeline.commands[0].args[1], "hello");
+
+        std::env::set_var("RUSH_TEST_PDEF", "world");
+        let list = parse("echo ${RUSH_TEST_PDEF:-hello}", 0).unwrap().unwrap();
+        assert_eq!(list.items[0].pipeline.commands[0].args[1], "world");
+        std::env::remove_var("RUSH_TEST_PDEF");
+    }
+
+    #[test]
+    fn param_alt() {
+        std::env::remove_var("RUSH_TEST_PALT");
+        let list = parse("echo ${RUSH_TEST_PALT:+yes}", 0).unwrap().unwrap();
+        assert_eq!(list.items[0].pipeline.commands[0].args[1], "");
+
+        std::env::set_var("RUSH_TEST_PALT", "val");
+        let list = parse("echo ${RUSH_TEST_PALT:+yes}", 0).unwrap().unwrap();
+        assert_eq!(list.items[0].pipeline.commands[0].args[1], "yes");
+        std::env::remove_var("RUSH_TEST_PALT");
+    }
+
+    #[test]
+    fn param_length() {
+        std::env::set_var("RUSH_TEST_PLEN", "hello");
+        let list = parse("echo ${#RUSH_TEST_PLEN}", 0).unwrap().unwrap();
+        assert_eq!(list.items[0].pipeline.commands[0].args[1], "5");
+        std::env::remove_var("RUSH_TEST_PLEN");
+    }
+
+    #[test]
+    fn param_strip_suffix() {
+        std::env::set_var("RUSH_TEST_PSUF", "hello.tar.gz");
+        let list = parse("echo ${RUSH_TEST_PSUF%.*}", 0).unwrap().unwrap();
+        assert_eq!(list.items[0].pipeline.commands[0].args[1], "hello.tar");
+        let list = parse("echo ${RUSH_TEST_PSUF%%.*}", 0).unwrap().unwrap();
+        assert_eq!(list.items[0].pipeline.commands[0].args[1], "hello");
+        std::env::remove_var("RUSH_TEST_PSUF");
+    }
+
+    #[test]
+    fn param_strip_prefix() {
+        std::env::set_var("RUSH_TEST_PPRE", "/usr/local/bin");
+        let list = parse("echo ${RUSH_TEST_PPRE#*/}", 0).unwrap().unwrap();
+        assert_eq!(list.items[0].pipeline.commands[0].args[1], "usr/local/bin");
+        let list = parse("echo ${RUSH_TEST_PPRE##*/}", 0).unwrap().unwrap();
+        assert_eq!(list.items[0].pipeline.commands[0].args[1], "bin");
+        std::env::remove_var("RUSH_TEST_PPRE");
+    }
+
+    #[test]
+    fn param_replace() {
+        std::env::set_var("RUSH_TEST_PREP", "hello world hello");
+        let list = parse("echo ${RUSH_TEST_PREP/hello/bye}", 0).unwrap().unwrap();
+        assert_eq!(list.items[0].pipeline.commands[0].args[1], "bye world hello");
+        let list = parse("echo ${RUSH_TEST_PREP//hello/bye}", 0).unwrap().unwrap();
+        assert_eq!(list.items[0].pipeline.commands[0].args[1], "bye world bye");
+        std::env::remove_var("RUSH_TEST_PREP");
     }
 }

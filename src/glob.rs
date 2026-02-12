@@ -81,7 +81,7 @@ fn expand_in_dir(dir: &str, file_pattern: &str) -> Vec<String> {
 
 /// パターン文字列とファイル名を照合する。
 /// `*` は 0 文字以上、`?` は任意の 1 文字にマッチ。
-fn matches_pattern(pattern: &str, name: &str) -> bool {
+pub fn matches_pattern(pattern: &str, name: &str) -> bool {
     let pat = pattern.as_bytes();
     let nam = name.as_bytes();
     matches_recursive(pat, 0, nam, 0)
