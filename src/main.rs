@@ -8,6 +8,7 @@
 //! - `history` ビルトイン（editor 所有の履歴への直接アクセス）
 //! - 継続行入力（末尾 `\`・未完了パイプ/演算子・未閉クォートで `> ` プロンプト）
 //! - `~/.rushrc` 読み込み
+//! - 非インタラクティブモード（`rush -c 'cmd'`、`rush script.sh`）
 //!
 //! ## モジュール構成
 //!
@@ -134,7 +135,62 @@ fn expand_alias(line: &str, aliases: &HashMap<String, String>) -> String {
     }
 }
 
+/// 文字列を 1 行ずつ（または単一コマンドとして）パースして実行する。
+fn run_string(shell: &mut Shell, input: &str) {
+    for line in input.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let expanded = expand_alias(trimmed, &shell.aliases);
+        match parser::parse(&expanded, shell.last_status) {
+            Ok(Some(list)) => {
+                let cmd_text = expanded.trim().to_string();
+                shell.last_status = executor::execute(shell, &list, &cmd_text);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("rush: {}", e);
+                shell.last_status = 2;
+            }
+        }
+        if shell.should_exit {
+            break;
+        }
+    }
+}
+
+/// スクリプトファイルを行単位で実行する。
+fn run_file(shell: &mut Shell, path: &str) {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("rush: {}: {}", path, e);
+            shell.last_status = 127;
+            return;
+        }
+    };
+    run_string(shell, &content);
+}
+
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+
+    // 非インタラクティブモード: rush -c 'command' または rush script.sh
+    if args.len() > 1 {
+        let mut shell = Shell::new();
+        if args[1] == "-c" {
+            if args.len() < 3 {
+                eprintln!("rush: -c: option requires an argument");
+                std::process::exit(2);
+            }
+            run_string(&mut shell, &args[2]);
+        } else {
+            run_file(&mut shell, &args[1]);
+        }
+        std::process::exit(shell.last_status);
+    }
+
     // シグナル設定: シェル自体は SIGINT/SIGTSTP/SIGTTOU/SIGTTIN を無視する。
     // 子プロセスは posix_spawnattr の POSIX_SPAWN_SETSIGDEF で SIG_DFL にリセットされる。
     unsafe {
