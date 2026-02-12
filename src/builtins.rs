@@ -20,7 +20,10 @@ use crate::shell::Shell;
 
 /// コマンド名がビルトインかどうかを判定する。
 ///
-/// executor がビルトイン判定 → リダイレクト準備 → 実行、の順で処理するために使用。
+/// 以下の場面で使用される:
+/// - [`executor`](crate::executor): ビルトイン判定 → fork なし高速パスの選択
+/// - [`highlight`](crate::highlight): コマンドの有効性判定（緑/赤の着色）
+/// - [`complete`](crate::complete): ビルトイン名のリストを補完候補に使用（`BUILTINS` 定数と同期）
 pub fn is_builtin(name: &str) -> bool {
     matches!(name, "exit" | "cd" | "pwd" | "echo" | "export" | "unset" | "jobs" | "fg" | "bg")
 }
@@ -158,7 +161,7 @@ fn builtin_unset(args: &[&str]) -> i32 {
 ///
 /// - `%N` → ジョブ番号 N
 /// - 数値のみ → ジョブ番号として解釈
-/// - 省略時 → [`JobTable::current_job_id`] で最新の非 Done ジョブを選択
+/// - 省略時 → [`JobTable::current_job_id`](crate::job::JobTable::current_job_id) で最新の非 Done ジョブを選択
 ///
 /// 該当ジョブが見つからない場合はエラーメッセージを出力して `Err(1)` を返す。
 fn parse_job_arg(shell: &Shell, args: &[&str]) -> Result<usize, i32> {
