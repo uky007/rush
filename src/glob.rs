@@ -1,18 +1,18 @@
-//! パス名展開（glob）: `*` と `?` によるファイル名マッチング。
+//! パス名展開（glob）: `*`, `?`, `[...]` によるファイル名マッチング。
 //!
 //! ## 対応パターン
 //!
 //! - `*` — 0 文字以上の任意の文字にマッチ
 //! - `?` — 任意の 1 文字にマッチ
+//! - `[abc]` — 文字クラス（列挙された任意の 1 文字にマッチ）
+//! - `[a-z]` — 範囲指定（ASCII 範囲の任意の 1 文字にマッチ）
+//! - `[!...]` / `[^...]` — 否定文字クラス（マッチしない文字にマッチ）
 //!
-//! ## 制限
-//!
-//! - `[a-z]` 範囲パターンは未対応（将来の拡張）
-//! - `.` で始まるファイルはパターンが `.` で始まる場合のみマッチ（bash 互換）
+//! `.` で始まるファイルはパターンが `.` で始まる場合のみマッチ（bash 互換）。
 
 /// パターンにグロブ文字（`*`, `?`）が含まれるか判定する。
 pub fn has_glob_chars(s: &str) -> bool {
-    s.bytes().any(|b| b == b'*' || b == b'?')
+    s.bytes().any(|b| b == b'*' || b == b'?' || b == b'[')
 }
 
 /// パターンを展開し、マッチするファイルパスをソート済みで返す。
@@ -120,6 +120,52 @@ fn matches_recursive(pat: &[u8], pi: usize, nam: &[u8], ni: usize) -> bool {
                 pi += 1;
                 ni += 1;
             }
+            b'[' => {
+                if ni >= nlen {
+                    return false;
+                }
+                pi += 1; // skip '['
+                let negate = pi < plen && (pat[pi] == b'!' || pat[pi] == b'^');
+                if negate {
+                    pi += 1;
+                }
+                let mut matched = false;
+                let ch = nam[ni];
+                // `]` を文字クラスの最初に置ける（bash 互換）
+                let first = true;
+                let mut first_iter = first;
+                while pi < plen && (pat[pi] != b']' || first_iter) {
+                    first_iter = false;
+                    // range: a-z
+                    if pi + 2 < plen && pat[pi + 1] == b'-' && pat[pi + 2] != b']' {
+                        let lo = pat[pi];
+                        let hi = pat[pi + 2];
+                        if (lo <= ch && ch <= hi) || (hi <= ch && ch <= lo) {
+                            matched = true;
+                        }
+                        pi += 3;
+                    } else {
+                        if pat[pi] == ch {
+                            matched = true;
+                        }
+                        pi += 1;
+                    }
+                }
+                // skip closing ']'
+                if pi < plen && pat[pi] == b']' {
+                    pi += 1;
+                } else {
+                    // 閉じ括弧がない → リテラルとして不一致
+                    return false;
+                }
+                if negate {
+                    matched = !matched;
+                }
+                if !matched {
+                    return false;
+                }
+                ni += 1;
+            }
             ch => {
                 if ni >= nlen || nam[ni] != ch {
                     return false;
@@ -185,6 +231,7 @@ mod tests {
         assert!(has_glob_chars("*.txt"));
         assert!(has_glob_chars("h?llo"));
         assert!(has_glob_chars("a*b?c"));
+        assert!(has_glob_chars("[abc]"));
     }
 
     #[test]
@@ -198,5 +245,49 @@ mod tests {
     fn expand_no_match_returns_pattern() {
         let result = expand("nosuch_xyz_pattern_*.qqqq");
         assert_eq!(result, vec!["nosuch_xyz_pattern_*.qqqq"]);
+    }
+
+    #[test]
+    fn bracket_char_list() {
+        assert!(matches_pattern("[abc]", "a"));
+        assert!(matches_pattern("[abc]", "b"));
+        assert!(matches_pattern("[abc]", "c"));
+        assert!(!matches_pattern("[abc]", "d"));
+    }
+
+    #[test]
+    fn bracket_range() {
+        assert!(matches_pattern("[a-z]", "m"));
+        assert!(matches_pattern("[a-z]", "a"));
+        assert!(matches_pattern("[a-z]", "z"));
+        assert!(!matches_pattern("[a-z]", "A"));
+        assert!(!matches_pattern("[a-z]", "0"));
+    }
+
+    #[test]
+    fn bracket_range_digits() {
+        assert!(matches_pattern("file[0-9].txt", "file3.txt"));
+        assert!(!matches_pattern("file[0-9].txt", "filea.txt"));
+    }
+
+    #[test]
+    fn bracket_negate() {
+        assert!(!matches_pattern("[!abc]", "a"));
+        assert!(matches_pattern("[!abc]", "d"));
+        assert!(matches_pattern("[^0-9]", "x"));
+        assert!(!matches_pattern("[^0-9]", "5"));
+    }
+
+    #[test]
+    fn bracket_with_star() {
+        assert!(matches_pattern("[A-Z]*", "Hello"));
+        assert!(!matches_pattern("[A-Z]*", "hello"));
+    }
+
+    #[test]
+    fn bracket_multiple_ranges() {
+        assert!(matches_pattern("[a-zA-Z]", "G"));
+        assert!(matches_pattern("[a-zA-Z]", "g"));
+        assert!(!matches_pattern("[a-zA-Z]", "5"));
     }
 }
