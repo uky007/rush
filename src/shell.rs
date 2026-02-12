@@ -42,6 +42,13 @@ pub struct Shell {
     pub dir_stack: Vec<String>,
     /// トラップハンドラ（シグナル番号 → コマンド文字列）。`trap 'cmd' SIGNAL` で設定。
     pub traps: HashMap<i32, String>,
+    /// `break` 要求の残り深さ。0 なら break 要求なし。
+    /// `break N` で N が設定され、ループ脱出ごとにデクリメントする。
+    pub break_level: usize,
+    /// `continue` 要求の残り深さ。0 なら continue 要求なし。
+    pub continue_level: usize,
+    /// 現在のループネスト深さ。`break`/`continue` の有効性判定に使用。
+    pub loop_depth: usize,
 }
 
 impl Shell {
@@ -60,6 +67,9 @@ impl Shell {
             should_return: false,
             dir_stack: Vec::new(),
             traps: HashMap::new(),
+            break_level: 0,
+            continue_level: 0,
+            loop_depth: 0,
         }
     }
 }

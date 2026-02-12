@@ -11,6 +11,7 @@
 //! - 非インタラクティブモード（`rush -c 'cmd'`、`rush script.sh`）
 //! - プロンプトカスタマイズ（`$PROMPT` 環境変数: `\u`/`\h`/`\w`/`\W`/`\$`/`\?`）
 //! - `if`/`then`/`elif`/`else`/`fi` 複合コマンド（ネスト対応、ワンライナー・複数行両対応）
+//! - `for`/`while`/`until`/`do`/`done` ループ（`break`/`continue` 対応、ネスト対応）
 //!
 //! ## モジュール構成
 //!
@@ -21,8 +22,8 @@
 //! | [`complete`] | Tab 補完（コマンド名、ファイル名、`&&`/`||`/`;` 後のコマンド位置認識） |
 //! | [`highlight`] | シンタックスハイライト（ANSI カラー、PATH キャッシュ、`$(cmd)`/`2>&1` 対応） |
 //! | [`parser`] | 構文解析（パイプライン、リダイレクト、クォート、変数展開、パラメータ展開、算術展開、継続行検出） |
-//! | [`executor`] | コマンド実行（条件付き実行、展開パイプライン、`if`/`elif`/`else`/`fi` 複合コマンド） |
-//! | [`builtins`] | ビルトイン（`cd`, `echo`, `export`, `alias`, `source`, `read`, `exec`, `wait` 等 27 種） |
+//! | [`executor`] | コマンド実行（条件付き実行、展開パイプライン、`if`/`elif`/`else`/`fi`、`for`/`while`/`until` ループ） |
+//! | [`builtins`] | ビルトイン（`cd`, `echo`, `export`, `alias`, `source`, `read`, `exec`, `wait` 等 29 種） |
 //! | [`glob`] | パス名展開（`*`, `?` によるファイル名マッチング、パラメータ展開のパターン共有） |
 //! | [`job`] | ジョブコントロール（バックグラウンド実行、Ctrl+Z サスペンド、`fg`/`bg` 復帰） |
 //! | [`shell`] | シェルのグローバル状態（終了ステータス、ジョブテーブル、エイリアスマップ） |
@@ -333,8 +334,8 @@ fn expand_alias(line: &str, aliases: &HashMap<String, String>) -> String {
 
 /// 文字列を 1 行ずつパースして実行する。
 ///
-/// `if` で始まる行を検出すると、対応する `fi` まで行を収集して
-/// [`executor::execute_if_block`] で複合コマンドとして実行する。
+/// `if` で始まる行は `fi` まで収集して [`executor::execute_if_block`] で実行。
+/// `for`/`while`/`until` で始まる行は `done` まで収集してループとして実行。
 /// ヒアドキュメントの本文収集にも対応。
 fn run_string(shell: &mut Shell, input: &str) {
     let lines: Vec<&str> = input.lines().collect();
@@ -349,10 +350,27 @@ fn run_string(shell: &mut Shell, input: &str) {
 
         // if ブロックの検出: `if` で始まる行を見つけたら `fi` まで収集
         if executor::starts_with_if(&expanded) {
-            // i-1 は現在行、lines の i-1 から収集を開始
-            // ただし expanded はエイリアス展開後なので元の lines を使う
             let (block, next_i) = executor::collect_if_block(&lines, i - 1);
             shell.last_status = executor::execute_if_block(shell, &block);
+            i = next_i;
+            if shell.should_exit {
+                break;
+            }
+            continue;
+        }
+
+        // for/while/until ブロックの検出
+        if executor::starts_with_for(&expanded)
+            || executor::starts_with_while(&expanded)
+            || executor::starts_with_until(&expanded)
+        {
+            let (block, next_i) = executor::collect_loop_block(&lines, i - 1);
+            if executor::starts_with_for(&expanded) {
+                shell.last_status = executor::execute_for_block(shell, &block);
+            } else {
+                shell.last_status = executor::execute_while_block(
+                    shell, &block, executor::starts_with_until(&expanded));
+            }
             i = next_i;
             if shell.should_exit {
                 break;
@@ -505,7 +523,6 @@ fn main() {
                     // if 複合コマンド: `if` で始まる入力を検出したら、
                     // `> ` プロンプトで `fi` まで対話的に行を収集し、
                     // ブロック全体を execute_if_block() で実行する。
-                    // ネストした if/fi も深さカウントで正しく追跡する。
                     if executor::starts_with_if(accumulated.trim()) {
                         let mut block = accumulated.clone();
                         let mut depth = 0i32;
@@ -537,6 +554,52 @@ fn main() {
                         }
                         if depth == 0 {
                             shell.last_status = executor::execute_if_block(&mut shell, &block);
+                        }
+                        break;
+                    }
+
+                    // for/while/until ループ: `> ` プロンプトで `done` まで収集
+                    if executor::starts_with_for(accumulated.trim())
+                        || executor::starts_with_while(accumulated.trim())
+                        || executor::starts_with_until(accumulated.trim())
+                    {
+                        let is_until = executor::starts_with_until(accumulated.trim());
+                        let is_for = executor::starts_with_for(accumulated.trim());
+                        let mut block = accumulated.clone();
+                        let mut depth = 0i32;
+                        for token in executor::shell_tokens_pub(block.trim()) {
+                            match token {
+                                "for" | "while" | "until" => depth += 1,
+                                "done" => depth -= 1,
+                                _ => {}
+                            }
+                        }
+                        while depth > 0 {
+                            match editor.read_line("> ") {
+                                Some(next) => {
+                                    block.push('\n');
+                                    block.push_str(&next);
+                                    for token in executor::shell_tokens_pub(next.trim()) {
+                                        match token {
+                                            "for" | "while" | "until" => depth += 1,
+                                            "done" => depth -= 1,
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                                None => {
+                                    println!();
+                                    break;
+                                }
+                            }
+                        }
+                        if depth == 0 {
+                            if is_for {
+                                shell.last_status = executor::execute_for_block(&mut shell, &block);
+                            } else {
+                                shell.last_status = executor::execute_while_block(
+                                    &mut shell, &block, is_until);
+                            }
                         }
                         break;
                     }

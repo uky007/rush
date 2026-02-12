@@ -1,6 +1,7 @@
 //! コマンド実行: コマンドリスト条件付き実行、ビルトイン判定、リダイレクト適用、
 //! パイプライン接続、展開パイプライン（コマンド置換 → チルダ → ブレース → glob）、ジョブ制御、
-//! `if`/`then`/`elif`/`else`/`fi` 複合コマンド。
+//! `if`/`then`/`elif`/`else`/`fi` 複合コマンド、
+//! `for`/`while`/`until`/`do`/`done` ループ。
 //!
 //! ## パイプライン実行
 //!
@@ -28,6 +29,23 @@
 //! if command; then body; else body; fi
 //! if command; then body; elif command; then body; else body; fi
 //! # ネスト・複数行にも対応
+//! ```
+//!
+//! ## ループ (`for`/`while`/`until`/`do`/`done`)
+//!
+//! if と同じテキストベースアプローチで実装。
+//!
+//! - [`execute_for_block`]: `for VAR in WORDS; do BODY; done` を実行
+//! - [`execute_while_block`]: `while COND; do BODY; done` / `until COND; do BODY; done` を実行
+//! - [`collect_loop_block`]: 行配列から `for`/`while`/`until`〜`done` の範囲を収集
+//! - [`starts_with_for`], [`starts_with_while`], [`starts_with_until`]: キーワード判定
+//!
+//! 対応構文:
+//! ```sh
+//! for var in a b c; do echo $var; done
+//! while command; do body; done
+//! until command; do body; done
+//! # ネスト・break・continue 対応
 //! ```
 
 use std::fs::{File, OpenOptions};
@@ -829,6 +847,266 @@ pub fn execute_if_block(shell: &mut Shell, block: &str) -> i32 {
     0
 }
 
+// ── for/while/until ループ ─────────────────────────────────────────
+
+/// `for VAR in WORDS...; do BODY; done` ブロックを解釈・実行する。
+///
+/// 処理フロー:
+/// 1. `for VAR [in WORDS...]` と `do ... done` の間を分割
+/// 2. `in` がなければ `"$@"` 相当（現在は空リスト）
+/// 3. WORDS を展開し、各要素で VAR に代入して BODY を実行
+/// 4. `break`/`continue` を適切にハンドリング
+pub fn execute_for_block(shell: &mut Shell, block: &str) -> i32 {
+    let tokens = tokenize_block(block);
+
+    // for VAR in words... ; do body ; done を解析
+    let mut var_name = String::new();
+    let mut word_tokens: Vec<String> = Vec::new();
+    let mut body_tokens: Vec<String> = Vec::new();
+    let mut depth = 0i32;
+
+    #[derive(PartialEq)]
+    enum State { BeforeFor, InHeader, InBody }
+    let mut state = State::BeforeFor;
+
+    for token in &tokens {
+        let trimmed = token.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let kw = extract_keyword(trimmed);
+
+        match state {
+            State::BeforeFor => {
+                if let Some("for") = kw {
+                    state = State::InHeader;
+                    let after = trimmed.strip_prefix("for").unwrap().trim();
+                    if !after.is_empty() {
+                        // "for VAR in a b c" or "for VAR"
+                        let parts: Vec<&str> = after.splitn(2, char::is_whitespace).collect();
+                        var_name = parts[0].to_string();
+                        if parts.len() > 1 {
+                            let rest = parts[1].trim();
+                            if let Some(after_in) = rest.strip_prefix("in") {
+                                let words_str = after_in.trim();
+                                if !words_str.is_empty() {
+                                    for w in words_str.split_whitespace() {
+                                        word_tokens.push(w.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            State::InHeader => {
+                if let Some("do") = kw {
+                    state = State::InBody;
+                    let after_do = trimmed.strip_prefix("do").unwrap().trim();
+                    if !after_do.is_empty() {
+                        body_tokens.push(after_do.to_string());
+                    }
+                } else {
+                    // 変数名 or in words
+                    if var_name.is_empty() {
+                        let parts: Vec<&str> = trimmed.splitn(2, char::is_whitespace).collect();
+                        var_name = parts[0].to_string();
+                        if parts.len() > 1 {
+                            let rest = parts[1].trim();
+                            if let Some(after_in) = rest.strip_prefix("in") {
+                                for w in after_in.trim().split_whitespace() {
+                                    word_tokens.push(w.to_string());
+                                }
+                            }
+                        }
+                    } else if let Some(after_in) = trimmed.strip_prefix("in") {
+                        for w in after_in.trim().split_whitespace() {
+                            word_tokens.push(w.to_string());
+                        }
+                    } else {
+                        for w in trimmed.split_whitespace() {
+                            word_tokens.push(w.to_string());
+                        }
+                    }
+                }
+            }
+            State::InBody => {
+                match kw {
+                    Some("for") | Some("while") | Some("until") => {
+                        depth += 1;
+                        body_tokens.push(trimmed.to_string());
+                    }
+                    Some("done") if depth > 0 => {
+                        depth -= 1;
+                        body_tokens.push(trimmed.to_string());
+                    }
+                    Some("done") => {
+                        break;
+                    }
+                    _ => {
+                        body_tokens.push(trimmed.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    if var_name.is_empty() {
+        eprintln!("rush: syntax error: missing variable name in `for`");
+        return 2;
+    }
+
+    let body = body_tokens.join("\n");
+
+    // word_tokens を展開（コマンド置換、チルダ、ブレース、glob）
+    let expanded_words: Vec<String> = if word_tokens.is_empty() {
+        Vec::new()
+    } else {
+        let cow_words: Vec<std::borrow::Cow<'_, str>> = word_tokens.iter()
+            .map(|s| std::borrow::Cow::Owned(s.clone()))
+            .collect();
+        expand_args_full(&cow_words, shell)
+    };
+
+    let mut last_status = 0;
+    shell.loop_depth += 1;
+
+    for word in &expanded_words {
+        std::env::set_var(&var_name, word);
+        last_status = run_command_string(shell, &body);
+        shell.last_status = last_status;
+
+        // break チェック
+        if shell.break_level > 0 {
+            shell.break_level -= 1;
+            break;
+        }
+        // continue チェック
+        if shell.continue_level > 0 {
+            shell.continue_level -= 1;
+            if shell.continue_level > 0 {
+                // 外側ループの continue
+                break;
+            }
+            continue;
+        }
+        if shell.should_return || shell.should_exit {
+            break;
+        }
+    }
+
+    shell.loop_depth -= 1;
+    last_status
+}
+
+/// `while COND; do BODY; done` / `until COND; do BODY; done` ブロックを解釈・実行する。
+///
+/// `is_until=true` のとき until ループ（条件が偽の間ループ継続）。
+/// `is_until=false` のとき while ループ（条件が真の間ループ継続）。
+pub fn execute_while_block(shell: &mut Shell, block: &str, is_until: bool) -> i32 {
+    let tokens = tokenize_block(block);
+
+    // while/until COND; do BODY; done を解析
+    let mut cond_tokens: Vec<String> = Vec::new();
+    let mut body_tokens: Vec<String> = Vec::new();
+    let mut depth = 0i32;
+
+    #[derive(PartialEq)]
+    enum State { BeforeKw, InCond, InBody }
+    let mut state = State::BeforeKw;
+
+    for token in &tokens {
+        let trimmed = token.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let kw = extract_keyword(trimmed);
+
+        match state {
+            State::BeforeKw => {
+                if let Some("while") | Some("until") = kw {
+                    state = State::InCond;
+                    let prefix = if trimmed.starts_with("while") { "while" } else { "until" };
+                    let after = trimmed.strip_prefix(prefix).unwrap().trim();
+                    if !after.is_empty() {
+                        cond_tokens.push(after.to_string());
+                    }
+                }
+            }
+            State::InCond => {
+                if let Some("do") = kw {
+                    state = State::InBody;
+                    let after_do = trimmed.strip_prefix("do").unwrap().trim();
+                    if !after_do.is_empty() {
+                        body_tokens.push(after_do.to_string());
+                    }
+                } else {
+                    cond_tokens.push(trimmed.to_string());
+                }
+            }
+            State::InBody => {
+                match kw {
+                    Some("for") | Some("while") | Some("until") => {
+                        depth += 1;
+                        body_tokens.push(trimmed.to_string());
+                    }
+                    Some("done") if depth > 0 => {
+                        depth -= 1;
+                        body_tokens.push(trimmed.to_string());
+                    }
+                    Some("done") => {
+                        break;
+                    }
+                    _ => {
+                        body_tokens.push(trimmed.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    let cond = cond_tokens.join("\n");
+    let body = body_tokens.join("\n");
+
+    if cond.is_empty() {
+        eprintln!("rush: syntax error: missing condition in `{}`",
+            if is_until { "until" } else { "while" });
+        return 2;
+    }
+
+    let mut last_status = 0;
+    shell.loop_depth += 1;
+
+    loop {
+        let cond_status = run_command_string(shell, &cond);
+        let should_run = if is_until { cond_status != 0 } else { cond_status == 0 };
+        if !should_run {
+            break;
+        }
+
+        last_status = run_command_string(shell, &body);
+        shell.last_status = last_status;
+
+        if shell.break_level > 0 {
+            shell.break_level -= 1;
+            break;
+        }
+        if shell.continue_level > 0 {
+            shell.continue_level -= 1;
+            if shell.continue_level > 0 {
+                break;
+            }
+            continue;
+        }
+        if shell.should_return || shell.should_exit {
+            break;
+        }
+    }
+
+    shell.loop_depth -= 1;
+    last_status
+}
+
 /// if ブロックの各セクションを保持する構造体。
 ///
 /// [`parse_if_sections`] が if ブロックテキストを解析した結果を格納する。
@@ -1088,7 +1366,7 @@ fn tokenize_block(block: &str) -> Vec<String> {
 /// 続く場合にキーワードとして認識する。`ifdef` や `finally` のような
 /// キーワードを含む非キーワードは認識しない。
 fn extract_keyword(token: &str) -> Option<&'static str> {
-    for kw in &["if", "then", "elif", "else", "fi"] {
+    for kw in &["if", "then", "elif", "else", "fi", "for", "while", "until", "do", "done", "in"] {
         if token == *kw {
             return Some(kw);
         }
@@ -1126,6 +1404,29 @@ fn run_command_string(shell: &mut Shell, input: &str) -> i32 {
             last_status = execute_if_block(shell, &block);
             shell.last_status = last_status;
             i = next_i;
+            if shell.should_return || shell.should_exit
+                || shell.break_level > 0 || shell.continue_level > 0
+            {
+                return last_status;
+            }
+            continue;
+        }
+
+        // ネストした for/while/until ブロックを検出
+        if starts_with_for(trimmed) || starts_with_while(trimmed) || starts_with_until(trimmed) {
+            let (block, next_i) = collect_loop_block(&lines, i);
+            if starts_with_for(trimmed) {
+                last_status = execute_for_block(shell, &block);
+            } else {
+                last_status = execute_while_block(shell, &block, starts_with_until(trimmed));
+            }
+            shell.last_status = last_status;
+            i = next_i;
+            if shell.should_return || shell.should_exit
+                || shell.break_level > 0 || shell.continue_level > 0
+            {
+                return last_status;
+            }
             continue;
         }
 
@@ -1141,7 +1442,9 @@ fn run_command_string(shell: &mut Shell, input: &str) -> i32 {
                 return 2;
             }
         }
-        if shell.should_return || shell.should_exit {
+        if shell.should_return || shell.should_exit
+            || shell.break_level > 0 || shell.continue_level > 0
+        {
             return last_status;
         }
 
@@ -1190,6 +1493,64 @@ pub fn collect_if_block(lines: &[&str], start: usize) -> (String, usize) {
                         return (block, i + 1);
                     }
                 }
+                _ => {}
+            }
+        }
+
+        i += 1;
+    }
+
+    (block, i)
+}
+
+/// 行が `for` キーワードで始まるかどうかを判定する。
+pub fn starts_with_for(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed == "for" || trimmed.starts_with("for ") || trimmed.starts_with("for\t")
+}
+
+/// 行が `while` キーワードで始まるかどうかを判定する。
+pub fn starts_with_while(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed == "while" || trimmed.starts_with("while ") || trimmed.starts_with("while\t")
+}
+
+/// 行が `until` キーワードで始まるかどうかを判定する。
+pub fn starts_with_until(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed == "until" || trimmed.starts_with("until ") || trimmed.starts_with("until\t")
+}
+
+/// 行配列から for/while/until ブロック全体（`for`/`while`/`until`〜`done`）を収集する。
+///
+/// `lines[start]` は最初のキーワードを含む行。
+/// ネストした for/while/until/done と if/fi を深さカウントで追跡し、
+/// 対応する `done` が見つかるまで行を `\n` で連結する。
+///
+/// 戻り値: `(収集したブロック文字列, 次に処理すべき行インデックス)`。
+pub fn collect_loop_block(lines: &[&str], start: usize) -> (String, usize) {
+    let mut depth = 0i32;
+    let mut block = String::new();
+    let mut i = start;
+
+    while i < lines.len() {
+        let line = lines[i];
+        if !block.is_empty() {
+            block.push('\n');
+        }
+        block.push_str(line);
+
+        for token in shell_tokens(line.trim()) {
+            match token {
+                "for" | "while" | "until" => depth += 1,
+                "done" => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return (block, i + 1);
+                    }
+                }
+                // if/fi もカウントしないとネストした if がずれる可能性があるが、
+                // if/fi は do/done のカウントに影響しないため不要
                 _ => {}
             }
         }
@@ -1517,5 +1878,119 @@ mod tests {
         assert_eq!(extract_keyword("echo"), None);
         assert_eq!(extract_keyword("ifdef"), None);
         assert_eq!(extract_keyword("finally"), None);
+        assert_eq!(extract_keyword("for"), Some("for"));
+        assert_eq!(extract_keyword("for x"), Some("for"));
+        assert_eq!(extract_keyword("while"), Some("while"));
+        assert_eq!(extract_keyword("until"), Some("until"));
+        assert_eq!(extract_keyword("do"), Some("do"));
+        assert_eq!(extract_keyword("done"), Some("done"));
+        assert_eq!(extract_keyword("in"), Some("in"));
+        assert_eq!(extract_keyword("foreach"), None);
+        assert_eq!(extract_keyword("donut"), None);
+    }
+
+    // ── for/while/until ループテスト ──────────────────────────────────
+
+    #[test]
+    fn starts_with_for_basic() {
+        assert!(starts_with_for("for x in a b c; do echo $x; done"));
+        assert!(starts_with_for("  for i in 1 2 3"));
+        assert!(!starts_with_for("echo for"));
+        assert!(!starts_with_for("foreach"));
+        assert!(!starts_with_for("fortune"));
+    }
+
+    #[test]
+    fn starts_with_while_basic() {
+        assert!(starts_with_while("while true; do echo hi; done"));
+        assert!(starts_with_while("  while [ 1 ]"));
+        assert!(!starts_with_while("echo while"));
+        assert!(!starts_with_while("whileloop"));
+    }
+
+    #[test]
+    fn starts_with_until_basic() {
+        assert!(starts_with_until("until false; do echo hi; done"));
+        assert!(!starts_with_until("echo until"));
+        assert!(!starts_with_until("untilnow"));
+    }
+
+    #[test]
+    fn collect_loop_block_oneliner() {
+        let lines = vec!["for x in a b; do echo $x; done"];
+        let (block, next) = collect_loop_block(&lines, 0);
+        assert_eq!(block, "for x in a b; do echo $x; done");
+        assert_eq!(next, 1);
+    }
+
+    #[test]
+    fn collect_loop_block_multiline() {
+        let lines = vec!["for x in a b", "do", "echo $x", "done", "echo after"];
+        let (block, next) = collect_loop_block(&lines, 0);
+        assert_eq!(block, "for x in a b\ndo\necho $x\ndone");
+        assert_eq!(next, 4);
+    }
+
+    #[test]
+    fn collect_loop_block_nested() {
+        let lines = vec![
+            "for i in a b; do",
+            "  for j in 1 2; do",
+            "    echo $i$j",
+            "  done",
+            "done",
+            "echo after",
+        ];
+        let (block, next) = collect_loop_block(&lines, 0);
+        assert!(block.contains("done\ndone"));
+        assert_eq!(next, 5);
+    }
+
+    #[test]
+    fn execute_for_block_basic() {
+        let mut shell = Shell::new();
+        let status = execute_for_block(&mut shell, "for x in a b c; do true; done");
+        assert_eq!(status, 0);
+        // x should be set to the last value
+        assert_eq!(std::env::var("x").unwrap_or_default(), "c");
+    }
+
+    #[test]
+    fn execute_for_block_empty_list() {
+        let mut shell = Shell::new();
+        let status = execute_for_block(&mut shell, "for x in; do echo $x; done");
+        assert_eq!(status, 0); // no iterations
+    }
+
+    #[test]
+    fn execute_while_block_basic() {
+        let mut shell = Shell::new();
+        std::env::set_var("RUSH_WHILE_TEST", "3");
+        let block = "while [ $RUSH_WHILE_TEST -gt 0 ]; do\nexport RUSH_WHILE_TEST=$(( RUSH_WHILE_TEST - 1 ))\ndone";
+        let status = execute_while_block(&mut shell, block, false);
+        assert_eq!(status, 0);
+        assert_eq!(std::env::var("RUSH_WHILE_TEST").unwrap(), "0");
+        std::env::remove_var("RUSH_WHILE_TEST");
+    }
+
+    #[test]
+    fn execute_until_block_basic() {
+        let mut shell = Shell::new();
+        std::env::set_var("RUSH_UNTIL_TEST", "0");
+        let block = "until [ $RUSH_UNTIL_TEST -eq 3 ]; do\nexport RUSH_UNTIL_TEST=$(( RUSH_UNTIL_TEST + 1 ))\ndone";
+        let status = execute_while_block(&mut shell, block, true);
+        assert_eq!(status, 0);
+        assert_eq!(std::env::var("RUSH_UNTIL_TEST").unwrap(), "3");
+        std::env::remove_var("RUSH_UNTIL_TEST");
+    }
+
+    #[test]
+    fn execute_for_block_with_break() {
+        let mut shell = Shell::new();
+        // break after first iteration
+        let block = "for x in a b c; do\nbreak\ndone";
+        let status = execute_for_block(&mut shell, block);
+        assert_eq!(status, 0);
+        assert_eq!(std::env::var("x").unwrap_or_default(), "a");
     }
 }

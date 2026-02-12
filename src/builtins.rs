@@ -4,17 +4,17 @@
 //! `try_exec()` が `Some(status)` を返せばビルトインとして処理済み、
 //! `None` なら外部コマンドとしてexecutorに委ねる。
 //!
-//! ## 対応ビルトイン（27 種）
+//! ## 対応ビルトイン（29 種）
 //!
 //! - シェル制御: `exit`, `cd`（`cd -` / OLDPWD 対応）, `exec`
 //! - 出力: `pwd`, `echo`（`-n` 対応）
 //! - 環境変数: `export`, `unset`, `read`（`-p` プロンプト、IFS 分割、`REPLY`）
 //! - ジョブコントロール: `jobs`, `fg`, `bg`, `wait`
 //! - エイリアス: `alias`, `unalias`（`-a` 全削除）
-//! - スクリプト: `source` / `.`（ファイル行単位実行、`if`/`fi` 複合コマンド対応）
+//! - スクリプト: `source` / `.`（ファイル行単位実行、`if`/`fi`・`for`/`while`/`until` 対応）
 //! - 情報: `type`
 //! - 実行制御: `command`（`-v` パス表示、エイリアスバイパス）, `builtin`（ビルトイン限定実行）
-//! - フロー制御: `true` / `:`（常に 0）, `false`（常に 1）, `return`（source からの早期脱出）
+//! - フロー制御: `true` / `:`（常に 0）, `false`（常に 1）, `return`（source からの早期脱出）, `break`（ループ脱出）, `continue`（ループ次反復）
 //! - 条件判定: `test` / `[`（文字列・整数・ファイル判定、`!` 否定）
 //! - 出力: `printf`（`%s`, `%d`, `%x`, `%o`, 幅指定、ゼロパディング、エスケープ）
 //! - ディレクトリスタック: `pushd`（スタックに積んで移動）, `popd`（ポップして移動）, `dirs`（一覧）
@@ -43,7 +43,8 @@ pub fn is_builtin(name: &str) -> bool {
                  | "true" | "false" | ":" | "return"
                  | "test" | "[" | "printf"
                  | "pushd" | "popd" | "dirs"
-                 | "trap")
+                 | "trap"
+                 | "break" | "continue")
 }
 
 /// ビルトインコマンドの実行を試みる。
@@ -77,6 +78,8 @@ pub fn try_exec(shell: &mut Shell, args: &[&str], stdout: &mut dyn Write) -> Opt
         "true" | ":" => Some(0),
         "false" => Some(1),
         "return" => Some(builtin_return(shell, args)),
+        "break" => Some(builtin_break(shell, args)),
+        "continue" => Some(builtin_continue(shell, args)),
         "test" | "[" => Some(builtin_test(args)),
         "printf" => Some(builtin_printf(args, stdout)),
         "pushd" => Some(builtin_pushd(shell, args, stdout)),
@@ -655,10 +658,62 @@ fn builtin_return(shell: &mut Shell, args: &[&str]) -> i32 {
     code
 }
 
+// ── break / continue ─────────────────────────────────────────────────
+
+/// `break [N]` — ループを N レベル抜ける。省略時は 1。ループ外で呼ぶとエラー。
+fn builtin_break(shell: &mut Shell, args: &[&str]) -> i32 {
+    if shell.loop_depth == 0 {
+        eprintln!("rush: break: only meaningful in a `for', `while', or `until' loop");
+        return 1;
+    }
+    let n = if args.len() > 1 {
+        match args[1].parse::<usize>() {
+            Ok(0) => {
+                eprintln!("rush: break: loop count must be > 0");
+                return 1;
+            }
+            Ok(n) => n,
+            Err(_) => {
+                eprintln!("rush: break: {}: numeric argument required", args[1]);
+                return 1;
+            }
+        }
+    } else {
+        1
+    };
+    shell.break_level = n;
+    0
+}
+
+/// `continue [N]` — ループの次の反復に進む。N で外側のループを指定可能。省略時は 1。
+fn builtin_continue(shell: &mut Shell, args: &[&str]) -> i32 {
+    if shell.loop_depth == 0 {
+        eprintln!("rush: continue: only meaningful in a `for', `while', or `until' loop");
+        return 1;
+    }
+    let n = if args.len() > 1 {
+        match args[1].parse::<usize>() {
+            Ok(0) => {
+                eprintln!("rush: continue: loop count must be > 0");
+                return 1;
+            }
+            Ok(n) => n,
+            Err(_) => {
+                eprintln!("rush: continue: {}: numeric argument required", args[1]);
+                return 1;
+            }
+        }
+    } else {
+        1
+    };
+    shell.continue_level = n;
+    0
+}
+
 // ── source / . ──────────────────────────────────────────────────────
 
 /// `source file` / `. file` — ファイルを現在のシェルコンテキストで行単位実行する。
-/// `return` による早期脱出をサポート。if/then/elif/else/fi ブロックに対応。
+/// `return` による早期脱出をサポート。if/fi ブロック、for/while/until ループに対応。
 fn builtin_source(shell: &mut Shell, args: &[&str]) -> i32 {
     if args.len() < 2 {
         eprintln!("rush: {}: filename argument required", args[0]);
@@ -686,6 +741,26 @@ fn builtin_source(shell: &mut Shell, args: &[&str]) -> i32 {
         if executor::starts_with_if(trimmed) {
             let (block, next_i) = executor::collect_if_block(&lines, i);
             shell.last_status = executor::execute_if_block(shell, &block);
+            i = next_i;
+            if shell.should_return {
+                shell.should_return = false;
+                break;
+            }
+            continue;
+        }
+
+        // for/while/until ブロック検出
+        if executor::starts_with_for(trimmed)
+            || executor::starts_with_while(trimmed)
+            || executor::starts_with_until(trimmed)
+        {
+            let (block, next_i) = executor::collect_loop_block(&lines, i);
+            if executor::starts_with_for(trimmed) {
+                shell.last_status = executor::execute_for_block(shell, &block);
+            } else {
+                shell.last_status = executor::execute_while_block(
+                    shell, &block, executor::starts_with_until(trimmed));
+            }
             i = next_i;
             if shell.should_return {
                 shell.should_return = false;
