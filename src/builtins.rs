@@ -4,7 +4,7 @@
 //! `try_exec()` が `Some(status)` を返せばビルトインとして処理済み、
 //! `None` なら外部コマンドとしてexecutorに委ねる。
 //!
-//! ## 対応ビルトイン（22 種）
+//! ## 対応ビルトイン（23 種）
 //!
 //! - シェル制御: `exit`, `cd`（`cd -` / OLDPWD 対応）, `exec`
 //! - 出力: `pwd`, `echo`（`-n` 対応）
@@ -16,6 +16,7 @@
 //! - 実行制御: `command`（`-v` パス表示、エイリアスバイパス）, `builtin`（ビルトイン限定実行）
 //! - フロー制御: `true` / `:`（常に 0）, `false`（常に 1）, `return`（source からの早期脱出）
 //! - 条件判定: `test` / `[`（文字列・整数・ファイル判定、`!` 否定）
+//! - 出力: `printf`（`%s`, `%d`, `%x`, `%o`, 幅指定、ゼロパディング、エスケープ）
 //! - 履歴: `history`（main.rs で特別扱い、`-c` クリア、`N` 件表示）
 
 use std::env;
@@ -38,7 +39,7 @@ pub fn is_builtin(name: &str) -> bool {
                  | "alias" | "unalias" | "history"
                  | "command" | "builtin" | "read" | "exec" | "wait"
                  | "true" | "false" | ":" | "return"
-                 | "test" | "[")
+                 | "test" | "[" | "printf")
 }
 
 /// ビルトインコマンドの実行を試みる。
@@ -73,6 +74,7 @@ pub fn try_exec(shell: &mut Shell, args: &[&str], stdout: &mut dyn Write) -> Opt
         "false" => Some(1),
         "return" => Some(builtin_return(shell, args)),
         "test" | "[" => Some(builtin_test(args)),
+        "printf" => Some(builtin_printf(args, stdout)),
         _ => None,
     }
 }
@@ -685,6 +687,153 @@ fn builtin_source(shell: &mut Shell, args: &[&str]) -> i32 {
     shell.last_status
 }
 
+// ── printf ──────────────────────────────────────────────────────────
+
+/// `printf format [args...]` — フォーマット文字列に従って出力する。
+///
+/// 対応フォーマット指定子: `%s`（文字列）, `%d`（整数）, `%x`（16進数）, `%o`（8進数）
+/// エスケープ: `\n`, `\t`, `\\`, `\0NNN`（8進数）
+fn builtin_printf(args: &[&str], stdout: &mut dyn Write) -> i32 {
+    if args.len() < 2 {
+        eprintln!("rush: printf: usage: printf format [arguments]");
+        return 1;
+    }
+    let format = args[1];
+    let arguments = &args[2..];
+    let mut arg_idx = 0;
+
+    let bytes = format.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            // エスケープシーケンス
+            match bytes[i + 1] {
+                b'n' => { let _ = write!(stdout, "\n"); i += 2; }
+                b't' => { let _ = write!(stdout, "\t"); i += 2; }
+                b'r' => { let _ = write!(stdout, "\r"); i += 2; }
+                b'\\' => { let _ = write!(stdout, "\\"); i += 2; }
+                b'0' => {
+                    // \0NNN — 8進数文字
+                    let mut val: u8 = 0;
+                    let mut j = i + 2;
+                    let end = (j + 3).min(bytes.len());
+                    while j < end && bytes[j] >= b'0' && bytes[j] <= b'7' {
+                        val = val * 8 + (bytes[j] - b'0');
+                        j += 1;
+                    }
+                    let _ = stdout.write_all(&[val]);
+                    i = j;
+                }
+                _ => {
+                    let _ = write!(stdout, "\\");
+                    i += 1;
+                }
+            }
+        } else if bytes[i] == b'%' && i + 1 < bytes.len() {
+            // フォーマット指定子
+            i += 1;
+            // 幅とフラグを解析
+            let mut width: Option<usize> = None;
+            let mut zero_pad = false;
+            let mut left_align = false;
+
+            if i < bytes.len() && bytes[i] == b'-' {
+                left_align = true;
+                i += 1;
+            }
+            if i < bytes.len() && bytes[i] == b'0' {
+                zero_pad = true;
+                i += 1;
+            }
+            let width_start = i;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i > width_start {
+                width = std::str::from_utf8(&bytes[width_start..i]).ok()
+                    .and_then(|s| s.parse().ok());
+            }
+
+            if i >= bytes.len() { break; }
+
+            let arg_val = if arg_idx < arguments.len() {
+                arguments[arg_idx]
+            } else {
+                ""
+            };
+
+            match bytes[i] {
+                b's' => {
+                    if let Some(w) = width {
+                        if left_align {
+                            let _ = write!(stdout, "{:<width$}", arg_val, width = w);
+                        } else {
+                            let _ = write!(stdout, "{:>width$}", arg_val, width = w);
+                        }
+                    } else {
+                        let _ = write!(stdout, "{}", arg_val);
+                    }
+                    arg_idx += 1;
+                }
+                b'd' => {
+                    let n: i64 = arg_val.parse().unwrap_or(0);
+                    if let Some(w) = width {
+                        if zero_pad {
+                            let _ = write!(stdout, "{:0>width$}", n, width = w);
+                        } else if left_align {
+                            let _ = write!(stdout, "{:<width$}", n, width = w);
+                        } else {
+                            let _ = write!(stdout, "{:>width$}", n, width = w);
+                        }
+                    } else {
+                        let _ = write!(stdout, "{}", n);
+                    }
+                    arg_idx += 1;
+                }
+                b'x' => {
+                    let n: u64 = arg_val.parse().unwrap_or(0);
+                    if let Some(w) = width {
+                        if zero_pad {
+                            let _ = write!(stdout, "{:0>width$x}", n, width = w);
+                        } else {
+                            let _ = write!(stdout, "{:width$x}", n, width = w);
+                        }
+                    } else {
+                        let _ = write!(stdout, "{:x}", n);
+                    }
+                    arg_idx += 1;
+                }
+                b'o' => {
+                    let n: u64 = arg_val.parse().unwrap_or(0);
+                    if let Some(w) = width {
+                        if zero_pad {
+                            let _ = write!(stdout, "{:0>width$o}", n, width = w);
+                        } else {
+                            let _ = write!(stdout, "{:width$o}", n, width = w);
+                        }
+                    } else {
+                        let _ = write!(stdout, "{:o}", n);
+                    }
+                    arg_idx += 1;
+                }
+                b'%' => {
+                    let _ = write!(stdout, "%");
+                }
+                _ => {
+                    let _ = write!(stdout, "%");
+                    let _ = stdout.write_all(&[bytes[i]]);
+                }
+            }
+            i += 1;
+        } else {
+            let _ = stdout.write_all(&[bytes[i]]);
+            i += 1;
+        }
+    }
+
+    0
+}
+
 // ── test / [ ────────────────────────────────────────────────────────
 
 /// `test expr` / `[ expr ]` — 条件式を評価する。
@@ -1056,5 +1205,54 @@ mod tests {
     #[test]
     fn test_bracket_missing_close() {
         assert_eq!(builtin_test(&["[", "hello"]), 2);
+    }
+
+    #[test]
+    fn printf_basic_string() {
+        let mut buf = Vec::new();
+        builtin_printf(&["printf", "%s", "hello"], &mut buf);
+        assert_eq!(String::from_utf8(buf).unwrap(), "hello");
+    }
+
+    #[test]
+    fn printf_newline_escape() {
+        let mut buf = Vec::new();
+        builtin_printf(&["printf", "%s\\n", "hello"], &mut buf);
+        assert_eq!(String::from_utf8(buf).unwrap(), "hello\n");
+    }
+
+    #[test]
+    fn printf_integer() {
+        let mut buf = Vec::new();
+        builtin_printf(&["printf", "%d", "42"], &mut buf);
+        assert_eq!(String::from_utf8(buf).unwrap(), "42");
+    }
+
+    #[test]
+    fn printf_hex() {
+        let mut buf = Vec::new();
+        builtin_printf(&["printf", "%x", "255"], &mut buf);
+        assert_eq!(String::from_utf8(buf).unwrap(), "ff");
+    }
+
+    #[test]
+    fn printf_zero_padded() {
+        let mut buf = Vec::new();
+        builtin_printf(&["printf", "%03d", "5"], &mut buf);
+        assert_eq!(String::from_utf8(buf).unwrap(), "005");
+    }
+
+    #[test]
+    fn printf_multiple_args() {
+        let mut buf = Vec::new();
+        builtin_printf(&["printf", "Name: %s, Age: %d\\n", "Alice", "30"], &mut buf);
+        assert_eq!(String::from_utf8(buf).unwrap(), "Name: Alice, Age: 30\n");
+    }
+
+    #[test]
+    fn printf_percent_literal() {
+        let mut buf = Vec::new();
+        builtin_printf(&["printf", "100%%"], &mut buf);
+        assert_eq!(String::from_utf8(buf).unwrap(), "100%");
     }
 }
