@@ -8,7 +8,7 @@
 //! - パイプライン: `cmd1 | cmd2 | cmd3`
 //! - リダイレクト: `>`, `>>`, `<`, `2>`, `2>>`
 //! - クォート: シングル (`'...'`) / ダブル (`"..."`)
-//! - 変数展開: `$VAR`, `${VAR}`, `$?`, `$$`, `$!`, `$0`（ダブルクォート内・裸ワードで展開、シングルクォートではリテラル）
+//! - 変数展開: `$VAR`, `${VAR}`, `$?`, `$$`, `$!`, `$0`, `$RANDOM`, `$SECONDS`（ダブルクォート内・裸ワードで展開、シングルクォートではリテラル）
 //! - パラメータ展開: `${var:-default}`, `${var:=val}`, `${var:+alt}`, `${var:?msg}`,
 //!   `${#var}`, `${var%pat}`, `${var%%pat}`, `${var#pat}`, `${var##pat}`,
 //!   `${var/pat/repl}`, `${var//pat/repl}`
@@ -331,7 +331,9 @@ fn expand_variables(s: &str, last_status: i32) -> Cow<'_, str> {
                     pos += 1;
                 }
                 let var_name = &s[var_start..pos];
-                if let Ok(val) = std::env::var(var_name) {
+                if let Some(val) = resolve_special_var(var_name) {
+                    result.push_str(&val);
+                } else if let Ok(val) = std::env::var(var_name) {
                     result.push_str(&val);
                 }
                 // 未定義 → 空文字（何も追加しない）
@@ -352,6 +354,31 @@ fn expand_variables(s: &str, last_status: i32) -> Cow<'_, str> {
 }
 
 /// 変数名の先頭文字として有効か（ASCII英字 or `_`）
+/// シェル起動時刻（`$SECONDS` 用）。プロセス起動からの秒数を返す。
+static SHELL_START: std::sync::LazyLock<std::time::Instant> =
+    std::sync::LazyLock::new(std::time::Instant::now);
+
+/// 動的特殊変数を解決する。該当しなければ `None`。
+fn resolve_special_var(name: &str) -> Option<String> {
+    match name {
+        "RANDOM" => {
+            // 簡易乱数: PID ^ 時刻ベース
+            let t = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0);
+            let pid = unsafe { libc::getpid() } as u64;
+            let val = ((t ^ (pid.wrapping_mul(2654435761))) % 32768) as u16;
+            Some(val.to_string())
+        }
+        "SECONDS" => {
+            let elapsed = SHELL_START.elapsed().as_secs();
+            Some(elapsed.to_string())
+        }
+        _ => None,
+    }
+}
+
 fn is_var_start(b: u8) -> bool {
     b.is_ascii_alphabetic() || b == b'_'
 }
@@ -365,10 +392,15 @@ fn is_var_char(b: u8) -> bool {
 /// 対応: `${var:-default}`, `${var:=default}`, `${var:+alt}`, `${var:?msg}`,
 ///       `${#var}`, `${var%pat}`, `${var%%pat}`, `${var#pat}`, `${var##pat}`,
 ///       `${var/pat/repl}`, `${var//pat/repl}`
+/// 変数名から値を取得する。動的特殊変数を優先し、なければ環境変数を参照。
+fn get_var(name: &str) -> String {
+    resolve_special_var(name).unwrap_or_else(|| std::env::var(name).unwrap_or_default())
+}
+
 fn expand_braced_param(inner: &str, last_status: i32) -> String {
     // ${#var} — 文字数
     if let Some(var_name) = inner.strip_prefix('#') {
-        let val = std::env::var(var_name).unwrap_or_default();
+        let val = get_var(var_name);
         return val.chars().count().to_string();
     }
 
@@ -381,11 +413,11 @@ fn expand_braced_param(inner: &str, last_status: i32) -> String {
 
     // 変数名の後に演算子がなければ通常の ${VAR}
     if name_end == bytes.len() {
-        return std::env::var(inner).unwrap_or_default();
+        return get_var(inner);
     }
 
     let var_name = &inner[..name_end];
-    let val = std::env::var(var_name).unwrap_or_default();
+    let val = get_var(var_name);
     let op_and_rest = &inner[name_end..];
 
     // ${var:-default}, ${var:=default}, ${var:+alt}, ${var:?msg}
@@ -851,7 +883,9 @@ impl<'a> Tokenizer<'a> {
                     self.pos += 1;
                 }
                 let var_name = &self.input[var_start..self.pos];
-                if let Ok(val) = std::env::var(var_name) {
+                if let Some(val) = resolve_special_var(var_name) {
+                    buf.push_str(&val);
+                } else if let Ok(val) = std::env::var(var_name) {
                     buf.push_str(&val);
                 }
             }
@@ -1652,6 +1686,43 @@ mod tests {
     fn expand_dollar_zero() {
         let list = parse("echo $0", 0).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "rush");
+    }
+
+    #[test]
+    fn expand_random() {
+        let list = parse("echo $RANDOM", 0).unwrap().unwrap();
+        let val: u64 = list.items[0].pipeline.commands[0].args[1]
+            .parse()
+            .expect("$RANDOM should be a number");
+        assert!(val < 32768, "$RANDOM should be 0..32767, got {}", val);
+    }
+
+    #[test]
+    fn expand_seconds() {
+        let list = parse("echo $SECONDS", 0).unwrap().unwrap();
+        let val: u64 = list.items[0].pipeline.commands[0].args[1]
+            .parse()
+            .expect("$SECONDS should be a number");
+        // テスト実行中なので 0 以上であること
+        assert!(val < 1_000_000, "$SECONDS should be reasonable, got {}", val);
+    }
+
+    #[test]
+    fn expand_random_in_braces() {
+        let list = parse("echo ${RANDOM}", 0).unwrap().unwrap();
+        let val: u64 = list.items[0].pipeline.commands[0].args[1]
+            .parse()
+            .expect("${RANDOM} should be a number");
+        assert!(val < 32768);
+    }
+
+    #[test]
+    fn expand_seconds_in_braces() {
+        let list = parse("echo ${SECONDS}", 0).unwrap().unwrap();
+        let val: u64 = list.items[0].pipeline.commands[0].args[1]
+            .parse()
+            .expect("${SECONDS} should be a number");
+        assert!(val < 1_000_000);
     }
 
     #[test]
