@@ -18,6 +18,7 @@ use std::path::Path;
 
 use crate::job::{self, JobStatus};
 use crate::shell::Shell;
+use crate::{executor, parser};
 
 /// コマンド名がビルトインかどうかを判定する。
 ///
@@ -27,7 +28,7 @@ use crate::shell::Shell;
 /// - [`complete`](crate::complete): ビルトイン名のリストを補完候補に使用（`BUILTINS` 定数と同期）
 pub fn is_builtin(name: &str) -> bool {
     matches!(name, "exit" | "cd" | "pwd" | "echo" | "export" | "unset"
-                 | "jobs" | "fg" | "bg" | "type")
+                 | "jobs" | "fg" | "bg" | "type" | "source" | ".")
 }
 
 /// ビルトインコマンドの実行を試みる。
@@ -50,6 +51,7 @@ pub fn try_exec(shell: &mut Shell, args: &[&str], stdout: &mut dyn Write) -> Opt
         "fg" => Some(builtin_fg(shell, args)),
         "bg" => Some(builtin_bg(shell, args)),
         "type" => Some(builtin_type(args, stdout)),
+        "source" | "." => Some(builtin_source(shell, args)),
         _ => None,
     }
 }
@@ -357,6 +359,39 @@ fn builtin_bg(shell: &mut Shell, args: &[&str]) -> i32 {
 
     eprintln!("[{}]+ {} &", job_id, command);
     0
+}
+
+// ── source / . ──────────────────────────────────────────────────────
+
+/// `source file` / `. file` — ファイルを現在のシェルコンテキストで行単位実行する。
+fn builtin_source(shell: &mut Shell, args: &[&str]) -> i32 {
+    if args.len() < 2 {
+        eprintln!("rush: {}: filename argument required", args[0]);
+        return 2;
+    }
+    let path = args[1];
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("rush: {}: {}: {}", args[0], path, e);
+            return 1;
+        }
+    };
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        match parser::parse(trimmed, shell.last_status) {
+            Ok(Some(list)) => {
+                let cmd_text = trimmed.to_string();
+                shell.last_status = executor::execute(shell, &list, &cmd_text);
+            }
+            Ok(None) => {}
+            Err(e) => eprintln!("rush: {}: {}", path, e),
+        }
+    }
+    shell.last_status
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
