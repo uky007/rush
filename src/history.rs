@@ -133,6 +133,20 @@ impl History {
         self.nav_index = 0;
     }
 
+    /// `from` 位置から逆方向に `query` を含むエントリを検索する。
+    pub fn search_back(&self, from: usize, query: &str) -> Option<(usize, &str)> {
+        if query.is_empty() {
+            return None;
+        }
+        let start = from.min(self.entries.len());
+        for i in (0..start).rev() {
+            if self.entries[i].contains(query) {
+                return Some((i, &self.entries[i]));
+            }
+        }
+        None
+    }
+
     /// ↓: 一つ次のエントリを返す。末尾到達時は saved_buf を復元。
     pub fn next(&mut self) -> Option<&str> {
         if self.nav_index < self.entries.len() {
@@ -207,6 +221,29 @@ mod tests {
 
         h.next();
         assert!(h.at_end());
+    }
+
+    #[test]
+    fn search_back_finds_match() {
+        let h = make_history(&["echo hello", "ls -la", "echo world"]);
+        let result = h.search_back(3, "echo");
+        assert_eq!(result, Some((2, "echo world")));
+        let result = h.search_back(2, "echo");
+        assert_eq!(result, Some((0, "echo hello")));
+    }
+
+    #[test]
+    fn search_back_no_match() {
+        let h = make_history(&["echo hello", "ls -la"]);
+        let result = h.search_back(2, "grep");
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn search_back_empty_query() {
+        let h = make_history(&["echo hello"]);
+        let result = h.search_back(1, "");
+        assert_eq!(result, None);
     }
 
     #[test]

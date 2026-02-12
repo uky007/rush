@@ -135,6 +135,8 @@ pub enum Key {
     CtrlL,
     /// Ctrl+U（`0x15`）— 行頭からカーソルまで削除。
     CtrlU,
+    /// Ctrl+R（`0x12`）— 逆方向インクリメンタル検索。
+    CtrlR,
     /// Ctrl+W（`0x17`）— 直前の単語を削除。
     CtrlW,
     /// 未対応のバイト列。無視される。
@@ -252,6 +254,7 @@ fn read_key(fd: i32) -> Key {
         5 => Key::CtrlE,
         11 => Key::CtrlK,
         12 => Key::CtrlL,
+        18 => Key::CtrlR,
         21 => Key::CtrlU,
         23 => Key::CtrlW,
         b if b >= 32 && b < 127 => Key::Char(b as char),
@@ -360,6 +363,10 @@ impl LineEditor {
                 Key::Down => self.history_next(),
                 Key::Tab => {
                     self.do_complete(prompt);
+                    continue;
+                }
+                Key::CtrlR => {
+                    self.reverse_search(prompt);
                     continue;
                 }
                 Key::CtrlK => self.kill_to_end(),
@@ -494,6 +501,101 @@ impl LineEditor {
         if let Some(entry) = self.history.next().map(|s| s.to_string()) {
             self.buf = entry;
             self.cursor = self.buf.len();
+        }
+    }
+
+    // ── Ctrl+R 逆方向検索 ─────────────────────────────────────────
+
+    /// Ctrl+R: 逆方向インクリメンタル検索。
+    /// `(reverse-i-search)'query': matched_line` 表示。
+    /// Enter で確定、Ctrl+C で取消、Ctrl+R で次のマッチ。
+    fn reverse_search(&mut self, prompt: &str) {
+        let mut query = String::new();
+        let mut search_pos = self.history.entries().len();
+        let mut matched_line: Option<String> = None;
+
+        loop {
+            // 検索プロンプトを表示
+            let display = match &matched_line {
+                Some(line) => format!(
+                    "\r\x1b[K(reverse-i-search)'{}': {}",
+                    query, line
+                ),
+                None => format!(
+                    "\r\x1b[K(reverse-i-search)'{}': ",
+                    query
+                ),
+            };
+            write_all(&display);
+
+            let key = read_key(self.fd);
+            match key {
+                Key::Enter => {
+                    // 確定: マッチした行をバッファにセット
+                    if let Some(line) = matched_line {
+                        self.buf = line;
+                        self.cursor = self.buf.len();
+                    }
+                    write_all("\n");
+                    // 通常プロンプトに戻す
+                    self.refresh_line(prompt);
+                    // read_line の呼び出し元に返すため、Enter を再発火
+                    // → バッファにセットしてプロンプト再描画して続行
+                    return;
+                }
+                Key::CtrlC => {
+                    // 取消: バッファを変更せずに戻る
+                    self.refresh_line(prompt);
+                    return;
+                }
+                Key::CtrlR => {
+                    // 次のマッチを検索
+                    if let Some((idx, line)) = self.history.search_back(search_pos, &query) {
+                        search_pos = idx;
+                        matched_line = Some(line.to_string());
+                    }
+                }
+                Key::Backspace => {
+                    if !query.is_empty() {
+                        query.pop();
+                        search_pos = self.history.entries().len();
+                        if query.is_empty() {
+                            matched_line = None;
+                        } else if let Some((idx, line)) =
+                            self.history.search_back(search_pos, &query)
+                        {
+                            search_pos = idx;
+                            matched_line = Some(line.to_string());
+                        } else {
+                            matched_line = None;
+                        }
+                    }
+                }
+                Key::Char(ch) => {
+                    query.push(ch);
+                    // 現在のマッチ位置から前を検索
+                    let pos = if matched_line.is_some() {
+                        search_pos + 1
+                    } else {
+                        self.history.entries().len()
+                    };
+                    if let Some((idx, line)) = self.history.search_back(pos, &query) {
+                        search_pos = idx;
+                        matched_line = Some(line.to_string());
+                    } else {
+                        matched_line = None;
+                    }
+                }
+                _ => {
+                    // その他のキーで検索終了、マッチした行をバッファにセット
+                    if let Some(line) = matched_line {
+                        self.buf = line;
+                        self.cursor = self.buf.len();
+                    }
+                    self.refresh_line(prompt);
+                    return;
+                }
+            }
         }
     }
 
