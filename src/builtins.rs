@@ -14,6 +14,7 @@
 //! - スクリプト: `source` / `.`（ファイル行単位実行）
 //! - 情報: `type`
 //! - 実行制御: `command`（`-v` パス表示、エイリアスバイパス）, `builtin`（ビルトイン限定実行）
+//! - フロー制御: `true` / `:`（常に 0）, `false`（常に 1）, `return`（source からの早期脱出）
 //! - 履歴: `history`（main.rs で特別扱い、`-c` クリア、`N` 件表示）
 
 use std::env;
@@ -34,7 +35,8 @@ pub fn is_builtin(name: &str) -> bool {
     matches!(name, "exit" | "cd" | "pwd" | "echo" | "export" | "unset"
                  | "jobs" | "fg" | "bg" | "type" | "source" | "."
                  | "alias" | "unalias" | "history"
-                 | "command" | "builtin" | "read" | "exec" | "wait")
+                 | "command" | "builtin" | "read" | "exec" | "wait"
+                 | "true" | "false" | ":" | "return")
 }
 
 /// ビルトインコマンドの実行を試みる。
@@ -65,6 +67,9 @@ pub fn try_exec(shell: &mut Shell, args: &[&str], stdout: &mut dyn Write) -> Opt
         "read" => Some(builtin_read(args)),
         "exec" => Some(builtin_exec(args)),
         "wait" => Some(builtin_wait(shell, args)),
+        "true" | ":" => Some(0),
+        "false" => Some(1),
+        "return" => Some(builtin_return(shell, args)),
         _ => None,
     }
 }
@@ -616,9 +621,31 @@ fn builtin_unalias(shell: &mut Shell, args: &[&str]) -> i32 {
     0
 }
 
+// ── return ──────────────────────────────────────────────────────────
+
+/// `return [N]` — `source` で実行中のスクリプトから早期脱出する。
+/// `source` の外で呼ばれた場合はエラー。
+fn builtin_return(shell: &mut Shell, args: &[&str]) -> i32 {
+    if shell.source_depth == 0 {
+        eprintln!("rush: return: can only `return' from a function or sourced script");
+        return 1;
+    }
+    let code = if args.len() > 1 {
+        args[1].parse::<i32>().unwrap_or_else(|_| {
+            eprintln!("rush: return: {}: numeric argument required", args[1]);
+            2
+        })
+    } else {
+        shell.last_status
+    };
+    shell.should_return = true;
+    code
+}
+
 // ── source / . ──────────────────────────────────────────────────────
 
 /// `source file` / `. file` — ファイルを現在のシェルコンテキストで行単位実行する。
+/// `return` による早期脱出をサポート。
 fn builtin_source(shell: &mut Shell, args: &[&str]) -> i32 {
     if args.len() < 2 {
         eprintln!("rush: {}: filename argument required", args[0]);
@@ -632,6 +659,7 @@ fn builtin_source(shell: &mut Shell, args: &[&str]) -> i32 {
             return 1;
         }
     };
+    shell.source_depth += 1;
     for line in content.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -645,7 +673,12 @@ fn builtin_source(shell: &mut Shell, args: &[&str]) -> i32 {
             Ok(None) => {}
             Err(e) => eprintln!("rush: {}: {}", path, e),
         }
+        if shell.should_return {
+            shell.should_return = false;
+            break;
+        }
     }
+    shell.source_depth -= 1;
     shell.last_status
 }
 
@@ -830,5 +863,38 @@ mod tests {
         let oldpwd = env::var("OLDPWD").unwrap();
         assert_eq!(oldpwd, orig.to_string_lossy());
         let _ = env::set_current_dir(&orig);
+    }
+
+    #[test]
+    fn true_returns_zero() {
+        let mut shell = Shell::new();
+        let mut buf = Vec::new();
+        assert_eq!(try_exec(&mut shell, &["true"], &mut buf), Some(0));
+        assert_eq!(try_exec(&mut shell, &[":"], &mut buf), Some(0));
+    }
+
+    #[test]
+    fn false_returns_one() {
+        let mut shell = Shell::new();
+        let mut buf = Vec::new();
+        assert_eq!(try_exec(&mut shell, &["false"], &mut buf), Some(1));
+    }
+
+    #[test]
+    fn return_outside_source_errors() {
+        let mut shell = Shell::new();
+        let mut buf = Vec::new();
+        let status = try_exec(&mut shell, &["return"], &mut buf).unwrap();
+        assert_eq!(status, 1); // error: not in source
+    }
+
+    #[test]
+    fn return_inside_source_sets_flag() {
+        let mut shell = Shell::new();
+        let mut buf = Vec::new();
+        shell.source_depth = 1; // simulate being inside source
+        let status = try_exec(&mut shell, &["return", "42"], &mut buf).unwrap();
+        assert_eq!(status, 42);
+        assert!(shell.should_return);
     }
 }

@@ -32,6 +32,10 @@ pub struct Shell {
     pub path_cache: PathCache,
     /// エイリアスマップ。`alias name=value` で定義される。
     pub aliases: HashMap<String, String>,
+    /// `source` 実行中のネスト深さ。`return` ビルトインの有効性判定に使用。
+    pub source_depth: usize,
+    /// `return` が呼ばれたら true にセットし、`source` のループを中断する。
+    pub should_return: bool,
 }
 
 impl Shell {
@@ -45,6 +49,8 @@ impl Shell {
             terminal_fd: libc::STDIN_FILENO,
             path_cache: PathCache::new(),
             aliases: HashMap::new(),
+            source_depth: 0,
+            should_return: false,
         }
     }
 }
