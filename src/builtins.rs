@@ -4,20 +4,21 @@
 //! `try_exec()` が `Some(status)` を返せばビルトインとして処理済み、
 //! `None` なら外部コマンドとしてexecutorに委ねる。
 //!
-//! ## 対応ビルトイン（29 種）
+//! ## 対応ビルトイン（31 種）
 //!
 //! - シェル制御: `exit`, `cd`（`cd -` / OLDPWD 対応）, `exec`
 //! - 出力: `pwd`, `echo`（`-n` 対応）
 //! - 環境変数: `export`, `unset`, `read`（`-p` プロンプト、IFS 分割、`REPLY`）
 //! - ジョブコントロール: `jobs`, `fg`, `bg`, `wait`
 //! - エイリアス: `alias`, `unalias`（`-a` 全削除）
-//! - スクリプト: `source` / `.`（ファイル行単位実行、`if`/`fi`・`for`/`while`/`until`・`case`/`esac` 対応）
+//! - スクリプト: `source` / `.`（ファイル行単位実行、`if`/`fi`・`for`/`while`/`until`・`case`/`esac`・関数定義対応）
 //! - 情報: `type`
 //! - 実行制御: `command`（`-v` パス表示、エイリアスバイパス）, `builtin`（ビルトイン限定実行）
 //! - フロー制御: `true` / `:`（常に 0）, `false`（常に 1）, `return`（source からの早期脱出）, `break`（ループ脱出）, `continue`（ループ次反復）
 //! - 条件判定: `test` / `[`（文字列・整数・ファイル判定、`!` 否定）
 //! - 出力: `printf`（`%s`, `%d`, `%x`, `%o`, 幅指定、ゼロパディング、エスケープ）
 //! - ディレクトリスタック: `pushd`（スタックに積んで移動）, `popd`（ポップして移動）, `dirs`（一覧）
+//! - 関数: `local`（ローカル変数設定）, `shift`（位置パラメータシフト）, `unset -f`（関数削除）
 //! - シグナル: `trap`（`trap 'cmd' SIGNAL`、一覧、`-` でリセット）
 //! - 履歴: `history`（main.rs で特別扱い、`-c` クリア、`N` 件表示）
 
@@ -44,7 +45,8 @@ pub fn is_builtin(name: &str) -> bool {
                  | "test" | "[" | "printf"
                  | "pushd" | "popd" | "dirs"
                  | "trap"
-                 | "break" | "continue")
+                 | "break" | "continue"
+                 | "local" | "shift")
 }
 
 /// ビルトインコマンドの実行を試みる。
@@ -62,11 +64,11 @@ pub fn try_exec(shell: &mut Shell, args: &[&str], stdout: &mut dyn Write) -> Opt
         "pwd" => Some(builtin_pwd(stdout)),
         "echo" => Some(builtin_echo(args, stdout)),
         "export" => Some(builtin_export(args, stdout)),
-        "unset" => Some(builtin_unset(args)),
+        "unset" => Some(builtin_unset(shell, args)),
         "jobs" => Some(builtin_jobs(shell, stdout)),
         "fg" => Some(builtin_fg(shell, args)),
         "bg" => Some(builtin_bg(shell, args)),
-        "type" => Some(builtin_type(args, stdout)),
+        "type" => Some(builtin_type(shell, args, stdout)),
         "source" | "." => Some(builtin_source(shell, args)),
         "alias" => Some(builtin_alias(shell, args, stdout)),
         "unalias" => Some(builtin_unalias(shell, args)),
@@ -86,6 +88,8 @@ pub fn try_exec(shell: &mut Shell, args: &[&str], stdout: &mut dyn Write) -> Opt
         "popd" => Some(builtin_popd(shell, args, stdout)),
         "dirs" => Some(builtin_dirs(shell, stdout)),
         "trap" => Some(builtin_trap(shell, args, stdout)),
+        "local" => Some(builtin_local(args)),
+        "shift" => Some(builtin_shift(shell, args)),
         _ => None,
     }
 }
@@ -207,9 +211,16 @@ fn builtin_export(args: &[&str], stdout: &mut dyn Write) -> i32 {
 }
 
 /// `unset VAR...` — 環境変数を削除する。
-fn builtin_unset(args: &[&str]) -> i32 {
-    for arg in &args[1..] {
-        env::remove_var(arg);
+fn builtin_unset(shell: &mut Shell, args: &[&str]) -> i32 {
+    if args.len() > 1 && args[1] == "-f" {
+        // unset -f: 関数の削除
+        for arg in &args[2..] {
+            shell.functions.remove(*arg);
+        }
+    } else {
+        for arg in &args[1..] {
+            env::remove_var(arg);
+        }
     }
     0
 }
@@ -217,14 +228,16 @@ fn builtin_unset(args: &[&str]) -> i32 {
 // ── type ビルトイン ──────────────────────────────────────────────────
 
 /// `type name [name ...]` — コマンドの所在を表示する。ビルトインか外部コマンドかを判定。
-fn builtin_type(args: &[&str], stdout: &mut dyn Write) -> i32 {
+fn builtin_type(shell: &Shell, args: &[&str], stdout: &mut dyn Write) -> i32 {
     if args.len() <= 1 {
         let _ = writeln!(stdout, "type: usage: type name [name ...]");
         return 1;
     }
     let mut status = 0;
     for &name in &args[1..] {
-        if is_builtin(name) {
+        if shell.functions.contains_key(name) {
+            let _ = writeln!(stdout, "{} is a function", name);
+        } else if is_builtin(name) {
             let _ = writeln!(stdout, "{} is a shell builtin", name);
         } else if let Some(path) = find_in_path(name) {
             let _ = writeln!(stdout, "{} is {}", name, path);
@@ -781,6 +794,14 @@ fn builtin_source(shell: &mut Shell, args: &[&str]) -> i32 {
             continue;
         }
 
+        // 関数定義検出
+        if let Some((name, rest)) = executor::parse_function_def(trimmed) {
+            let (body, next_i) = executor::collect_function_body(&lines, i, &rest);
+            shell.functions.insert(name, body);
+            i = next_i;
+            continue;
+        }
+
         match parser::parse(trimmed, shell.last_status) {
             Ok(Some(list)) => {
                 let cmd_text = trimmed.to_string();
@@ -1198,6 +1219,69 @@ fn eval_binary(left: &str, op: &str, right: &str) -> bool {
     }
 }
 
+// ── local ビルトイン ──────────────────────────────────────────────────
+
+/// `local VAR=value ...` — 変数をローカルスコープに設定する。
+///
+/// bash 互換: 関数内でのみ意味を持つが、rush では簡易実装として
+/// `export` と同様に環境変数として設定する。関数から return した後に
+/// 呼び出し側で変数が見えなくなるような厳密なスコープは未実装。
+fn builtin_local(args: &[&str]) -> i32 {
+    for arg in &args[1..] {
+        if let Some(eq) = arg.find('=') {
+            let (name, val) = arg.split_at(eq);
+            let val = &val[1..]; // '=' をスキップ
+            env::set_var(name, val);
+        } else {
+            // 値なし: 変数が未定義なら空文字で初期化
+            if env::var(*arg).is_err() {
+                env::set_var(*arg, "");
+            }
+        }
+    }
+    0
+}
+
+// ── shift ビルトイン ──────────────────────────────────────────────────
+
+/// `shift [N]` — 位置パラメータを N 個左にシフトする（デフォルト N=1）。
+///
+/// `$2` → `$1`, `$3` → `$2`, ... となり、`$#` が N 減少する。
+fn builtin_shift(shell: &mut Shell, args: &[&str]) -> i32 {
+    let n: usize = if args.len() > 1 {
+        match args[1].parse() {
+            Ok(v) => v,
+            Err(_) => {
+                eprintln!("rush: shift: {}: numeric argument required", args[1]);
+                return 1;
+            }
+        }
+    } else {
+        1
+    };
+
+    if n > shell.positional_args.len() {
+        eprintln!("rush: shift: shift count out of range");
+        return 1;
+    }
+
+    // シェル内部状態をシフト
+    shell.positional_args = shell.positional_args[n..].to_vec();
+
+    // 環境変数を更新
+    let new_count = shell.positional_args.len();
+    std::env::set_var("_RUSH_POS_COUNT", new_count.to_string());
+    for (i, val) in shell.positional_args.iter().enumerate() {
+        std::env::set_var(format!("_RUSH_POS_{}", i + 1), val);
+    }
+    // 古い余分な env vars を削除
+    for i in (new_count + 1)..=(new_count + n) {
+        std::env::remove_var(format!("_RUSH_POS_{}", i));
+    }
+
+    0
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1275,8 +1359,9 @@ mod tests {
 
     #[test]
     fn unset_removes_var() {
+        let mut shell = Shell::new();
         env::set_var("RUSH_TEST_UNSET", "value");
-        builtin_unset(&["unset", "RUSH_TEST_UNSET"]);
+        builtin_unset(&mut shell, &["unset", "RUSH_TEST_UNSET"]);
         assert!(env::var("RUSH_TEST_UNSET").is_err());
     }
 

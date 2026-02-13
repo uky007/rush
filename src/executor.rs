@@ -1,7 +1,7 @@
 //! コマンド実行: コマンドリスト条件付き実行、ビルトイン判定、リダイレクト適用、
 //! パイプライン接続、展開パイプライン（コマンド置換 → チルダ → ブレース → glob）、ジョブ制御、
 //! `if`/`then`/`elif`/`else`/`fi` 複合コマンド、
-//! `for`/`while`/`until`/`do`/`done` ループ。
+//! `for`/`while`/`until`/`do`/`done` ループ、関数定義・実行。
 //!
 //! ## パイプライン実行
 //!
@@ -61,6 +61,21 @@
 //!   pattern2|pattern3) body2 ;;
 //!   *) default_body ;;
 //! esac
+//! ```
+//!
+//! ## 関数定義・実行 (`name() { ... }`)
+//!
+//! - [`parse_function_def`]: 行が関数定義 (`name() {`) かを判定
+//! - [`collect_function_body`]: `{`〜`}` の関数本体を収集
+//! - [`execute_function`]: 位置パラメータ設定 → 本体実行 → 復元
+//!
+//! 対応構文:
+//! ```sh
+//! name() { body; }         # ワンライナー
+//! name() {                 # 複数行
+//!   body
+//! }
+//! name arg1 arg2           # 呼び出し（$1, $2 で参照）
 //! ```
 
 use std::fs::{File, OpenOptions};
@@ -389,6 +404,27 @@ fn execute_pipeline(shell: &mut Shell, pipeline: &Pipeline<'_>, cmd_text: &str) 
         if !has_fd_dup {
             let expanded = expand_args_full(&cmd.args, shell);
             let args: Vec<&str> = expanded.iter().map(|s| s.as_str()).collect();
+            // ユーザー定義関数の呼び出しチェック（ビルトインより優先）
+            if !args.is_empty() {
+                if let Some(body) = shell.functions.get(args[0]).cloned() {
+                    // 代入を一時的にシェル環境に設定し、実行後に復元
+                    let saved: Vec<(String, Option<String>)> = cmd.assignments.iter()
+                        .map(|(k, v)| {
+                            let old = std::env::var(k).ok();
+                            std::env::set_var(k, v);
+                            (k.clone(), old)
+                        })
+                        .collect();
+                    let status = execute_function(shell, &body, &args[1..]);
+                    for (k, old) in saved {
+                        match old {
+                            Some(v) => std::env::set_var(&k, &v),
+                            None => std::env::remove_var(&k),
+                        }
+                    }
+                    return status;
+                }
+            }
             if !args.is_empty() && builtins::is_builtin(args[0]) {
                 // ビルトイン: 代入を一時的にシェル環境に設定し、実行後に復元
                 let saved: Vec<(String, Option<String>)> = cmd.assignments.iter()
@@ -1324,6 +1360,155 @@ fn case_pattern_match(word: &str, pattern: &str) -> bool {
     glob::matches_pattern(pattern, word)
 }
 
+// ── 関数定義・実行 ──────────────────────────────────────────────────
+
+/// 行が関数定義 (`name() {` または `name () {`) かどうかを判定する。
+///
+/// 関数定義と認識されたら `Some((name, body_start))` を返す。
+/// `body_start` は `{` の後の残りテキスト（あれば）。
+pub fn parse_function_def(line: &str) -> Option<(String, String)> {
+    let trimmed = line.trim();
+
+    // パターン: name() { body } または name () { body }
+    // `()` を探す
+    let paren_pos = trimmed.find("()")?;
+    let name = trimmed[..paren_pos].trim();
+
+    // 名前が有効な識別子かチェック
+    if name.is_empty() || name.contains(' ') || name.contains('\t') {
+        return None;
+    }
+    let name_bytes = name.as_bytes();
+    if !(name_bytes[0].is_ascii_alphabetic() || name_bytes[0] == b'_') {
+        return None;
+    }
+    if !name_bytes.iter().all(|&b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
+        return None;
+    }
+    // キーワードは関数名として使えない
+    if matches!(name, "if" | "then" | "elif" | "else" | "fi" | "for" | "while"
+        | "until" | "do" | "done" | "case" | "esac" | "in") {
+        return None;
+    }
+
+    let after_paren = trimmed[paren_pos + 2..].trim();
+
+    // `{` で始まるはず
+    if let Some(rest) = after_paren.strip_prefix('{') {
+        Some((name.to_string(), rest.trim().to_string()))
+    } else {
+        None
+    }
+}
+
+/// 関数定義ブロック（`name() { ... }`）を行配列から収集する。
+///
+/// `{` の対応する `}` までを収集する。ネストした `{}` を深さカウントで追跡。
+pub fn collect_function_body(lines: &[&str], start: usize, initial_rest: &str) -> (String, usize) {
+    let mut depth = 1i32; // 既に `{` を通過している
+    let mut body = String::new();
+
+    // 最初の行の `{` の後の残りをチェック
+    if !initial_rest.is_empty() {
+        // `}` で終わるワンライナーチェック
+        let rest_trimmed = initial_rest.trim();
+        if let Some(inner) = rest_trimmed.strip_suffix('}') {
+            // ワンライナー: name() { body }
+            return (inner.trim().trim_end_matches(';').trim().to_string(), start + 1);
+        }
+        body.push_str(initial_rest);
+    }
+
+    let mut i = start + 1;
+    while i < lines.len() {
+        let line = lines[i];
+        let trimmed = line.trim();
+
+        // `{` と `}` のカウント（クォート内は除外すべきだが簡易版）
+        for token in shell_tokens(trimmed) {
+            match token {
+                "{" => depth += 1,
+                "}" => {
+                    depth -= 1;
+                    if depth == 0 {
+                        // `}` の前のテキストがあれば追加
+                        let before_brace = trimmed.strip_suffix('}').unwrap_or("").trim();
+                        if !before_brace.is_empty() {
+                            if !body.is_empty() { body.push('\n'); }
+                            body.push_str(before_brace);
+                        }
+                        return (body.trim().to_string(), i + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if depth > 0 {
+            if !body.is_empty() { body.push('\n'); }
+            body.push_str(line);
+        }
+        i += 1;
+    }
+
+    (body.trim().to_string(), i)
+}
+
+/// ユーザー定義関数を実行する。
+///
+/// 位置パラメータ（`$1`〜`$N`, `$@`, `$*`, `$#`）を設定し、
+/// 関数本体を `run_command_string` で実行する。
+/// `return` による早期脱出をサポート。
+pub fn execute_function(shell: &mut Shell, body: &str, args: &[&str]) -> i32 {
+    // 位置パラメータを保存
+    let saved_positional = shell.positional_args.clone();
+    let saved_env: Vec<(String, Option<String>)> = {
+        let count = std::env::var("_RUSH_POS_COUNT").ok();
+        let mut saved = vec![("_RUSH_POS_COUNT".to_string(), count)];
+        let old_count: usize = saved[0].1.as_ref()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        for i in 1..=old_count.max(args.len()) {
+            let key = format!("_RUSH_POS_{}", i);
+            saved.push((key.clone(), std::env::var(&key).ok()));
+        }
+        saved
+    };
+
+    // 新しい位置パラメータを設定
+    shell.positional_args = args.iter().map(|s| s.to_string()).collect();
+    std::env::set_var("_RUSH_POS_COUNT", args.len().to_string());
+    for (i, arg) in args.iter().enumerate() {
+        std::env::set_var(format!("_RUSH_POS_{}", i + 1), arg);
+    }
+    // 余分な古い位置パラメータを削除
+    let old_count: usize = saved_env[0].1.as_ref()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    for i in (args.len() + 1)..=old_count {
+        std::env::remove_var(format!("_RUSH_POS_{}", i));
+    }
+
+    // source_depth を上げて return を有効にする
+    shell.source_depth += 1;
+    let status = run_command_string(shell, body);
+    shell.source_depth -= 1;
+
+    // should_return をリセット（関数内の return はここで消化される）
+    shell.should_return = false;
+
+    // 位置パラメータを復元
+    shell.positional_args = saved_positional;
+    for (key, val) in saved_env {
+        match val {
+            Some(v) => std::env::set_var(&key, &v),
+            None => std::env::remove_var(&key),
+        }
+    }
+
+    status
+}
+
 /// if ブロックの各セクションを保持する構造体。
 ///
 /// [`parse_if_sections`] が if ブロックテキストを解析した結果を格納する。
@@ -1668,6 +1853,14 @@ fn run_command_string(shell: &mut Shell, input: &str) -> i32 {
             {
                 return last_status;
             }
+            continue;
+        }
+
+        // 関数定義を検出
+        if let Some((name, rest)) = parse_function_def(trimmed) {
+            let (body, next_i) = collect_function_body(&lines, i, &rest);
+            shell.functions.insert(name, body);
+            i = next_i;
             continue;
         }
 
@@ -2353,5 +2546,110 @@ mod tests {
     fn split_case_segments_basic() {
         let segs = split_case_segments("a) echo hello ;; b) echo world ;;");
         assert_eq!(segs.len(), 3); // before first ;;, between, after last ;;
+    }
+
+    // ── 関数定義・実行テスト ──────────────────────────────────────────
+
+    #[test]
+    fn parse_function_def_basic() {
+        let result = parse_function_def("greet() { echo hello; }");
+        assert!(result.is_some());
+        let (name, rest) = result.unwrap();
+        assert_eq!(name, "greet");
+        assert!(rest.contains("echo hello"));
+    }
+
+    #[test]
+    fn parse_function_def_with_space() {
+        let result = parse_function_def("my_func () { echo test; }");
+        assert!(result.is_some());
+        let (name, _) = result.unwrap();
+        assert_eq!(name, "my_func");
+    }
+
+    #[test]
+    fn parse_function_def_not_keyword() {
+        // keywords can't be function names
+        assert!(parse_function_def("if() { echo test; }").is_none());
+        assert!(parse_function_def("for() { echo test; }").is_none());
+    }
+
+    #[test]
+    fn parse_function_def_not_func() {
+        assert!(parse_function_def("echo hello").is_none());
+        assert!(parse_function_def("ls -la").is_none());
+    }
+
+    #[test]
+    fn execute_function_basic() {
+        let mut shell = Shell::new();
+        shell.functions.insert("myfn".to_string(), "export RUSH_FN_TEST=hello".to_string());
+        let status = execute_function(&mut shell, "export RUSH_FN_TEST=hello", &[]);
+        assert_eq!(status, 0);
+        assert_eq!(std::env::var("RUSH_FN_TEST").unwrap(), "hello");
+        std::env::remove_var("RUSH_FN_TEST");
+    }
+
+    #[test]
+    fn execute_function_with_args() {
+        let mut shell = Shell::new();
+        let body = "export RUSH_FN_ARG=$1";
+        let status = execute_function(&mut shell, body, &["world"]);
+        assert_eq!(status, 0);
+        assert_eq!(std::env::var("RUSH_FN_ARG").unwrap(), "world");
+        std::env::remove_var("RUSH_FN_ARG");
+    }
+
+    #[test]
+    fn execute_function_return() {
+        let mut shell = Shell::new();
+        let body = "return 42";
+        let status = execute_function(&mut shell, body, &[]);
+        assert_eq!(status, 42);
+        assert!(!shell.should_return); // should_return is consumed
+    }
+
+    #[test]
+    fn execute_function_positional_restore() {
+        let mut shell = Shell::new();
+        // Set initial positional args
+        shell.positional_args = vec!["outer1".to_string()];
+        std::env::set_var("_RUSH_POS_COUNT", "1");
+        std::env::set_var("_RUSH_POS_1", "outer1");
+
+        let body = "export RUSH_FN_POS=$1";
+        execute_function(&mut shell, body, &["inner1"]);
+
+        // After function, positional args should be restored
+        assert_eq!(shell.positional_args, vec!["outer1".to_string()]);
+        assert_eq!(std::env::var("_RUSH_POS_1").unwrap(), "outer1");
+
+        std::env::remove_var("RUSH_FN_POS");
+        std::env::remove_var("_RUSH_POS_COUNT");
+        std::env::remove_var("_RUSH_POS_1");
+    }
+
+    #[test]
+    fn collect_function_body_oneliner() {
+        let lines = vec!["greet() { echo hello; }"];
+        let result = parse_function_def(lines[0]);
+        assert!(result.is_some());
+        let (name, rest) = result.unwrap();
+        let (body, next_i) = collect_function_body(&lines, 0, &rest);
+        assert_eq!(name, "greet");
+        assert_eq!(body, "echo hello");
+        assert_eq!(next_i, 1);
+    }
+
+    #[test]
+    fn collect_function_body_multiline() {
+        let lines = vec!["greet() {", "  echo hello", "  echo world", "}"];
+        let result = parse_function_def(lines[0]);
+        assert!(result.is_some());
+        let (_, rest) = result.unwrap();
+        let (body, next_i) = collect_function_body(&lines, 0, &rest);
+        assert!(body.contains("echo hello"));
+        assert!(body.contains("echo world"));
+        assert_eq!(next_i, 4);
     }
 }

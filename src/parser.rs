@@ -301,6 +301,57 @@ fn expand_variables(s: &str, last_status: i32) -> Cow<'_, str> {
                 result.push_str("rush");
                 pos += 1;
             }
+            b'1'..=b'9' => {
+                // 位置パラメータ $1〜$9
+                let n = (bytes[pos] - b'0') as usize;
+                pos += 1;
+                let count: usize = std::env::var("_RUSH_POS_COUNT")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                if n <= count {
+                    if let Ok(val) = std::env::var(format!("_RUSH_POS_{}", n)) {
+                        result.push_str(&val);
+                    }
+                }
+            }
+            b'@' => {
+                // $@ — 全位置パラメータ（個別の単語として展開）
+                let count: usize = std::env::var("_RUSH_POS_COUNT")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                for i in 1..=count {
+                    if i > 1 { result.push(' '); }
+                    if let Ok(val) = std::env::var(format!("_RUSH_POS_{}", i)) {
+                        result.push_str(&val);
+                    }
+                }
+                pos += 1;
+            }
+            b'*' => {
+                // $* — 全位置パラメータ（単一文字列として展開）
+                let count: usize = std::env::var("_RUSH_POS_COUNT")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                for i in 1..=count {
+                    if i > 1 { result.push(' '); }
+                    if let Ok(val) = std::env::var(format!("_RUSH_POS_{}", i)) {
+                        result.push_str(&val);
+                    }
+                }
+                pos += 1;
+            }
+            b'#' => {
+                // $# — 位置パラメータの個数
+                let count: usize = std::env::var("_RUSH_POS_COUNT")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+                result.push_str(&count.to_string());
+                pos += 1;
+            }
             b'{' => {
                 pos += 1; // skip '{'
                 let var_start = pos;
@@ -1863,10 +1914,10 @@ mod tests {
     }
 
     #[test]
-    fn dollar_before_non_ident() {
-        // $@ is not a special variable — treated as literal "$@"
+    fn dollar_at_expands_positional() {
+        // $@ expands to all positional parameters (empty when none set)
         let list = parse("echo $@", 0).unwrap().unwrap();
-        assert_eq!(list.items[0].pipeline.commands[0].args[1], "$@");
+        assert_eq!(list.items[0].pipeline.commands[0].args[1], "");
     }
 
     #[test]
@@ -2314,5 +2365,47 @@ mod tests {
         let cmd = &list.items[0].pipeline.commands[0];
         assert!(cmd.assignments.is_empty());
         assert_eq!(cmd.args[1], "FOO=bar");
+    }
+
+    // ── 位置パラメータ展開テスト ──
+
+    #[test]
+    fn dollar_1_no_positional() {
+        // $1 with no positional args → empty
+        let list = parse("echo $1", 0).unwrap().unwrap();
+        assert_eq!(list.items[0].pipeline.commands[0].args[1], "");
+    }
+
+    #[test]
+    fn dollar_1_with_positional() {
+        std::env::set_var("_RUSH_POS_COUNT", "2");
+        std::env::set_var("_RUSH_POS_1", "hello");
+        std::env::set_var("_RUSH_POS_2", "world");
+        let list = parse("echo $1 $2", 0).unwrap().unwrap();
+        assert_eq!(list.items[0].pipeline.commands[0].args[1], "hello");
+        assert_eq!(list.items[0].pipeline.commands[0].args[2], "world");
+        std::env::remove_var("_RUSH_POS_COUNT");
+        std::env::remove_var("_RUSH_POS_1");
+        std::env::remove_var("_RUSH_POS_2");
+    }
+
+    #[test]
+    fn dollar_hash_count() {
+        std::env::set_var("_RUSH_POS_COUNT", "3");
+        let list = parse("echo $#", 0).unwrap().unwrap();
+        assert_eq!(list.items[0].pipeline.commands[0].args[1], "3");
+        std::env::remove_var("_RUSH_POS_COUNT");
+    }
+
+    #[test]
+    fn dollar_star_all_args() {
+        std::env::set_var("_RUSH_POS_COUNT", "2");
+        std::env::set_var("_RUSH_POS_1", "a");
+        std::env::set_var("_RUSH_POS_2", "b");
+        let list = parse("echo $*", 0).unwrap().unwrap();
+        assert_eq!(list.items[0].pipeline.commands[0].args[1], "a b");
+        std::env::remove_var("_RUSH_POS_COUNT");
+        std::env::remove_var("_RUSH_POS_1");
+        std::env::remove_var("_RUSH_POS_2");
     }
 }

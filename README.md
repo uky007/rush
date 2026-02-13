@@ -75,9 +75,9 @@
 | モジュール | 責務 | 高速化手法 |
 |-----------|------|-----------|
 | `parser` | 入力をAST（コマンド列）に変換。変数展開、パラメータ展開、算術展開、継続行検出 | ゼロコピー (`Cow::Borrowed`) |
-| `executor` | コマンド実行・パイプライン接続・`if`/`elif`/`else`/`fi`・`for`/`while`/`until` ループ・`case`/`esac`。展開パイプライン: コマンド置換 → チルダ → ブレース → glob | ビルトイン in-process、スタック配列 |
+| `executor` | コマンド実行・パイプライン接続・`if`/`elif`/`else`/`fi`・`for`/`while`/`until` ループ・`case`/`esac`・関数定義/実行。展開パイプライン: コマンド置換 → チルダ → ブレース → glob | ビルトイン in-process、スタック配列 |
 | `spawn` | 外部コマンドの起動 (`posix_spawnp`)。fd 複製 (`2>&1`) 対応 | fork+exec 回避、RAII ラッパー |
-| `builtins` | cd, pwd, echo, export, unset, source, read, exec, wait, type, command, builtin 等 29 種 | fork 不要、直接実行 |
+| `builtins` | cd, pwd, echo, export, unset, source, read, exec, wait, type, command, builtin 等 31 種 | fork 不要、直接実行 |
 | `job` | ジョブコントロール (bg/fg/jobs/wait) | waitpid 手動 reap |
 | `editor` | 行編集 (raw モード、Ctrl+R 逆方向検索、Tab 補完、シンタックスハイライト) | libc 直接操作、1 回の write(2) |
 | `highlight` | シンタックスハイライト・PATH キャッシュ | HashSet キャッシュ、変更検出 |
@@ -172,6 +172,7 @@
 - **`if`/`then`/`elif`/`else`/`fi` 複合コマンド**: 条件分岐（`test`/`[` との組合せ、ネスト対応、ワンライナー・複数行両対応）
 - **`for`/`while`/`until`/`do`/`done` ループ**: `for var in words; do body; done`、`while cond; do body; done`、`until cond; do body; done`（ネスト対応、`break [N]`/`continue [N]` 対応）
 - **`case`/`in`/`esac` パターンマッチ**: `case $var in pattern) body;; esac`（`|` OR パターン、`*` デフォルト、glob マッチング、ネスト対応）
+- **関数定義 `name() { ... }`**: ユーザー定義関数（位置パラメータ `$1`〜`$9`・`$@`・`$*`・`$#`、`return`、`local`、`shift`、`unset -f`、再帰・ネスト対応）
 
 ## Speed Comparison Targets
 

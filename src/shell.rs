@@ -49,6 +49,10 @@ pub struct Shell {
     pub continue_level: usize,
     /// 現在のループネスト深さ。`break`/`continue` の有効性判定に使用。
     pub loop_depth: usize,
+    /// ユーザー定義関数マップ。`name() { body }` で定義される。
+    pub functions: HashMap<String, String>,
+    /// 位置パラメータ（`$1`〜`$N`）。関数呼び出し時に設定される。
+    pub positional_args: Vec<String>,
 }
 
 impl Shell {
@@ -70,6 +74,8 @@ impl Shell {
             break_level: 0,
             continue_level: 0,
             loop_depth: 0,
+            functions: HashMap::new(),
+            positional_args: Vec::new(),
         }
     }
 }

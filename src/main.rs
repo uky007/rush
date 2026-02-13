@@ -13,6 +13,7 @@
 //! - `if`/`then`/`elif`/`else`/`fi` 複合コマンド（ネスト対応、ワンライナー・複数行両対応）
 //! - `for`/`while`/`until`/`do`/`done` ループ（`break`/`continue` 対応、ネスト対応）
 //! - `case`/`in`/`)`/`;;`/`esac` パターンマッチ（OR パターン、glob、ネスト対応）
+//! - 関数定義 `name() { body }` と呼び出し（位置パラメータ `$1`〜`$9`, `$@`, `$*`, `$#`）
 //!
 //! ## モジュール構成
 //!
@@ -23,8 +24,8 @@
 //! | [`complete`] | Tab 補完（コマンド名、ファイル名、`&&`/`||`/`;` 後のコマンド位置認識） |
 //! | [`highlight`] | シンタックスハイライト（ANSI カラー、PATH キャッシュ、`$(cmd)`/`2>&1` 対応） |
 //! | [`parser`] | 構文解析（パイプライン、リダイレクト、クォート、変数展開、パラメータ展開、算術展開、継続行検出） |
-//! | [`executor`] | コマンド実行（条件付き実行、展開パイプライン、`if`/`elif`/`else`/`fi`、`for`/`while`/`until` ループ、`case`/`esac`） |
-//! | [`builtins`] | ビルトイン（`cd`, `echo`, `export`, `alias`, `source`, `read`, `exec`, `wait` 等 29 種） |
+//! | [`executor`] | コマンド実行（条件付き実行、展開パイプライン、`if`/`elif`/`else`/`fi`、`for`/`while`/`until` ループ、`case`/`esac`、関数） |
+//! | [`builtins`] | ビルトイン（`cd`, `echo`, `export`, `alias`, `source`, `read`, `exec`, `wait` 等 31 種） |
 //! | [`glob`] | パス名展開（`*`, `?` によるファイル名マッチング、パラメータ展開のパターン共有） |
 //! | [`job`] | ジョブコントロール（バックグラウンド実行、Ctrl+Z サスペンド、`fg`/`bg` 復帰） |
 //! | [`shell`] | シェルのグローバル状態（終了ステータス、ジョブテーブル、エイリアスマップ） |
@@ -390,6 +391,14 @@ fn run_string(shell: &mut Shell, input: &str) {
             continue;
         }
 
+        // 関数定義の検出
+        if let Some((name, rest)) = executor::parse_function_def(&expanded) {
+            let (body, next_i) = executor::collect_function_body(&lines, i - 1, &rest);
+            shell.functions.insert(name, body);
+            i = next_i;
+            continue;
+        }
+
         match parser::parse(&expanded, shell.last_status) {
             Ok(Some(mut list)) => {
                 // ヒアドキュメントの本文を収集
@@ -648,6 +657,61 @@ fn main() {
                         }
                         if depth == 0 {
                             shell.last_status = executor::execute_case_block(&mut shell, &block);
+                        }
+                        break;
+                    }
+
+                    // 関数定義: `name() {` を検出して `}` まで収集
+                    if let Some((name, rest)) = executor::parse_function_def(accumulated.trim()) {
+                        let mut body = rest.clone();
+                        // ワンライナーチェック: `name() { body }` が全部1行に収まっている場合
+                        let rest_trimmed = rest.trim();
+                        if rest_trimmed.ends_with('}') {
+                            let inner = rest_trimmed.strip_suffix('}').unwrap_or(rest_trimmed)
+                                .trim_end_matches(';').trim();
+                            shell.functions.insert(name, inner.to_string());
+                        } else {
+                            // 複数行: `}` まで収集
+                            let mut depth = 1i32;
+                            // 最初の行の rest で `{`/`}` カウント
+                            for token in executor::shell_tokens_pub(rest.trim()) {
+                                match token {
+                                    "{" => depth += 1,
+                                    "}" => depth -= 1,
+                                    _ => {}
+                                }
+                            }
+                            while depth > 0 {
+                                match editor.read_line("> ") {
+                                    Some(next) => {
+                                        let next_trimmed = next.trim();
+                                        for token in executor::shell_tokens_pub(next_trimmed) {
+                                            match token {
+                                                "{" => depth += 1,
+                                                "}" => depth -= 1,
+                                                _ => {}
+                                            }
+                                        }
+                                        if depth > 0 {
+                                            if !body.is_empty() { body.push('\n'); }
+                                            body.push_str(&next);
+                                        } else {
+                                            // `}` 行の前のテキストがあれば追加
+                                            let before = next_trimmed.strip_suffix('}')
+                                                .unwrap_or("").trim();
+                                            if !before.is_empty() {
+                                                if !body.is_empty() { body.push('\n'); }
+                                                body.push_str(before);
+                                            }
+                                        }
+                                    }
+                                    None => {
+                                        println!();
+                                        break;
+                                    }
+                                }
+                            }
+                            shell.functions.insert(name, body.trim().to_string());
                         }
                         break;
                     }
