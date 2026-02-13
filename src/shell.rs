@@ -2,7 +2,8 @@
 //!
 //! 環境変数は `std::env` を直接使用し、子プロセスへの自動継承を活用する。
 //! ジョブテーブル（[`JobTable`]）、プロセスグループ/ターミナル制御、
-//! `$PATH` キャッシュ（[`PathCache`]）を保持する。
+//! `$PATH` キャッシュ（[`PathCache`]）、ユーザー定義関数マップ、
+//! 位置パラメータ（`$1`〜`$9`）を保持する。
 //!
 //! [`PathCache`] は [`editor`](crate::editor) とは別インスタンスで管理される。
 //! エディタの PathCache はハイライト・補完用で `read_line` 呼び出し毎にリフレッシュされ、
@@ -34,7 +35,7 @@ pub struct Shell {
     pub aliases: HashMap<String, String>,
     /// 直前のバックグラウンドプロセスの PID（`$!` 展開用）。
     pub last_bg_pid: i32,
-    /// `source` 実行中のネスト深さ。`return` ビルトインの有効性判定に使用。
+    /// `source` / 関数実行中のネスト深さ。`return` ビルトインの有効性判定に使用。
     pub source_depth: usize,
     /// `return` が呼ばれたら true にセットし、`source` のループを中断する。
     pub should_return: bool,

@@ -4,7 +4,7 @@
 //! `try_exec()` が `Some(status)` を返せばビルトインとして処理済み、
 //! `None` なら外部コマンドとしてexecutorに委ねる。
 //!
-//! ## 対応ビルトイン（31 種）
+//! ## 対応ビルトイン（32 種）
 //!
 //! - シェル制御: `exit`, `cd`（`cd -` / OLDPWD 対応）, `exec`
 //! - 出力: `pwd`, `echo`（`-n` 対応）
@@ -14,7 +14,7 @@
 //! - スクリプト: `source` / `.`（ファイル行単位実行、`if`/`fi`・`for`/`while`/`until`・`case`/`esac`・関数定義対応）
 //! - 情報: `type`
 //! - 実行制御: `command`（`-v` パス表示、エイリアスバイパス）, `builtin`（ビルトイン限定実行）
-//! - フロー制御: `true` / `:`（常に 0）, `false`（常に 1）, `return`（source からの早期脱出）, `break`（ループ脱出）, `continue`（ループ次反復）
+//! - フロー制御: `true` / `:`（常に 0）, `false`（常に 1）, `return`（関数・source からの早期脱出）, `break`（ループ脱出）, `continue`（ループ次反復）
 //! - 条件判定: `test` / `[`（文字列・整数・ファイル判定、`!` 否定）
 //! - 出力: `printf`（`%s`, `%d`, `%x`, `%o`, 幅指定、ゼロパディング、エスケープ）
 //! - ディレクトリスタック: `pushd`（スタックに積んで移動）, `popd`（ポップして移動）, `dirs`（一覧）
@@ -652,8 +652,8 @@ fn builtin_unalias(shell: &mut Shell, args: &[&str]) -> i32 {
 
 // ── return ──────────────────────────────────────────────────────────
 
-/// `return [N]` — `source` で実行中のスクリプトから早期脱出する。
-/// `source` の外で呼ばれた場合はエラー。
+/// `return [N]` — 関数または `source` 実行中のスクリプトから早期脱出する。
+/// 関数・`source` の外で呼ばれた場合はエラー。
 fn builtin_return(shell: &mut Shell, args: &[&str]) -> i32 {
     if shell.source_depth == 0 {
         eprintln!("rush: return: can only `return' from a function or sourced script");
