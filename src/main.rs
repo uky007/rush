@@ -12,6 +12,7 @@
 //! - プロンプトカスタマイズ（`$PROMPT` 環境変数: `\u`/`\h`/`\w`/`\W`/`\$`/`\?`）
 //! - `if`/`then`/`elif`/`else`/`fi` 複合コマンド（ネスト対応、ワンライナー・複数行両対応）
 //! - `for`/`while`/`until`/`do`/`done` ループ（`break`/`continue` 対応、ネスト対応）
+//! - `case`/`in`/`)`/`;;`/`esac` パターンマッチ（OR パターン、glob、ネスト対応）
 //!
 //! ## モジュール構成
 //!
@@ -22,7 +23,7 @@
 //! | [`complete`] | Tab 補完（コマンド名、ファイル名、`&&`/`||`/`;` 後のコマンド位置認識） |
 //! | [`highlight`] | シンタックスハイライト（ANSI カラー、PATH キャッシュ、`$(cmd)`/`2>&1` 対応） |
 //! | [`parser`] | 構文解析（パイプライン、リダイレクト、クォート、変数展開、パラメータ展開、算術展開、継続行検出） |
-//! | [`executor`] | コマンド実行（条件付き実行、展開パイプライン、`if`/`elif`/`else`/`fi`、`for`/`while`/`until` ループ） |
+//! | [`executor`] | コマンド実行（条件付き実行、展開パイプライン、`if`/`elif`/`else`/`fi`、`for`/`while`/`until` ループ、`case`/`esac`） |
 //! | [`builtins`] | ビルトイン（`cd`, `echo`, `export`, `alias`, `source`, `read`, `exec`, `wait` 等 29 種） |
 //! | [`glob`] | パス名展開（`*`, `?` によるファイル名マッチング、パラメータ展開のパターン共有） |
 //! | [`job`] | ジョブコントロール（バックグラウンド実行、Ctrl+Z サスペンド、`fg`/`bg` 復帰） |
@@ -378,6 +379,17 @@ fn run_string(shell: &mut Shell, input: &str) {
             continue;
         }
 
+        // case ブロックの検出
+        if executor::starts_with_case(&expanded) {
+            let (block, next_i) = executor::collect_case_block(&lines, i - 1);
+            shell.last_status = executor::execute_case_block(shell, &block);
+            i = next_i;
+            if shell.should_exit {
+                break;
+            }
+            continue;
+        }
+
         match parser::parse(&expanded, shell.last_status) {
             Ok(Some(mut list)) => {
                 // ヒアドキュメントの本文を収集
@@ -600,6 +612,42 @@ fn main() {
                                 shell.last_status = executor::execute_while_block(
                                     &mut shell, &block, is_until);
                             }
+                        }
+                        break;
+                    }
+
+                    // case 文: `> ` プロンプトで `esac` まで収集
+                    if executor::starts_with_case(accumulated.trim()) {
+                        let mut block = accumulated.clone();
+                        let mut depth = 0i32;
+                        for token in executor::shell_tokens_pub(block.trim()) {
+                            match token {
+                                "case" => depth += 1,
+                                "esac" => depth -= 1,
+                                _ => {}
+                            }
+                        }
+                        while depth > 0 {
+                            match editor.read_line("> ") {
+                                Some(next) => {
+                                    block.push('\n');
+                                    block.push_str(&next);
+                                    for token in executor::shell_tokens_pub(next.trim()) {
+                                        match token {
+                                            "case" => depth += 1,
+                                            "esac" => depth -= 1,
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                                None => {
+                                    println!();
+                                    break;
+                                }
+                            }
+                        }
+                        if depth == 0 {
+                            shell.last_status = executor::execute_case_block(&mut shell, &block);
                         }
                         break;
                     }

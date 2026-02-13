@@ -11,7 +11,7 @@
 //! - 環境変数: `export`, `unset`, `read`（`-p` プロンプト、IFS 分割、`REPLY`）
 //! - ジョブコントロール: `jobs`, `fg`, `bg`, `wait`
 //! - エイリアス: `alias`, `unalias`（`-a` 全削除）
-//! - スクリプト: `source` / `.`（ファイル行単位実行、`if`/`fi`・`for`/`while`/`until` 対応）
+//! - スクリプト: `source` / `.`（ファイル行単位実行、`if`/`fi`・`for`/`while`/`until`・`case`/`esac` 対応）
 //! - 情報: `type`
 //! - 実行制御: `command`（`-v` パス表示、エイリアスバイパス）, `builtin`（ビルトイン限定実行）
 //! - フロー制御: `true` / `:`（常に 0）, `false`（常に 1）, `return`（source からの早期脱出）, `break`（ループ脱出）, `continue`（ループ次反復）
@@ -761,6 +761,18 @@ fn builtin_source(shell: &mut Shell, args: &[&str]) -> i32 {
                 shell.last_status = executor::execute_while_block(
                     shell, &block, executor::starts_with_until(trimmed));
             }
+            i = next_i;
+            if shell.should_return {
+                shell.should_return = false;
+                break;
+            }
+            continue;
+        }
+
+        // case ブロック検出
+        if executor::starts_with_case(trimmed) {
+            let (block, next_i) = executor::collect_case_block(&lines, i);
+            shell.last_status = executor::execute_case_block(shell, &block);
             i = next_i;
             if shell.should_return {
                 shell.should_return = false;

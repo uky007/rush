@@ -47,6 +47,21 @@
 //! until command; do body; done
 //! # ネスト・break・continue 対応
 //! ```
+//!
+//! ## case 文 (`case`/`in`/`)`/`;;`/`esac`)
+//!
+//! - [`execute_case_block`]: `case WORD in PATTERN) BODY;; ... esac` を実行
+//! - [`collect_case_block`]: 行配列から `case`〜`esac` の範囲を収集
+//! - [`starts_with_case`]: 行が `case` キーワードで始まるかの判定
+//!
+//! 対応構文:
+//! ```sh
+//! case $var in
+//!   pattern1) body1 ;;
+//!   pattern2|pattern3) body2 ;;
+//!   *) default_body ;;
+//! esac
+//! ```
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -1107,6 +1122,208 @@ pub fn execute_while_block(shell: &mut Shell, block: &str, is_until: bool) -> i3
     last_status
 }
 
+// ── case/in/esac 文 ──────────────────────────────────────────────────
+
+/// `case WORD in PATTERN) BODY ;; ... esac` ブロックを解釈・実行する。
+///
+/// 処理フロー:
+/// 1. `case WORD in` のヘッダから WORD を抽出
+/// 2. 各 `PATTERN) BODY ;;` 節を順に評価
+/// 3. WORD がパターンにマッチしたら BODY を実行して終了
+/// 4. `*` はワイルドカード（デフォルト節）
+/// 5. `|` で複数パターンを OR 結合可能
+pub fn execute_case_block(shell: &mut Shell, block: &str) -> i32 {
+    // case ブロックは `;;` をクロージャ区切りとして使うため、
+    // tokenize_block（`;` で分割）ではなく行ベースで解析する。
+    let lines: Vec<&str> = block.lines().collect();
+
+    let mut word = String::new();
+    let mut clauses: Vec<(Vec<String>, String)> = Vec::new(); // (patterns, body)
+    let mut depth = 0i32;
+
+    #[derive(PartialEq)]
+    enum State { BeforeCase, InHeader, InClauses }
+    let mut state = State::BeforeCase;
+    let mut current_body = String::new();
+    let mut current_patterns: Vec<String> = Vec::new();
+
+    for line in &lines {
+        // 行内を `;;\n` で区切る必要がある: ワンライナー対応
+        // まず ;; で分割し、各セグメントを処理
+        let segments = split_case_segments(line);
+
+        for seg in &segments {
+            let trimmed = seg.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            match state {
+                State::BeforeCase => {
+                    if let Some("case") = extract_keyword(trimmed) {
+                        state = State::InHeader;
+                        let after = trimmed.strip_prefix("case").unwrap().trim();
+                        if !after.is_empty() {
+                            if let Some(rest) = after.strip_suffix(" in") {
+                                word = rest.trim().to_string();
+                                state = State::InClauses;
+                            } else if after == "in" {
+                                state = State::InClauses;
+                            } else if after.contains(" in") {
+                                let in_pos = after.rfind(" in").unwrap();
+                                word = after[..in_pos].trim().to_string();
+                                state = State::InClauses;
+                            } else {
+                                word = after.to_string();
+                            }
+                        }
+                    }
+                }
+                State::InHeader => {
+                    let kw = extract_keyword(trimmed);
+                    if kw == Some("in") {
+                        state = State::InClauses;
+                    } else if word.is_empty() {
+                        if let Some(rest) = trimmed.strip_suffix(" in") {
+                            word = rest.trim().to_string();
+                            state = State::InClauses;
+                        } else {
+                            word = trimmed.to_string();
+                        }
+                    }
+                }
+                State::InClauses => {
+                    let kw = extract_keyword(trimmed);
+                    if kw == Some("esac") {
+                        if depth > 0 {
+                            depth -= 1;
+                            if !current_body.is_empty() { current_body.push('\n'); }
+                            current_body.push_str(trimmed);
+                        } else {
+                            if !current_patterns.is_empty() {
+                                clauses.push((current_patterns.clone(), current_body.trim().to_string()));
+                            }
+                            break;
+                        }
+                    } else if kw == Some("case") {
+                        depth += 1;
+                        if !current_body.is_empty() { current_body.push('\n'); }
+                        current_body.push_str(trimmed);
+                    } else if depth == 0 && trimmed.contains(')') && current_patterns.is_empty() {
+                        // パターン行: "pattern)" or "pat1|pat2) body"
+                        let paren_pos = trimmed.find(')').unwrap();
+                        let pattern_str = trimmed[..paren_pos].trim();
+                        let pattern_str = pattern_str.strip_prefix('(').unwrap_or(pattern_str).trim();
+                        current_patterns = pattern_str.split('|').map(|p| p.trim().to_string()).collect();
+                        let after = trimmed[paren_pos + 1..].trim();
+                        if !after.is_empty() {
+                            current_body = after.to_string();
+                        }
+                    } else if depth == 0 && !current_patterns.is_empty() {
+                        if !current_body.is_empty() { current_body.push('\n'); }
+                        current_body.push_str(trimmed);
+                    } else {
+                        if !current_body.is_empty() { current_body.push('\n'); }
+                        current_body.push_str(trimmed);
+                    }
+                }
+            }
+        }
+
+        // `;;\n` の後にクロージャ確定
+        if state == State::InClauses && depth == 0 && line.contains(";;") && !current_patterns.is_empty() {
+            clauses.push((current_patterns.clone(), current_body.trim().to_string()));
+            current_patterns.clear();
+            current_body.clear();
+        }
+    }
+
+    if word.is_empty() {
+        eprintln!("rush: syntax error: missing word in `case`");
+        return 2;
+    }
+
+    // word を展開（変数展開 + コマンド置換 + チルダ + glob）
+    let word_val = expand_case_word(&word, shell);
+
+    // Match against clauses
+    for (patterns, body) in &clauses {
+        for pattern in patterns {
+            if case_pattern_match(&word_val, pattern) {
+                return run_command_string(shell, body);
+            }
+        }
+    }
+
+    0
+}
+
+/// case 文の WORD を展開する。
+///
+/// `parser::parse` で変数展開（`$VAR`, `${VAR}`）を行い、
+/// さらに `expand_args_full` でコマンド置換・チルダ・glob を適用する。
+fn expand_case_word(word: &str, shell: &mut Shell) -> String {
+    // パーサーで変数展開を行う（echo WORD をパースして展開済み引数を取得）
+    let synthetic = format!("echo {}", word);
+    if let Ok(Some(list)) = parser::parse(&synthetic, shell.last_status) {
+        if let Some(cmd) = list.items.first() {
+            if let Some(arg) = cmd.pipeline.commands[0].args.get(1) {
+                let cow_args = vec![arg.clone()];
+                let expanded = expand_args_full(&cow_args, shell);
+                return expanded.into_iter().next().unwrap_or_default();
+            }
+        }
+    }
+    word.to_string()
+}
+
+/// case ブロックの行を `;;` で分割する。
+///
+/// `;;` はクロージャ区切りとして特別扱いする。クォート内の `;;` は無視する。
+/// 各セグメントは `;;` を含まない文字列。
+fn split_case_segments(line: &str) -> Vec<&str> {
+    let bytes = line.as_bytes();
+    let len = bytes.len();
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+
+    while i < len {
+        match bytes[i] {
+            b'\'' => {
+                i += 1;
+                while i < len && bytes[i] != b'\'' { i += 1; }
+                if i < len { i += 1; }
+            }
+            b'"' => {
+                i += 1;
+                while i < len && bytes[i] != b'"' {
+                    if bytes[i] == b'\\' && i + 1 < len { i += 1; }
+                    i += 1;
+                }
+                if i < len { i += 1; }
+            }
+            b';' if i + 1 < len && bytes[i + 1] == b';' => {
+                segments.push(&line[start..i]);
+                i += 2; // skip ;;
+                start = i;
+            }
+            _ => { i += 1; }
+        }
+    }
+
+    segments.push(&line[start..]);
+    segments
+}
+
+/// case 文のパターンマッチ。`*` と `?` によるグロブマッチをサポート。
+fn case_pattern_match(word: &str, pattern: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    glob::matches_pattern(pattern, word)
+}
+
 /// if ブロックの各セクションを保持する構造体。
 ///
 /// [`parse_if_sections`] が if ブロックテキストを解析した結果を格納する。
@@ -1337,6 +1554,16 @@ fn tokenize_block(block: &str) -> Vec<String> {
                     i += 1;
                 }
             }
+            b';' if i + 1 < len && bytes[i + 1] == b';' => {
+                // `;;` は case 文のクロージャ区切り → 現在のトークンに付加して分割
+                current.push_str(";;");
+                let trimmed = current.trim().to_string();
+                if !trimmed.is_empty() {
+                    tokens.push(trimmed);
+                }
+                current.clear();
+                i += 2;
+            }
             b'\n' | b';' => {
                 let trimmed = current.trim().to_string();
                 if !trimmed.is_empty() {
@@ -1366,7 +1593,7 @@ fn tokenize_block(block: &str) -> Vec<String> {
 /// 続く場合にキーワードとして認識する。`ifdef` や `finally` のような
 /// キーワードを含む非キーワードは認識しない。
 fn extract_keyword(token: &str) -> Option<&'static str> {
-    for kw in &["if", "then", "elif", "else", "fi", "for", "while", "until", "do", "done", "in"] {
+    for kw in &["if", "then", "elif", "else", "fi", "for", "while", "until", "do", "done", "in", "case", "esac"] {
         if token == *kw {
             return Some(kw);
         }
@@ -1420,6 +1647,20 @@ fn run_command_string(shell: &mut Shell, input: &str) -> i32 {
             } else {
                 last_status = execute_while_block(shell, &block, starts_with_until(trimmed));
             }
+            shell.last_status = last_status;
+            i = next_i;
+            if shell.should_return || shell.should_exit
+                || shell.break_level > 0 || shell.continue_level > 0
+            {
+                return last_status;
+            }
+            continue;
+        }
+
+        // ネストした case ブロックを検出
+        if starts_with_case(trimmed) {
+            let (block, next_i) = collect_case_block(&lines, i);
+            last_status = execute_case_block(shell, &block);
             shell.last_status = last_status;
             i = next_i;
             if shell.should_return || shell.should_exit
@@ -1551,6 +1792,46 @@ pub fn collect_loop_block(lines: &[&str], start: usize) -> (String, usize) {
                 }
                 // if/fi もカウントしないとネストした if がずれる可能性があるが、
                 // if/fi は do/done のカウントに影響しないため不要
+                _ => {}
+            }
+        }
+
+        i += 1;
+    }
+
+    (block, i)
+}
+
+/// 行が `case` キーワードで始まるかどうかを判定する。
+pub fn starts_with_case(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed == "case" || trimmed.starts_with("case ") || trimmed.starts_with("case\t")
+}
+
+/// 行配列から case ブロック全体（`case`〜`esac`）を収集する。
+///
+/// ネストした case/esac を深さカウントで追跡し、対応する `esac` まで収集する。
+pub fn collect_case_block(lines: &[&str], start: usize) -> (String, usize) {
+    let mut depth = 0i32;
+    let mut block = String::new();
+    let mut i = start;
+
+    while i < lines.len() {
+        let line = lines[i];
+        if !block.is_empty() {
+            block.push('\n');
+        }
+        block.push_str(line);
+
+        for token in shell_tokens(line.trim()) {
+            match token {
+                "case" => depth += 1,
+                "esac" => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return (block, i + 1);
+                    }
+                }
                 _ => {}
             }
         }
@@ -1992,5 +2273,85 @@ mod tests {
         let status = execute_for_block(&mut shell, block);
         assert_eq!(status, 0);
         assert_eq!(std::env::var("x").unwrap_or_default(), "a");
+    }
+
+    // ── case/esac テスト ──────────────────────────────────────────────
+
+    #[test]
+    fn starts_with_case_basic() {
+        assert!(starts_with_case("case $X in"));
+        assert!(starts_with_case("  case $X in"));
+        assert!(!starts_with_case("echo case"));
+        assert!(!starts_with_case("caseinsensitive"));
+    }
+
+    #[test]
+    fn collect_case_block_basic() {
+        let lines = vec!["case $X in", "a) echo a ;;", "esac"];
+        let (block, next) = collect_case_block(&lines, 0);
+        assert!(block.contains("esac"));
+        assert_eq!(next, 3);
+    }
+
+    #[test]
+    fn execute_case_block_match() {
+        let mut shell = Shell::new();
+        std::env::set_var("RUSH_CASE_TEST", "hello");
+        let block = "case $RUSH_CASE_TEST in\nhello) true ;;\n*) false ;;\nesac";
+        let status = execute_case_block(&mut shell, block);
+        assert_eq!(status, 0);
+        std::env::remove_var("RUSH_CASE_TEST");
+    }
+
+    #[test]
+    fn execute_case_block_default() {
+        let mut shell = Shell::new();
+        std::env::set_var("RUSH_CASE_TEST2", "xyz");
+        let block = "case $RUSH_CASE_TEST2 in\nhello) true ;;\n*) false ;;\nesac";
+        let status = execute_case_block(&mut shell, block);
+        assert_eq!(status, 1);
+        std::env::remove_var("RUSH_CASE_TEST2");
+    }
+
+    #[test]
+    fn execute_case_block_or_pattern() {
+        let mut shell = Shell::new();
+        std::env::set_var("RUSH_CASE_TEST3", "yes");
+        let block = "case $RUSH_CASE_TEST3 in\nyes|true|1) true ;;\n*) false ;;\nesac";
+        let status = execute_case_block(&mut shell, block);
+        assert_eq!(status, 0);
+        std::env::remove_var("RUSH_CASE_TEST3");
+    }
+
+    #[test]
+    fn execute_case_block_glob_pattern() {
+        let mut shell = Shell::new();
+        std::env::set_var("RUSH_CASE_TEST4", "file.rs");
+        let block = "case $RUSH_CASE_TEST4 in\n*.rs) true ;;\n*.txt) false ;;\nesac";
+        let status = execute_case_block(&mut shell, block);
+        assert_eq!(status, 0);
+        std::env::remove_var("RUSH_CASE_TEST4");
+    }
+
+    #[test]
+    fn execute_case_block_no_match() {
+        let mut shell = Shell::new();
+        std::env::set_var("RUSH_CASE_TEST5", "none");
+        let block = "case $RUSH_CASE_TEST5 in\nhello) true ;;\nworld) false ;;\nesac";
+        let status = execute_case_block(&mut shell, block);
+        assert_eq!(status, 0); // no match → 0
+        std::env::remove_var("RUSH_CASE_TEST5");
+    }
+
+    #[test]
+    fn tokenize_block_preserves_double_semicolon() {
+        let tokens = tokenize_block("echo a ;; echo b");
+        assert_eq!(tokens, vec!["echo a ;;", "echo b"]);
+    }
+
+    #[test]
+    fn split_case_segments_basic() {
+        let segs = split_case_segments("a) echo hello ;; b) echo world ;;");
+        assert_eq!(segs.len(), 3); // before first ;;, between, after last ;;
     }
 }
