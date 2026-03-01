@@ -30,6 +30,7 @@
 - **ビルトインコマンドはin-process実行** — fork/execを回避し、cd/echo/export等を直接実行
 - **`posix_spawn()` 優先** — 外部コマンドはfork+execではなくposix_spawnで生成（macOSで2-5倍高速）
 - **ゼロコピーパース** — 入力文字列への参照（`Cow::Borrowed`）でトークン化、String割り当てを最小化
+- **位置パラメータ直接渡し** — `$1`〜`$9`/`$@`/`$*`/`$#` を環境変数経由ではなく `&[String]` スライスでパーサーに渡し、syscall を回避
 - **スタック配列化** — パイプ/PID 配列を 8 段以下はスタックに確保し、ヒープ割り当てを排除
 - **PATH キャッシュ** — `$PATH` 内コマンドを `HashSet` でキャッシュし、変更検出で自動再構築
 
@@ -74,7 +75,7 @@
 
 | モジュール | 責務 | 高速化手法 |
 |-----------|------|-----------|
-| `parser` | 入力をAST（コマンド列）に変換。変数展開、パラメータ展開、位置パラメータ（`$1`〜`$9`, `$@`, `$*`, `$#`）、算術展開、継続行検出 | ゼロコピー (`Cow::Borrowed`) |
+| `parser` | 入力をAST（コマンド列）に変換。変数展開、パラメータ展開、位置パラメータ（`$1`〜`$9`, `$@`, `$*`, `$#`）、算術展開、継続行検出 | ゼロコピー (`Cow::Borrowed`)、位置パラメータ直接スライス渡し |
 | `executor` | コマンド実行・パイプライン接続・`if`/`elif`/`else`/`fi`・`for`/`while`/`until` ループ・`case`/`esac`・関数定義/実行。展開パイプライン: コマンド置換 → チルダ → ブレース → glob | ビルトイン in-process、スタック配列 |
 | `spawn` | 外部コマンドの起動 (`posix_spawnp`)。fd 複製 (`2>&1`) 対応 | fork+exec 回避、RAII ラッパー |
 | `builtins` | cd, pwd, echo, export, unset, source, read, exec, wait, type, command, builtin 等 32 種 | fork 不要、直接実行 |
@@ -152,7 +153,7 @@
 - **ブレース展開**: `{a,b,c}` カンマ展開、`{1..5}` 数値レンジ、`{a..z}` 文字レンジ、ネスト対応
 - **継続行入力**: 末尾 `\`・未完了パイプ/演算子・未閉クォートで `> ` プロンプトによる複数行入力
 
-### Phase 10: Extended Shell Features (進行中)
+### Phase 10: Extended Shell Features ✅
 - **`true` / `false` / `:` / `return`**: フロー制御ビルトイン（`return` は `source` 内でのみ有効）
 - **特殊変数 `$$`, `$!`, `$0`**: プロセス ID、直前バックグラウンド PID、シェル名
 - **`2>>` stderr 追記リダイレクト**: 標準エラーを追記モードで開く
@@ -173,6 +174,13 @@
 - **`for`/`while`/`until`/`do`/`done` ループ**: `for var in words; do body; done`、`while cond; do body; done`、`until cond; do body; done`（ネスト対応、`break [N]`/`continue [N]` 対応）
 - **`case`/`in`/`esac` パターンマッチ**: `case $var in pattern) body;; esac`（`|` OR パターン、`*` デフォルト、glob マッチング、ネスト対応）
 - **関数定義 `name() { ... }`**: ユーザー定義関数（位置パラメータ `$1`〜`$9`・`$@`・`$*`・`$#`、`return`、`local`、`shift`、`unset -f`、再帰・ネスト対応）
+
+### Phase 11: Test Stabilization & Internal Cleanup ✅
+- **位置パラメータの内部化**: `_RUSH_POS_*` 環境変数を廃止し、`parse()` に `pos_args: &[String]` スライスを直接渡す設計に変更（`env::var` syscall 回避による高速化 + テスト並列実行時のレース条件解消）
+- **`execute_function()` 簡素化**: 環境変数の保存/復元ロジックを削除し、`shell.positional_args` の save/restore のみに（~25行削減）
+- **`builtin_shift()` 簡素化**: 環境変数同期ロジックを削除（~8行削減）
+- **CWD 依存テストの排他制御**: `set_current_dir()` を使うテスト群に `Mutex` ロックを追加し、並列実行時の競合を防止
+- **テストスイート安定化**: 274テストが並列実行で安定パス（10回連続で再現性確認済み）
 
 ## Speed Comparison Targets
 
