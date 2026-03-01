@@ -802,7 +802,7 @@ fn builtin_source(shell: &mut Shell, args: &[&str]) -> i32 {
             continue;
         }
 
-        match parser::parse(trimmed, shell.last_status) {
+        match parser::parse(trimmed, shell.last_status, &shell.positional_args) {
             Ok(Some(list)) => {
                 let cmd_text = trimmed.to_string();
                 shell.last_status = executor::execute(shell, &list, &cmd_text);
@@ -1268,17 +1268,6 @@ fn builtin_shift(shell: &mut Shell, args: &[&str]) -> i32 {
     // シェル内部状態をシフト
     shell.positional_args = shell.positional_args[n..].to_vec();
 
-    // 環境変数を更新
-    let new_count = shell.positional_args.len();
-    std::env::set_var("_RUSH_POS_COUNT", new_count.to_string());
-    for (i, val) in shell.positional_args.iter().enumerate() {
-        std::env::set_var(format!("_RUSH_POS_{}", i + 1), val);
-    }
-    // 古い余分な env vars を削除
-    for i in (new_count + 1)..=(new_count + n) {
-        std::env::remove_var(format!("_RUSH_POS_{}", i));
-    }
-
     0
 }
 
@@ -1289,8 +1278,13 @@ mod tests {
     use super::*;
     use crate::shell::Shell;
 
+    /// CWD を変更するテストの排他ロック。
+    /// `set_current_dir` はプロセスグローバルなため、並列実行時の競合を防ぐ。
+    static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn pwd_outputs_current_dir() {
+        let _lock = CWD_LOCK.lock().unwrap();
         let mut buf = Vec::new();
         let status = builtin_pwd(&mut buf);
         assert_eq!(status, 0);
@@ -1440,6 +1434,7 @@ mod tests {
 
     #[test]
     fn cd_dash_returns_to_oldpwd() {
+        let _lock = CWD_LOCK.lock().unwrap();
         let orig = env::current_dir().unwrap();
         let tmp = env::temp_dir();
         // First cd to tmp to set OLDPWD
@@ -1457,6 +1452,7 @@ mod tests {
 
     #[test]
     fn cd_sets_oldpwd() {
+        let _lock = CWD_LOCK.lock().unwrap();
         let orig = env::current_dir().unwrap();
         let tmp = env::temp_dir();
         let mut buf = Vec::new();
@@ -1611,6 +1607,7 @@ mod tests {
 
     #[test]
     fn pushd_and_popd() {
+        let _lock = CWD_LOCK.lock().unwrap();
         let orig = env::current_dir().unwrap();
         let tmp = env::temp_dir().canonicalize().unwrap();
         let mut shell = Shell::new();
@@ -1677,6 +1674,7 @@ mod tests {
 
     #[test]
     fn dirs_shows_current() {
+        let _lock = CWD_LOCK.lock().unwrap();
         let shell = Shell::new();
         let mut buf = Vec::new();
         let status = builtin_dirs(&shell, &mut buf);

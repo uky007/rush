@@ -193,7 +193,7 @@ fn expand_tilde_prefix(s: &str) -> Cow<'_, str> {
 // ── Variable expansion (crate-private) ──────────────────────────────
 
 /// `$VAR` / `${VAR}` / `$?` を展開する。`$` が含まれなければゼロコピーの `Cow::Borrowed` を返す。
-fn expand_variables(s: &str, last_status: i32) -> Cow<'_, str> {
+fn expand_variables<'a>(s: &'a str, last_status: i32, pos_args: &[String]) -> Cow<'a, str> {
     if !s.contains('$') {
         return Cow::Borrowed(s);
     }
@@ -237,7 +237,7 @@ fn expand_variables(s: &str, last_status: i32) -> Cow<'_, str> {
                                     paren_depth -= 1;
                                 } else if pos + 1 < len && bytes[pos + 1] == b')' {
                                     let expr = &s[expr_start..pos];
-                                    result.push_str(&eval_arithmetic(expr, last_status));
+                                    result.push_str(&eval_arithmetic(expr, last_status, pos_args));
                                     pos += 2; // skip '))'
                                     found = true;
                                     break;
@@ -307,51 +307,29 @@ fn expand_variables(s: &str, last_status: i32) -> Cow<'_, str> {
                 // 位置パラメータ $1〜$9
                 let n = (bytes[pos] - b'0') as usize;
                 pos += 1;
-                let count: usize = std::env::var("_RUSH_POS_COUNT")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0);
-                if n <= count {
-                    if let Ok(val) = std::env::var(format!("_RUSH_POS_{}", n)) {
-                        result.push_str(&val);
-                    }
+                if let Some(val) = pos_args.get(n - 1) {
+                    result.push_str(val);
                 }
             }
             b'@' => {
                 // $@ — 全位置パラメータ（個別の単語として展開）
-                let count: usize = std::env::var("_RUSH_POS_COUNT")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0);
-                for i in 1..=count {
-                    if i > 1 { result.push(' '); }
-                    if let Ok(val) = std::env::var(format!("_RUSH_POS_{}", i)) {
-                        result.push_str(&val);
-                    }
+                for (i, arg) in pos_args.iter().enumerate() {
+                    if i > 0 { result.push(' '); }
+                    result.push_str(arg);
                 }
                 pos += 1;
             }
             b'*' => {
                 // $* — 全位置パラメータ（単一文字列として展開）
-                let count: usize = std::env::var("_RUSH_POS_COUNT")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0);
-                for i in 1..=count {
-                    if i > 1 { result.push(' '); }
-                    if let Ok(val) = std::env::var(format!("_RUSH_POS_{}", i)) {
-                        result.push_str(&val);
-                    }
+                for (i, arg) in pos_args.iter().enumerate() {
+                    if i > 0 { result.push(' '); }
+                    result.push_str(arg);
                 }
                 pos += 1;
             }
             b'#' => {
                 // $# — 位置パラメータの個数
-                let count: usize = std::env::var("_RUSH_POS_COUNT")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(0);
-                result.push_str(&count.to_string());
+                result.push_str(&pos_args.len().to_string());
                 pos += 1;
             }
             b'{' => {
@@ -374,7 +352,7 @@ fn expand_variables(s: &str, last_status: i32) -> Cow<'_, str> {
                     let inner = &s[var_start..pos];
                     pos += 1; // skip '}'
                     if !inner.is_empty() {
-                        result.push_str(&expand_braced_param(inner, last_status));
+                        result.push_str(&expand_braced_param(inner, last_status, pos_args));
                     }
                 } else {
                     // 閉じ '}' がない → リテラル "${"
@@ -454,7 +432,7 @@ fn get_var(name: &str) -> String {
     resolve_special_var(name).unwrap_or_else(|| std::env::var(name).unwrap_or_default())
 }
 
-fn expand_braced_param(inner: &str, last_status: i32) -> String {
+fn expand_braced_param(inner: &str, last_status: i32, pos_args: &[String]) -> String {
     // ${#var} — 文字数
     if let Some(var_name) = inner.strip_prefix('#') {
         let val = get_var(var_name);
@@ -480,12 +458,12 @@ fn expand_braced_param(inner: &str, last_status: i32) -> String {
     // ${var:-default}, ${var:=default}, ${var:+alt}, ${var:?msg}
     if op_and_rest.starts_with(":-") {
         let operand = &op_and_rest[2..];
-        return if val.is_empty() { expand_variables(operand, last_status).into_owned() } else { val };
+        return if val.is_empty() { expand_variables(operand, last_status, pos_args).into_owned() } else { val };
     }
     if op_and_rest.starts_with(":=") {
         let operand = &op_and_rest[2..];
         if val.is_empty() {
-            let def = expand_variables(operand, last_status).into_owned();
+            let def = expand_variables(operand, last_status, pos_args).into_owned();
             std::env::set_var(var_name, &def);
             return def;
         }
@@ -493,7 +471,7 @@ fn expand_braced_param(inner: &str, last_status: i32) -> String {
     }
     if op_and_rest.starts_with(":+") {
         let operand = &op_and_rest[2..];
-        return if val.is_empty() { String::new() } else { expand_variables(operand, last_status).into_owned() };
+        return if val.is_empty() { String::new() } else { expand_variables(operand, last_status, pos_args).into_owned() };
     }
     if op_and_rest.starts_with(":?") {
         let operand = &op_and_rest[2..];
@@ -631,8 +609,8 @@ fn glob_replace_all(val: &str, pattern: &str, replacement: &str) -> String {
 
 /// `$((expr))` の算術式を評価し、結果を文字列で返す。
 /// 式中の `$VAR` は先に変数展開し、裸の変数名は環境変数として参照する。
-fn eval_arithmetic(expr: &str, last_status: i32) -> String {
-    let expanded = expand_variables(expr, last_status);
+fn eval_arithmetic(expr: &str, last_status: i32, pos_args: &[String]) -> String {
+    let expanded = expand_variables(expr, last_status, pos_args);
     let mut parser = ArithParser::new(&expanded);
     match parser.parse_expr() {
         Some(val) => val.to_string(),
@@ -796,15 +774,16 @@ enum Token<'a> {
 ///
 /// 空白をスキップし、演算子・クォート・通常ワードを識別する。
 /// `Iterator<Item = Result<Token, ParseError>>` を実装。
-struct Tokenizer<'a> {
+struct Tokenizer<'a, 'b> {
     input: &'a str,
     pos: usize,
     last_status: i32,
+    pos_args: &'b [String],
 }
 
-impl<'a> Tokenizer<'a> {
-    fn new(input: &'a str, last_status: i32) -> Self {
-        Self { input, pos: 0, last_status }
+impl<'a, 'b> Tokenizer<'a, 'b> {
+    fn new(input: &'a str, last_status: i32, pos_args: &'b [String]) -> Self {
+        Self { input, pos: 0, last_status, pos_args }
     }
 
     fn skip_whitespace(&mut self) {
@@ -843,7 +822,7 @@ impl<'a> Tokenizer<'a> {
                                     paren_depth -= 1;
                                 } else if self.pos + 1 < len && bytes[self.pos + 1] == b')' {
                                     let expr = &self.input[expr_start..self.pos];
-                                    buf.push_str(&eval_arithmetic(expr, self.last_status));
+                                    buf.push_str(&eval_arithmetic(expr, self.last_status, self.pos_args));
                                     self.pos += 2; // skip '))'
                                     found = true;
                                     break;
@@ -929,7 +908,7 @@ impl<'a> Tokenizer<'a> {
                     let inner = &self.input[var_start..self.pos];
                     self.pos += 1; // skip '}'
                     if !inner.is_empty() {
-                        buf.push_str(&expand_braced_param(inner, self.last_status));
+                        buf.push_str(&expand_braced_param(inner, self.last_status, self.pos_args));
                     }
                 } else {
                     buf.push_str("${");
@@ -955,7 +934,7 @@ impl<'a> Tokenizer<'a> {
     }
 }
 
-impl<'a> Iterator for Tokenizer<'a> {
+impl<'a, 'b> Iterator for Tokenizer<'a, 'b> {
     type Item = Result<Token<'a>, ParseError>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1123,7 +1102,7 @@ impl<'a> Iterator for Tokenizer<'a> {
                         if self.input.as_bytes()[self.pos] == b'"' {
                             let word = &self.input[start..self.pos];
                             self.pos += 1; // skip closing quote
-                            return Some(Ok(Token::Word(expand_variables(word, self.last_status))));
+                            return Some(Ok(Token::Word(expand_variables(word, self.last_status, self.pos_args))));
                         }
                         self.pos += 1;
                     }
@@ -1218,7 +1197,7 @@ impl<'a> Iterator for Tokenizer<'a> {
                             }
                         }
                     }
-                    let expanded = expand_variables(&buf, self.last_status);
+                    let expanded = expand_variables(&buf, self.last_status, self.pos_args);
                     Some(Ok(Token::Word(Cow::Owned(expanded.into_owned()))))
                 } else {
                     // エスケープなし → 従来通り
@@ -1259,7 +1238,7 @@ impl<'a> Iterator for Tokenizer<'a> {
                         }
                     }
                     let word = &self.input[start..self.pos];
-                    Some(Ok(Token::Word(expand_variables(word, self.last_status))))
+                    Some(Ok(Token::Word(expand_variables(word, self.last_status, self.pos_args))))
                 }
             }
         }
@@ -1308,8 +1287,8 @@ pub fn fill_heredoc_bodies(list: &mut CommandList<'_>, bodies: &[String]) {
 /// - 構文エラー → `Err(ParseError)`
 ///
 /// `last_status` は `$?` 展開に使用される。
-pub fn parse(input: &str, last_status: i32) -> Result<Option<CommandList<'_>>, ParseError> {
-    let mut tokens = Tokenizer::new(input, last_status);
+pub fn parse<'a>(input: &'a str, last_status: i32, pos_args: &[String]) -> Result<Option<CommandList<'a>>, ParseError> {
+    let mut tokens = Tokenizer::new(input, last_status, pos_args);
     let mut items: Vec<ListItem<'_>> = Vec::new();
     let mut commands: Vec<Command<'_>> = Vec::new();
     let mut args: Vec<Cow<'_, str>> = Vec::new();
@@ -1497,7 +1476,7 @@ mod tests {
 
     /// パース結果から最初のパイプラインの各コマンドの引数を文字列ベクタとして取り出す。
     fn parse_args(input: &str) -> Vec<Vec<String>> {
-        let list = parse(input, 0).unwrap().unwrap();
+        let list = parse(input, 0, &[]).unwrap().unwrap();
         list.items[0]
             .pipeline
             .commands
@@ -1578,7 +1557,7 @@ mod tests {
 
     #[test]
     fn redirect_output() {
-        let list = parse("echo hello > out.txt", 0).unwrap().unwrap();
+        let list = parse("echo hello > out.txt", 0, &[]).unwrap().unwrap();
         let p = &list.items[0].pipeline;
         assert_eq!(p.commands.len(), 1);
         assert_eq!(p.commands[0].args.len(), 2);
@@ -1589,7 +1568,7 @@ mod tests {
 
     #[test]
     fn redirect_append() {
-        let list = parse("echo hello >> out.txt", 0).unwrap().unwrap();
+        let list = parse("echo hello >> out.txt", 0, &[]).unwrap().unwrap();
         let p = &list.items[0].pipeline;
         assert_eq!(p.commands[0].redirects[0].kind, RedirectKind::Append);
         assert_eq!(p.commands[0].redirects[0].target, "out.txt");
@@ -1597,7 +1576,7 @@ mod tests {
 
     #[test]
     fn redirect_input() {
-        let list = parse("cat < in.txt", 0).unwrap().unwrap();
+        let list = parse("cat < in.txt", 0, &[]).unwrap().unwrap();
         let p = &list.items[0].pipeline;
         assert_eq!(p.commands[0].redirects[0].kind, RedirectKind::Input);
         assert_eq!(p.commands[0].redirects[0].target, "in.txt");
@@ -1605,7 +1584,7 @@ mod tests {
 
     #[test]
     fn redirect_stderr() {
-        let list = parse("ls 2> err.txt", 0).unwrap().unwrap();
+        let list = parse("ls 2> err.txt", 0, &[]).unwrap().unwrap();
         let p = &list.items[0].pipeline;
         assert_eq!(p.commands[0].redirects[0].kind, RedirectKind::Stderr);
         assert_eq!(p.commands[0].redirects[0].target, "err.txt");
@@ -1613,7 +1592,7 @@ mod tests {
 
     #[test]
     fn redirect_stderr_append() {
-        let list = parse("cmd 2>> err.log", 0).unwrap().unwrap();
+        let list = parse("cmd 2>> err.log", 0, &[]).unwrap().unwrap();
         let p = &list.items[0].pipeline;
         assert_eq!(p.commands[0].redirects[0].kind, RedirectKind::StderrAppend);
         assert_eq!(p.commands[0].redirects[0].target, "err.log");
@@ -1621,7 +1600,7 @@ mod tests {
 
     #[test]
     fn here_string() {
-        let list = parse("cat <<<hello", 0).unwrap().unwrap();
+        let list = parse("cat <<<hello", 0, &[]).unwrap().unwrap();
         let p = &list.items[0].pipeline;
         assert_eq!(p.commands[0].args[0], "cat");
         assert_eq!(p.commands[0].redirects[0].kind, RedirectKind::HereString);
@@ -1630,7 +1609,7 @@ mod tests {
 
     #[test]
     fn here_string_with_space() {
-        let list = parse("cat <<< word", 0).unwrap().unwrap();
+        let list = parse("cat <<< word", 0, &[]).unwrap().unwrap();
         let p = &list.items[0].pipeline;
         assert_eq!(p.commands[0].redirects[0].kind, RedirectKind::HereString);
         assert_eq!(p.commands[0].redirects[0].target, "word");
@@ -1638,7 +1617,7 @@ mod tests {
 
     #[test]
     fn here_doc_delimiter() {
-        let list = parse("cat <<EOF", 0).unwrap().unwrap();
+        let list = parse("cat <<EOF", 0, &[]).unwrap().unwrap();
         let p = &list.items[0].pipeline;
         assert_eq!(p.commands[0].redirects[0].kind, RedirectKind::HereDoc);
         assert_eq!(p.commands[0].redirects[0].target, "EOF");
@@ -1646,21 +1625,21 @@ mod tests {
 
     #[test]
     fn here_doc_delimiters_fn() {
-        let list = parse("cat <<EOF", 0).unwrap().unwrap();
+        let list = parse("cat <<EOF", 0, &[]).unwrap().unwrap();
         let delims = heredoc_delimiters(&list);
         assert_eq!(delims, vec!["EOF"]);
     }
 
     #[test]
     fn redirect_no_space() {
-        let list = parse("echo hello >out.txt", 0).unwrap().unwrap();
+        let list = parse("echo hello >out.txt", 0, &[]).unwrap().unwrap();
         let p = &list.items[0].pipeline;
         assert_eq!(p.commands[0].redirects[0].target, "out.txt");
     }
 
     #[test]
     fn multiple_redirects() {
-        let list = parse("cmd < in.txt > out.txt 2> err.txt", 0).unwrap().unwrap();
+        let list = parse("cmd < in.txt > out.txt 2> err.txt", 0, &[]).unwrap().unwrap();
         let p = &list.items[0].pipeline;
         assert_eq!(p.commands[0].redirects.len(), 3);
         assert_eq!(p.commands[0].redirects[0].kind, RedirectKind::Input);
@@ -1672,7 +1651,7 @@ mod tests {
 
     #[test]
     fn pipeline_with_redirects() {
-        let list = parse("cat < in.txt | grep hello > out.txt", 0).unwrap().unwrap();
+        let list = parse("cat < in.txt | grep hello > out.txt", 0, &[]).unwrap().unwrap();
         let p = &list.items[0].pipeline;
         assert_eq!(p.commands.len(), 2);
         assert_eq!(p.commands[0].redirects[0].kind, RedirectKind::Input);
@@ -1685,7 +1664,7 @@ mod tests {
 
     #[test]
     fn two_is_not_stderr_redirect_with_space() {
-        let list = parse("echo 2 > file", 0).unwrap().unwrap();
+        let list = parse("echo 2 > file", 0, &[]).unwrap().unwrap();
         let p = &list.items[0].pipeline;
         assert_eq!(p.commands[0].args.len(), 2);
         assert_eq!(p.commands[0].args[1], "2");
@@ -1696,9 +1675,9 @@ mod tests {
 
     #[test]
     fn empty_input() {
-        assert!(parse("", 0).unwrap().is_none());
-        assert!(parse("   ", 0).unwrap().is_none());
-        assert!(parse("\t\n", 0).unwrap().is_none());
+        assert!(parse("", 0, &[]).unwrap().is_none());
+        assert!(parse("   ", 0, &[]).unwrap().is_none());
+        assert!(parse("\t\n", 0, &[]).unwrap().is_none());
     }
 
     // ── エラーケース ──
@@ -1706,7 +1685,7 @@ mod tests {
     #[test]
     fn err_unterminated_single_quote() {
         assert_eq!(
-            parse("echo 'hello", 0),
+            parse("echo 'hello", 0, &[]),
             Err(ParseError::UnterminatedQuote('\'')),
         );
     }
@@ -1714,43 +1693,43 @@ mod tests {
     #[test]
     fn err_unterminated_double_quote() {
         assert_eq!(
-            parse("echo \"hello", 0),
+            parse("echo \"hello", 0, &[]),
             Err(ParseError::UnterminatedQuote('"')),
         );
     }
 
     #[test]
     fn err_missing_redirect_target() {
-        assert_eq!(parse("echo >", 0), Err(ParseError::MissingRedirectTarget));
+        assert_eq!(parse("echo >", 0, &[]), Err(ParseError::MissingRedirectTarget));
     }
 
     #[test]
     fn err_redirect_followed_by_pipe() {
-        assert_eq!(parse("echo > | cat", 0), Err(ParseError::MissingRedirectTarget));
+        assert_eq!(parse("echo > | cat", 0, &[]), Err(ParseError::MissingRedirectTarget));
     }
 
     #[test]
     fn err_leading_pipe() {
-        assert_eq!(parse("| ls", 0), Err(ParseError::EmptyPipelineSegment));
+        assert_eq!(parse("| ls", 0, &[]), Err(ParseError::EmptyPipelineSegment));
     }
 
     #[test]
     fn err_trailing_pipe() {
-        assert_eq!(parse("ls |", 0), Err(ParseError::IncompleteInput));
+        assert_eq!(parse("ls |", 0, &[]), Err(ParseError::IncompleteInput));
     }
 
     #[test]
     fn err_double_pipe_operator() {
         // `ls | | grep` → first `|` consumed as Pipe, then `| grep` → EmptyPipelineSegment
         // because after Pipe, args is empty and next token is `|` (Pipe)
-        assert_eq!(parse("ls | | grep", 0), Err(ParseError::EmptyPipelineSegment));
+        assert_eq!(parse("ls | | grep", 0, &[]), Err(ParseError::EmptyPipelineSegment));
     }
 
     // ── background (&) ──
 
     #[test]
     fn background_simple() {
-        let list = parse("sleep 10 &", 0).unwrap().unwrap();
+        let list = parse("sleep 10 &", 0, &[]).unwrap().unwrap();
         let p = &list.items[0].pipeline;
         assert!(p.background);
         assert_eq!(p.commands.len(), 1);
@@ -1759,7 +1738,7 @@ mod tests {
 
     #[test]
     fn background_pipeline() {
-        let list = parse("ls | grep foo &", 0).unwrap().unwrap();
+        let list = parse("ls | grep foo &", 0, &[]).unwrap().unwrap();
         let p = &list.items[0].pipeline;
         assert!(p.background);
         assert_eq!(p.commands.len(), 2);
@@ -1767,13 +1746,13 @@ mod tests {
 
     #[test]
     fn background_bare_ampersand() {
-        assert_eq!(parse("&", 0), Err(ParseError::EmptyPipelineSegment));
+        assert_eq!(parse("&", 0, &[]), Err(ParseError::EmptyPipelineSegment));
     }
 
     #[test]
     fn background_followed_by_command() {
         // `cmd & extra` → 2 items: cmd (background), extra (foreground)
-        let list = parse("cmd & extra", 0).unwrap().unwrap();
+        let list = parse("cmd & extra", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items.len(), 2);
         assert!(list.items[0].pipeline.background);
         assert_eq!(list.items[0].pipeline.commands[0].args[0], "cmd");
@@ -1783,7 +1762,7 @@ mod tests {
 
     #[test]
     fn no_background_flag() {
-        let list = parse("ls", 0).unwrap().unwrap();
+        let list = parse("ls", 0, &[]).unwrap().unwrap();
         assert!(!list.items[0].pipeline.background);
     }
 
@@ -1791,7 +1770,7 @@ mod tests {
 
     #[test]
     fn cow_is_borrowed() {
-        let list = parse("echo hello", 0).unwrap().unwrap();
+        let list = parse("echo hello", 0, &[]).unwrap().unwrap();
         for arg in &list.items[0].pipeline.commands[0].args {
             assert!(matches!(arg, Cow::Borrowed(_)), "expected Borrowed, got Owned");
         }
@@ -1799,7 +1778,7 @@ mod tests {
 
     #[test]
     fn cow_quoted_is_borrowed() {
-        let list = parse("echo 'hello world'", 0).unwrap().unwrap();
+        let list = parse("echo 'hello world'", 0, &[]).unwrap().unwrap();
         assert!(matches!(&list.items[0].pipeline.commands[0].args[1], Cow::Borrowed(_)));
     }
 
@@ -1808,20 +1787,20 @@ mod tests {
     #[test]
     fn expand_env_var() {
         std::env::set_var("RUSH_TEST_VAR", "hello");
-        let list = parse("echo $RUSH_TEST_VAR", 0).unwrap().unwrap();
+        let list = parse("echo $RUSH_TEST_VAR", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "hello");
         std::env::remove_var("RUSH_TEST_VAR");
     }
 
     #[test]
     fn expand_last_status() {
-        let list = parse("echo $?", 42).unwrap().unwrap();
+        let list = parse("echo $?", 42, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "42");
     }
 
     #[test]
     fn expand_dollar_dollar() {
-        let list = parse("echo $$", 0).unwrap().unwrap();
+        let list = parse("echo $$", 0, &[]).unwrap().unwrap();
         let val: i32 = list.items[0].pipeline.commands[0].args[1].parse().unwrap();
         assert!(val > 0); // should be a valid PID
     }
@@ -1829,20 +1808,20 @@ mod tests {
     #[test]
     fn expand_dollar_bang() {
         std::env::set_var("RUSH_LAST_BG_PID", "12345");
-        let list = parse("echo $!", 0).unwrap().unwrap();
+        let list = parse("echo $!", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "12345");
         std::env::remove_var("RUSH_LAST_BG_PID");
     }
 
     #[test]
     fn expand_dollar_zero() {
-        let list = parse("echo $0", 0).unwrap().unwrap();
+        let list = parse("echo $0", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "rush");
     }
 
     #[test]
     fn expand_random() {
-        let list = parse("echo $RANDOM", 0).unwrap().unwrap();
+        let list = parse("echo $RANDOM", 0, &[]).unwrap().unwrap();
         let val: u64 = list.items[0].pipeline.commands[0].args[1]
             .parse()
             .expect("$RANDOM should be a number");
@@ -1851,7 +1830,7 @@ mod tests {
 
     #[test]
     fn expand_seconds() {
-        let list = parse("echo $SECONDS", 0).unwrap().unwrap();
+        let list = parse("echo $SECONDS", 0, &[]).unwrap().unwrap();
         let val: u64 = list.items[0].pipeline.commands[0].args[1]
             .parse()
             .expect("$SECONDS should be a number");
@@ -1861,7 +1840,7 @@ mod tests {
 
     #[test]
     fn expand_random_in_braces() {
-        let list = parse("echo ${RANDOM}", 0).unwrap().unwrap();
+        let list = parse("echo ${RANDOM}", 0, &[]).unwrap().unwrap();
         let val: u64 = list.items[0].pipeline.commands[0].args[1]
             .parse()
             .expect("${RANDOM} should be a number");
@@ -1870,7 +1849,7 @@ mod tests {
 
     #[test]
     fn expand_seconds_in_braces() {
-        let list = parse("echo ${SECONDS}", 0).unwrap().unwrap();
+        let list = parse("echo ${SECONDS}", 0, &[]).unwrap().unwrap();
         let val: u64 = list.items[0].pipeline.commands[0].args[1]
             .parse()
             .expect("${SECONDS} should be a number");
@@ -1880,14 +1859,14 @@ mod tests {
     #[test]
     fn expand_undefined_var() {
         std::env::remove_var("RUSH_NONEXISTENT_VAR_XYZ");
-        let list = parse("echo $RUSH_NONEXISTENT_VAR_XYZ", 0).unwrap().unwrap();
+        let list = parse("echo $RUSH_NONEXISTENT_VAR_XYZ", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "");
     }
 
     #[test]
     fn single_quote_no_expand() {
         std::env::set_var("RUSH_TEST_VAR2", "expanded");
-        let list = parse("echo '$RUSH_TEST_VAR2'", 0).unwrap().unwrap();
+        let list = parse("echo '$RUSH_TEST_VAR2'", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "$RUSH_TEST_VAR2");
         assert!(matches!(&list.items[0].pipeline.commands[0].args[1], Cow::Borrowed(_)));
         std::env::remove_var("RUSH_TEST_VAR2");
@@ -1896,7 +1875,7 @@ mod tests {
     #[test]
     fn double_quote_expand() {
         std::env::set_var("RUSH_TEST_VAR3", "world");
-        let list = parse("echo \"hello $RUSH_TEST_VAR3\"", 0).unwrap().unwrap();
+        let list = parse("echo \"hello $RUSH_TEST_VAR3\"", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "hello world");
         std::env::remove_var("RUSH_TEST_VAR3");
     }
@@ -1904,34 +1883,34 @@ mod tests {
     #[test]
     fn redirect_target_expand() {
         std::env::set_var("RUSH_TEST_DIR", "/tmp");
-        let list = parse("echo hello > $RUSH_TEST_DIR/out.txt", 0).unwrap().unwrap();
+        let list = parse("echo hello > $RUSH_TEST_DIR/out.txt", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].redirects[0].target, "/tmp/out.txt");
         std::env::remove_var("RUSH_TEST_DIR");
     }
 
     #[test]
     fn bare_dollar_at_end() {
-        let list = parse("echo $", 0).unwrap().unwrap();
+        let list = parse("echo $", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "$");
     }
 
     #[test]
     fn dollar_at_expands_positional() {
         // $@ expands to all positional parameters (empty when none set)
-        let list = parse("echo $@", 0).unwrap().unwrap();
+        let list = parse("echo $@", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "");
     }
 
     #[test]
     fn no_dollar_cow_borrowed() {
-        let list = parse("echo hello", 0).unwrap().unwrap();
+        let list = parse("echo hello", 0, &[]).unwrap().unwrap();
         assert!(matches!(&list.items[0].pipeline.commands[0].args[0], Cow::Borrowed(_)));
         assert!(matches!(&list.items[0].pipeline.commands[0].args[1], Cow::Borrowed(_)));
     }
 
     #[test]
     fn double_quote_no_dollar_cow_borrowed() {
-        let list = parse("echo \"hello\"", 0).unwrap().unwrap();
+        let list = parse("echo \"hello\"", 0, &[]).unwrap().unwrap();
         assert!(matches!(&list.items[0].pipeline.commands[0].args[1], Cow::Borrowed(_)));
     }
 
@@ -1939,7 +1918,7 @@ mod tests {
 
     #[test]
     fn and_connector() {
-        let list = parse("echo a && echo b", 0).unwrap().unwrap();
+        let list = parse("echo a && echo b", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items.len(), 2);
         assert_eq!(list.items[0].connector, Connector::And);
         assert_eq!(list.items[0].pipeline.commands[0].args[0], "echo");
@@ -1951,21 +1930,21 @@ mod tests {
 
     #[test]
     fn or_connector() {
-        let list = parse("false || echo ok", 0).unwrap().unwrap();
+        let list = parse("false || echo ok", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items.len(), 2);
         assert_eq!(list.items[0].connector, Connector::Or);
     }
 
     #[test]
     fn seq_connector() {
-        let list = parse("echo a ; echo b", 0).unwrap().unwrap();
+        let list = parse("echo a ; echo b", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items.len(), 2);
         assert_eq!(list.items[0].connector, Connector::Seq);
     }
 
     #[test]
     fn mixed_connectors() {
-        let list = parse("a && b || c ; d", 0).unwrap().unwrap();
+        let list = parse("a && b || c ; d", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items.len(), 4);
         assert_eq!(list.items[0].connector, Connector::And);
         assert_eq!(list.items[1].connector, Connector::Or);
@@ -1975,7 +1954,7 @@ mod tests {
 
     #[test]
     fn background_then_command() {
-        let list = parse("sleep 1 & echo done", 0).unwrap().unwrap();
+        let list = parse("sleep 1 & echo done", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items.len(), 2);
         assert!(list.items[0].pipeline.background);
         assert!(!list.items[1].pipeline.background);
@@ -1984,72 +1963,72 @@ mod tests {
 
     #[test]
     fn leading_semi_skipped() {
-        let list = parse("; echo hello", 0).unwrap().unwrap();
+        let list = parse("; echo hello", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items.len(), 1);
         assert_eq!(list.items[0].pipeline.commands[0].args[0], "echo");
     }
 
     #[test]
     fn trailing_semi_ok() {
-        let list = parse("echo hello ;", 0).unwrap().unwrap();
+        let list = parse("echo hello ;", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items.len(), 1);
     }
 
     #[test]
     fn double_semi_skipped() {
-        let list = parse("echo a ;; echo b", 0).unwrap().unwrap();
+        let list = parse("echo a ;; echo b", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items.len(), 2);
     }
 
     #[test]
     fn only_semicolons() {
-        assert!(parse(";;;", 0).unwrap().is_none());
+        assert!(parse(";;;", 0, &[]).unwrap().is_none());
     }
 
     #[test]
     fn err_leading_and() {
-        assert_eq!(parse("&& cmd", 0), Err(ParseError::EmptyPipelineSegment));
+        assert_eq!(parse("&& cmd", 0, &[]), Err(ParseError::EmptyPipelineSegment));
     }
 
     #[test]
     fn err_trailing_and() {
-        assert_eq!(parse("cmd &&", 0), Err(ParseError::IncompleteInput));
+        assert_eq!(parse("cmd &&", 0, &[]), Err(ParseError::IncompleteInput));
     }
 
     #[test]
     fn err_leading_or() {
         // `||` at start: first `||` is Or token, empty pipeline before it
-        assert_eq!(parse("|| cmd", 0), Err(ParseError::EmptyPipelineSegment));
+        assert_eq!(parse("|| cmd", 0, &[]), Err(ParseError::EmptyPipelineSegment));
     }
 
     #[test]
     fn err_trailing_or() {
-        assert_eq!(parse("cmd ||", 0), Err(ParseError::IncompleteInput));
+        assert_eq!(parse("cmd ||", 0, &[]), Err(ParseError::IncompleteInput));
     }
 
     // ── エスケープテスト ──
 
     #[test]
     fn escape_double_quote_in_dquote() {
-        let list = parse(r#"echo "hello\"world""#, 0).unwrap().unwrap();
+        let list = parse(r#"echo "hello\"world""#, 0, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "hello\"world");
     }
 
     #[test]
     fn escape_backslash_in_dquote() {
-        let list = parse(r#"echo "a\\b""#, 0).unwrap().unwrap();
+        let list = parse(r#"echo "a\\b""#, 0, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "a\\b");
     }
 
     #[test]
     fn escape_dollar_in_dquote() {
-        let list = parse(r#"echo "\$HOME""#, 0).unwrap().unwrap();
+        let list = parse(r#"echo "\$HOME""#, 0, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "$HOME");
     }
 
     #[test]
     fn escape_space_in_bare_word() {
-        let list = parse(r"echo file\ name", 0).unwrap().unwrap();
+        let list = parse(r"echo file\ name", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "file name");
     }
 
@@ -2058,7 +2037,7 @@ mod tests {
     #[test]
     fn expand_braced_var() {
         std::env::set_var("RUSH_TEST_BRACE", "braced");
-        let list = parse("echo ${RUSH_TEST_BRACE}", 0).unwrap().unwrap();
+        let list = parse("echo ${RUSH_TEST_BRACE}", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "braced");
         std::env::remove_var("RUSH_TEST_BRACE");
     }
@@ -2066,7 +2045,7 @@ mod tests {
     #[test]
     fn expand_braced_var_with_suffix() {
         std::env::set_var("RUSH_TEST_BSUF", "val");
-        let list = parse("echo ${RUSH_TEST_BSUF}suffix", 0).unwrap().unwrap();
+        let list = parse("echo ${RUSH_TEST_BSUF}suffix", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "valsuffix");
         std::env::remove_var("RUSH_TEST_BSUF");
     }
@@ -2074,14 +2053,14 @@ mod tests {
     #[test]
     fn expand_braced_undefined() {
         std::env::remove_var("RUSH_TEST_BUNDEF_XYZ");
-        let list = parse("echo ${RUSH_TEST_BUNDEF_XYZ}", 0).unwrap().unwrap();
+        let list = parse("echo ${RUSH_TEST_BUNDEF_XYZ}", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "");
     }
 
     #[test]
     fn braced_unclosed() {
         // `${` without closing `}` → literal "${" then rest
-        let list = parse("echo ${abc", 0).unwrap().unwrap();
+        let list = parse("echo ${abc", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "${abc");
     }
 
@@ -2119,21 +2098,21 @@ mod tests {
 
     #[test]
     fn fd_dup_2_to_1() {
-        let list = parse("cmd 2>&1", 0).unwrap().unwrap();
+        let list = parse("cmd 2>&1", 0, &[]).unwrap().unwrap();
         let r = &list.items[0].pipeline.commands[0].redirects[0];
         assert_eq!(r.kind, RedirectKind::FdDup { src_fd: 2, dst_fd: 1 });
     }
 
     #[test]
     fn fd_dup_stdout_to_stderr() {
-        let list = parse("cmd >&2", 0).unwrap().unwrap();
+        let list = parse("cmd >&2", 0, &[]).unwrap().unwrap();
         let r = &list.items[0].pipeline.commands[0].redirects[0];
         assert_eq!(r.kind, RedirectKind::FdDup { src_fd: 1, dst_fd: 2 });
     }
 
     #[test]
     fn fd_dup_with_file_redirect() {
-        let list = parse("cmd > out 2>&1", 0).unwrap().unwrap();
+        let list = parse("cmd > out 2>&1", 0, &[]).unwrap().unwrap();
         let redirects = &list.items[0].pipeline.commands[0].redirects;
         assert_eq!(redirects.len(), 2);
         assert_eq!(redirects[0].kind, RedirectKind::Output);
@@ -2143,32 +2122,32 @@ mod tests {
 
     #[test]
     fn fd_dup_bad_target() {
-        assert_eq!(parse("cmd 2>&abc", 0), Err(ParseError::BadFdRedirect));
+        assert_eq!(parse("cmd 2>&abc", 0, &[]), Err(ParseError::BadFdRedirect));
     }
 
     // ── コマンド置換パススルーテスト ──
 
     #[test]
     fn cmd_sub_passthrough() {
-        let list = parse("echo $(date)", 0).unwrap().unwrap();
+        let list = parse("echo $(date)", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "$(date)");
     }
 
     #[test]
     fn backtick_passthrough() {
-        let list = parse("echo `date`", 0).unwrap().unwrap();
+        let list = parse("echo `date`", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "`date`");
     }
 
     #[test]
     fn cmd_sub_nested() {
-        let list = parse("echo $(echo $(whoami))", 0).unwrap().unwrap();
+        let list = parse("echo $(echo $(whoami))", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "$(echo $(whoami))");
     }
 
     #[test]
     fn cmd_sub_in_double_quotes() {
-        let list = parse("echo \"today is $(date)\"", 0).unwrap().unwrap();
+        let list = parse("echo \"today is $(date)\"", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "today is $(date)");
     }
 
@@ -2177,11 +2156,11 @@ mod tests {
     #[test]
     fn param_default() {
         std::env::remove_var("RUSH_TEST_PDEF");
-        let list = parse("echo ${RUSH_TEST_PDEF:-hello}", 0).unwrap().unwrap();
+        let list = parse("echo ${RUSH_TEST_PDEF:-hello}", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "hello");
 
         std::env::set_var("RUSH_TEST_PDEF", "world");
-        let list = parse("echo ${RUSH_TEST_PDEF:-hello}", 0).unwrap().unwrap();
+        let list = parse("echo ${RUSH_TEST_PDEF:-hello}", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "world");
         std::env::remove_var("RUSH_TEST_PDEF");
     }
@@ -2189,11 +2168,11 @@ mod tests {
     #[test]
     fn param_alt() {
         std::env::remove_var("RUSH_TEST_PALT");
-        let list = parse("echo ${RUSH_TEST_PALT:+yes}", 0).unwrap().unwrap();
+        let list = parse("echo ${RUSH_TEST_PALT:+yes}", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "");
 
         std::env::set_var("RUSH_TEST_PALT", "val");
-        let list = parse("echo ${RUSH_TEST_PALT:+yes}", 0).unwrap().unwrap();
+        let list = parse("echo ${RUSH_TEST_PALT:+yes}", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "yes");
         std::env::remove_var("RUSH_TEST_PALT");
     }
@@ -2201,7 +2180,7 @@ mod tests {
     #[test]
     fn param_length() {
         std::env::set_var("RUSH_TEST_PLEN", "hello");
-        let list = parse("echo ${#RUSH_TEST_PLEN}", 0).unwrap().unwrap();
+        let list = parse("echo ${#RUSH_TEST_PLEN}", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "5");
         std::env::remove_var("RUSH_TEST_PLEN");
     }
@@ -2209,9 +2188,9 @@ mod tests {
     #[test]
     fn param_strip_suffix() {
         std::env::set_var("RUSH_TEST_PSUF", "hello.tar.gz");
-        let list = parse("echo ${RUSH_TEST_PSUF%.*}", 0).unwrap().unwrap();
+        let list = parse("echo ${RUSH_TEST_PSUF%.*}", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "hello.tar");
-        let list = parse("echo ${RUSH_TEST_PSUF%%.*}", 0).unwrap().unwrap();
+        let list = parse("echo ${RUSH_TEST_PSUF%%.*}", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "hello");
         std::env::remove_var("RUSH_TEST_PSUF");
     }
@@ -2219,9 +2198,9 @@ mod tests {
     #[test]
     fn param_strip_prefix() {
         std::env::set_var("RUSH_TEST_PPRE", "/usr/local/bin");
-        let list = parse("echo ${RUSH_TEST_PPRE#*/}", 0).unwrap().unwrap();
+        let list = parse("echo ${RUSH_TEST_PPRE#*/}", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "usr/local/bin");
-        let list = parse("echo ${RUSH_TEST_PPRE##*/}", 0).unwrap().unwrap();
+        let list = parse("echo ${RUSH_TEST_PPRE##*/}", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "bin");
         std::env::remove_var("RUSH_TEST_PPRE");
     }
@@ -2229,9 +2208,9 @@ mod tests {
     #[test]
     fn param_replace() {
         std::env::set_var("RUSH_TEST_PREP", "hello world hello");
-        let list = parse("echo ${RUSH_TEST_PREP/hello/bye}", 0).unwrap().unwrap();
+        let list = parse("echo ${RUSH_TEST_PREP/hello/bye}", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "bye world hello");
-        let list = parse("echo ${RUSH_TEST_PREP//hello/bye}", 0).unwrap().unwrap();
+        let list = parse("echo ${RUSH_TEST_PREP//hello/bye}", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "bye world bye");
         std::env::remove_var("RUSH_TEST_PREP");
     }
@@ -2240,46 +2219,46 @@ mod tests {
 
     #[test]
     fn arith_basic() {
-        let list = parse("echo $((1+2))", 0).unwrap().unwrap();
+        let list = parse("echo $((1+2))", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "3");
     }
 
     #[test]
     fn arith_precedence() {
-        let list = parse("echo $((2+3*4))", 0).unwrap().unwrap();
+        let list = parse("echo $((2+3*4))", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "14");
     }
 
     #[test]
     fn arith_parens() {
-        let list = parse("echo $((2*(3+4)))", 0).unwrap().unwrap();
+        let list = parse("echo $((2*(3+4)))", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "14");
     }
 
     #[test]
     fn arith_div_mod() {
-        let list = parse("echo $((10/3))", 0).unwrap().unwrap();
+        let list = parse("echo $((10/3))", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "3");
-        let list = parse("echo $((10%3))", 0).unwrap().unwrap();
+        let list = parse("echo $((10%3))", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "1");
     }
 
     #[test]
     fn arith_negative() {
-        let list = parse("echo $((-5+3))", 0).unwrap().unwrap();
+        let list = parse("echo $((-5+3))", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "-2");
     }
 
     #[test]
     fn arith_spaces() {
-        let list = parse("echo $(( 10 + 20 ))", 0).unwrap().unwrap();
+        let list = parse("echo $(( 10 + 20 ))", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "30");
     }
 
     #[test]
     fn arith_variable() {
         std::env::set_var("RUSH_TEST_ARITH", "7");
-        let list = parse("echo $((RUSH_TEST_ARITH+3))", 0).unwrap().unwrap();
+        let list = parse("echo $((RUSH_TEST_ARITH+3))", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "10");
         std::env::remove_var("RUSH_TEST_ARITH");
     }
@@ -2287,14 +2266,14 @@ mod tests {
     #[test]
     fn arith_dollar_variable() {
         std::env::set_var("RUSH_TEST_ARITH2", "5");
-        let list = parse("echo $(($RUSH_TEST_ARITH2*2))", 0).unwrap().unwrap();
+        let list = parse("echo $(($RUSH_TEST_ARITH2*2))", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "10");
         std::env::remove_var("RUSH_TEST_ARITH2");
     }
 
     #[test]
     fn arith_in_double_quotes() {
-        let list = parse("echo \"result=$((1+2))\"", 0).unwrap().unwrap();
+        let list = parse("echo \"result=$((1+2))\"", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "result=3");
     }
 
@@ -2302,24 +2281,24 @@ mod tests {
 
     #[test]
     fn incomplete_trailing_pipe() {
-        assert_eq!(parse("ls |", 0), Err(ParseError::IncompleteInput));
+        assert_eq!(parse("ls |", 0, &[]), Err(ParseError::IncompleteInput));
         // 継続入力後の再パースは成功する
-        let list = parse("ls |\ngrep foo", 0).unwrap().unwrap();
+        let list = parse("ls |\ngrep foo", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands.len(), 2);
     }
 
     #[test]
     fn incomplete_trailing_and() {
-        assert_eq!(parse("true &&", 0), Err(ParseError::IncompleteInput));
-        let list = parse("true &&\necho ok", 0).unwrap().unwrap();
+        assert_eq!(parse("true &&", 0, &[]), Err(ParseError::IncompleteInput));
+        let list = parse("true &&\necho ok", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items.len(), 2);
         assert_eq!(list.items[0].connector, Connector::And);
     }
 
     #[test]
     fn incomplete_trailing_or() {
-        assert_eq!(parse("false ||", 0), Err(ParseError::IncompleteInput));
-        let list = parse("false ||\necho ok", 0).unwrap().unwrap();
+        assert_eq!(parse("false ||", 0, &[]), Err(ParseError::IncompleteInput));
+        let list = parse("false ||\necho ok", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items.len(), 2);
         assert_eq!(list.items[0].connector, Connector::Or);
     }
@@ -2327,15 +2306,15 @@ mod tests {
     #[test]
     fn multiline_quoted_string() {
         // 最初のパースは UnterminatedQuote
-        assert!(matches!(parse("echo \"hello", 0), Err(ParseError::UnterminatedQuote('"'))));
+        assert!(matches!(parse("echo \"hello", 0, &[]), Err(ParseError::UnterminatedQuote('"'))));
         // 継続入力後は成功
-        let list = parse("echo \"hello\nworld\"", 0).unwrap().unwrap();
+        let list = parse("echo \"hello\nworld\"", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "hello\nworld");
     }
 
     #[test]
     fn inline_assignment_only() {
-        let list = parse("FOO=bar", 0).unwrap().unwrap();
+        let list = parse("FOO=bar", 0, &[]).unwrap().unwrap();
         let cmd = &list.items[0].pipeline.commands[0];
         assert!(cmd.args.is_empty());
         assert_eq!(cmd.assignments, vec![("FOO".to_string(), "bar".to_string())]);
@@ -2343,7 +2322,7 @@ mod tests {
 
     #[test]
     fn inline_assignment_with_command() {
-        let list = parse("FOO=bar echo hello", 0).unwrap().unwrap();
+        let list = parse("FOO=bar echo hello", 0, &[]).unwrap().unwrap();
         let cmd = &list.items[0].pipeline.commands[0];
         assert_eq!(cmd.args[0], "echo");
         assert_eq!(cmd.args[1], "hello");
@@ -2352,7 +2331,7 @@ mod tests {
 
     #[test]
     fn multiple_assignments() {
-        let list = parse("A=1 B=2 cmd", 0).unwrap().unwrap();
+        let list = parse("A=1 B=2 cmd", 0, &[]).unwrap().unwrap();
         let cmd = &list.items[0].pipeline.commands[0];
         assert_eq!(cmd.args[0], "cmd");
         assert_eq!(cmd.assignments.len(), 2);
@@ -2363,7 +2342,7 @@ mod tests {
     #[test]
     fn assignment_not_after_command() {
         // FOO=bar should not be treated as assignment when after a command word
-        let list = parse("echo FOO=bar", 0).unwrap().unwrap();
+        let list = parse("echo FOO=bar", 0, &[]).unwrap().unwrap();
         let cmd = &list.items[0].pipeline.commands[0];
         assert!(cmd.assignments.is_empty());
         assert_eq!(cmd.args[1], "FOO=bar");
@@ -2374,40 +2353,29 @@ mod tests {
     #[test]
     fn dollar_1_no_positional() {
         // $1 with no positional args → empty
-        let list = parse("echo $1", 0).unwrap().unwrap();
+        let list = parse("echo $1", 0, &[]).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "");
     }
 
     #[test]
     fn dollar_1_with_positional() {
-        std::env::set_var("_RUSH_POS_COUNT", "2");
-        std::env::set_var("_RUSH_POS_1", "hello");
-        std::env::set_var("_RUSH_POS_2", "world");
-        let list = parse("echo $1 $2", 0).unwrap().unwrap();
+        let args = vec!["hello".to_string(), "world".to_string()];
+        let list = parse("echo $1 $2", 0, &args).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "hello");
         assert_eq!(list.items[0].pipeline.commands[0].args[2], "world");
-        std::env::remove_var("_RUSH_POS_COUNT");
-        std::env::remove_var("_RUSH_POS_1");
-        std::env::remove_var("_RUSH_POS_2");
     }
 
     #[test]
     fn dollar_hash_count() {
-        std::env::set_var("_RUSH_POS_COUNT", "3");
-        let list = parse("echo $#", 0).unwrap().unwrap();
+        let args = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let list = parse("echo $#", 0, &args).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "3");
-        std::env::remove_var("_RUSH_POS_COUNT");
     }
 
     #[test]
     fn dollar_star_all_args() {
-        std::env::set_var("_RUSH_POS_COUNT", "2");
-        std::env::set_var("_RUSH_POS_1", "a");
-        std::env::set_var("_RUSH_POS_2", "b");
-        let list = parse("echo $*", 0).unwrap().unwrap();
+        let args = vec!["a".to_string(), "b".to_string()];
+        let list = parse("echo $*", 0, &args).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "a b");
-        std::env::remove_var("_RUSH_POS_COUNT");
-        std::env::remove_var("_RUSH_POS_1");
-        std::env::remove_var("_RUSH_POS_2");
     }
 }

@@ -281,7 +281,7 @@ fn execute_capture(cmd_str: &str, shell: &mut Shell) -> String {
             libc::signal(libc::SIGINT, libc::SIG_DFL);
             libc::signal(libc::SIGTSTP, libc::SIG_DFL);
         }
-        match parser::parse(cmd_str, shell.last_status) {
+        match parser::parse(cmd_str, shell.last_status, &shell.positional_args) {
             Ok(Some(list)) => {
                 let status = execute(shell, &list, cmd_str);
                 std::process::exit(status);
@@ -1301,7 +1301,7 @@ pub fn execute_case_block(shell: &mut Shell, block: &str) -> i32 {
 fn expand_case_word(word: &str, shell: &mut Shell) -> String {
     // パーサーで変数展開を行う（echo WORD をパースして展開済み引数を取得）
     let synthetic = format!("echo {}", word);
-    if let Ok(Some(list)) = parser::parse(&synthetic, shell.last_status) {
+    if let Ok(Some(list)) = parser::parse(&synthetic, shell.last_status, &shell.positional_args) {
         if let Some(cmd) = list.items.first() {
             if let Some(arg) = cmd.pipeline.commands[0].args.get(1) {
                 let cow_args = vec![arg.clone()];
@@ -1462,32 +1462,9 @@ pub fn collect_function_body(lines: &[&str], start: usize, initial_rest: &str) -
 pub fn execute_function(shell: &mut Shell, body: &str, args: &[&str]) -> i32 {
     // 位置パラメータを保存
     let saved_positional = shell.positional_args.clone();
-    let saved_env: Vec<(String, Option<String>)> = {
-        let count = std::env::var("_RUSH_POS_COUNT").ok();
-        let mut saved = vec![("_RUSH_POS_COUNT".to_string(), count)];
-        let old_count: usize = saved[0].1.as_ref()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-        for i in 1..=old_count.max(args.len()) {
-            let key = format!("_RUSH_POS_{}", i);
-            saved.push((key.clone(), std::env::var(&key).ok()));
-        }
-        saved
-    };
 
     // 新しい位置パラメータを設定
     shell.positional_args = args.iter().map(|s| s.to_string()).collect();
-    std::env::set_var("_RUSH_POS_COUNT", args.len().to_string());
-    for (i, arg) in args.iter().enumerate() {
-        std::env::set_var(format!("_RUSH_POS_{}", i + 1), arg);
-    }
-    // 余分な古い位置パラメータを削除
-    let old_count: usize = saved_env[0].1.as_ref()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    for i in (args.len() + 1)..=old_count {
-        std::env::remove_var(format!("_RUSH_POS_{}", i));
-    }
 
     // source_depth を上げて return を有効にする
     shell.source_depth += 1;
@@ -1499,12 +1476,6 @@ pub fn execute_function(shell: &mut Shell, body: &str, args: &[&str]) -> i32 {
 
     // 位置パラメータを復元
     shell.positional_args = saved_positional;
-    for (key, val) in saved_env {
-        match val {
-            Some(v) => std::env::set_var(&key, &v),
-            None => std::env::remove_var(&key),
-        }
-    }
 
     status
 }
@@ -1864,7 +1835,7 @@ fn run_command_string(shell: &mut Shell, input: &str) -> i32 {
             continue;
         }
 
-        match parser::parse(trimmed, shell.last_status) {
+        match parser::parse(trimmed, shell.last_status, &shell.positional_args) {
             Ok(Some(list)) => {
                 let cmd_text = trimmed.to_string();
                 last_status = execute(shell, &list, &cmd_text);
@@ -2612,21 +2583,15 @@ mod tests {
     #[test]
     fn execute_function_positional_restore() {
         let mut shell = Shell::new();
-        // Set initial positional args
         shell.positional_args = vec!["outer1".to_string()];
-        std::env::set_var("_RUSH_POS_COUNT", "1");
-        std::env::set_var("_RUSH_POS_1", "outer1");
 
         let body = "export RUSH_FN_POS=$1";
         execute_function(&mut shell, body, &["inner1"]);
 
         // After function, positional args should be restored
         assert_eq!(shell.positional_args, vec!["outer1".to_string()]);
-        assert_eq!(std::env::var("_RUSH_POS_1").unwrap(), "outer1");
 
         std::env::remove_var("RUSH_FN_POS");
-        std::env::remove_var("_RUSH_POS_COUNT");
-        std::env::remove_var("_RUSH_POS_1");
     }
 
     #[test]

@@ -399,7 +399,7 @@ fn run_string(shell: &mut Shell, input: &str) {
             continue;
         }
 
-        match parser::parse(&expanded, shell.last_status) {
+        match parser::parse(&expanded, shell.last_status, &shell.positional_args) {
             Ok(Some(mut list)) => {
                 // ヒアドキュメントの本文を収集
                 let delims = parser::heredoc_delimiters(&list);
@@ -717,7 +717,7 @@ fn main() {
                     }
 
                     // パース: 不完全入力なら `> ` プロンプトで継続行を読み取る
-                    match parser::parse(&accumulated, shell.last_status) {
+                    match parser::parse(&accumulated, shell.last_status, &shell.positional_args) {
                         Ok(Some(mut list)) => {
                             // ヒアドキュメントの本文を対話的に収集
                             let delims = parser::heredoc_delimiters(&list);
