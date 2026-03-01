@@ -46,7 +46,8 @@ pub fn is_builtin(name: &str) -> bool {
                  | "pushd" | "popd" | "dirs"
                  | "trap"
                  | "break" | "continue"
-                 | "local" | "shift")
+                 | "local" | "shift"
+                 | "set")
 }
 
 /// ビルトインコマンドの実行を試みる。
@@ -90,6 +91,7 @@ pub fn try_exec(shell: &mut Shell, args: &[&str], stdout: &mut dyn Write) -> Opt
         "trap" => Some(builtin_trap(shell, args, stdout)),
         "local" => Some(builtin_local(args)),
         "shift" => Some(builtin_shift(shell, args)),
+        "set" => Some(builtin_set(shell, args, stdout)),
         _ => None,
     }
 }
@@ -802,7 +804,7 @@ fn builtin_source(shell: &mut Shell, args: &[&str]) -> i32 {
             continue;
         }
 
-        match parser::parse(trimmed, shell.last_status, &shell.positional_args) {
+        match parser::parse(trimmed, shell.last_status, &shell.positional_args, shell.set_nounset) {
             Ok(Some(list)) => {
                 let cmd_text = trimmed.to_string();
                 shell.last_status = executor::execute(shell, &list, &cmd_text);
@@ -1271,6 +1273,69 @@ fn builtin_shift(shell: &mut Shell, args: &[&str]) -> i32 {
     0
 }
 
+/// `set` — シェルオプションの設定・解除・表示。
+///
+/// 対応オプション:
+/// - `-e` / `+e` — errexit
+/// - `-u` / `+u` — nounset
+/// - `-o pipefail` / `+o pipefail` — pipefail
+/// - 複合フラグ: `-eu` → errexit + nounset 両方 ON
+/// - `-o` 単独 / 引数なし → 現在の設定を表示
+fn builtin_set(shell: &mut Shell, args: &[&str], stdout: &mut dyn Write) -> i32 {
+    if args.len() <= 1 {
+        // 引数なし → 現在の設定表示
+        let _ = writeln!(stdout, "errexit\t\t{}", if shell.set_errexit { "on" } else { "off" });
+        let _ = writeln!(stdout, "nounset\t\t{}", if shell.set_nounset { "on" } else { "off" });
+        let _ = writeln!(stdout, "pipefail\t{}", if shell.set_pipefail { "on" } else { "off" });
+        return 0;
+    }
+
+    let mut i = 1;
+    while i < args.len() {
+        let arg = args[i];
+        match arg {
+            "-o" | "+o" => {
+                let enable = arg.starts_with('-');
+                if i + 1 < args.len() {
+                    match args[i + 1] {
+                        "pipefail" => shell.set_pipefail = enable,
+                        name => {
+                            eprintln!("rush: set: {}: invalid option name", name);
+                            return 1;
+                        }
+                    }
+                    i += 2;
+                } else {
+                    // `-o` 単独 → 設定表示
+                    let _ = writeln!(stdout, "errexit\t\t{}", if shell.set_errexit { "on" } else { "off" });
+                    let _ = writeln!(stdout, "nounset\t\t{}", if shell.set_nounset { "on" } else { "off" });
+                    let _ = writeln!(stdout, "pipefail\t{}", if shell.set_pipefail { "on" } else { "off" });
+                    i += 1;
+                }
+            }
+            _ if arg.starts_with('-') || arg.starts_with('+') => {
+                let enable = arg.starts_with('-');
+                for ch in arg[1..].chars() {
+                    match ch {
+                        'e' => shell.set_errexit = enable,
+                        'u' => shell.set_nounset = enable,
+                        _ => {
+                            eprintln!("rush: set: -{}: invalid option", ch);
+                            return 1;
+                        }
+                    }
+                }
+                i += 1;
+            }
+            _ => {
+                eprintln!("rush: set: {}: invalid argument", arg);
+                return 1;
+            }
+        }
+    }
+    0
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1681,5 +1746,56 @@ mod tests {
         assert_eq!(status, 0);
         let output = String::from_utf8(buf).unwrap();
         assert!(!output.trim().is_empty());
+    }
+
+    // ── set ビルトイン ──
+
+    #[test]
+    fn set_errexit_flag() {
+        let mut shell = Shell::new();
+        let mut buf = Vec::new();
+        builtin_set(&mut shell, &["set", "-e"], &mut buf);
+        assert!(shell.set_errexit);
+        builtin_set(&mut shell, &["set", "+e"], &mut buf);
+        assert!(!shell.set_errexit);
+    }
+
+    #[test]
+    fn set_nounset_flag() {
+        let mut shell = Shell::new();
+        let mut buf = Vec::new();
+        builtin_set(&mut shell, &["set", "-u"], &mut buf);
+        assert!(shell.set_nounset);
+        builtin_set(&mut shell, &["set", "+u"], &mut buf);
+        assert!(!shell.set_nounset);
+    }
+
+    #[test]
+    fn set_compound_flags() {
+        let mut shell = Shell::new();
+        let mut buf = Vec::new();
+        builtin_set(&mut shell, &["set", "-eu"], &mut buf);
+        assert!(shell.set_errexit);
+        assert!(shell.set_nounset);
+    }
+
+    #[test]
+    fn set_pipefail_flag() {
+        let mut shell = Shell::new();
+        let mut buf = Vec::new();
+        builtin_set(&mut shell, &["set", "-o", "pipefail"], &mut buf);
+        assert!(shell.set_pipefail);
+        builtin_set(&mut shell, &["set", "+o", "pipefail"], &mut buf);
+        assert!(!shell.set_pipefail);
+    }
+
+    #[test]
+    fn set_display_options() {
+        let mut shell = Shell::new();
+        shell.set_errexit = true;
+        let mut buf = Vec::new();
+        builtin_set(&mut shell, &["set", "-o"], &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains("errexit"));
     }
 }

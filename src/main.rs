@@ -355,7 +355,7 @@ fn run_string(shell: &mut Shell, input: &str) {
             let (block, next_i) = executor::collect_if_block(&lines, i - 1);
             shell.last_status = executor::execute_if_block(shell, &block);
             i = next_i;
-            if shell.should_exit {
+            if shell.should_exit || shell.errexit_pending {
                 break;
             }
             continue;
@@ -374,7 +374,7 @@ fn run_string(shell: &mut Shell, input: &str) {
                     shell, &block, executor::starts_with_until(&expanded));
             }
             i = next_i;
-            if shell.should_exit {
+            if shell.should_exit || shell.errexit_pending {
                 break;
             }
             continue;
@@ -385,7 +385,7 @@ fn run_string(shell: &mut Shell, input: &str) {
             let (block, next_i) = executor::collect_case_block(&lines, i - 1);
             shell.last_status = executor::execute_case_block(shell, &block);
             i = next_i;
-            if shell.should_exit {
+            if shell.should_exit || shell.errexit_pending {
                 break;
             }
             continue;
@@ -399,7 +399,7 @@ fn run_string(shell: &mut Shell, input: &str) {
             continue;
         }
 
-        match parser::parse(&expanded, shell.last_status, &shell.positional_args) {
+        match parser::parse(&expanded, shell.last_status, &shell.positional_args, shell.set_nounset) {
             Ok(Some(mut list)) => {
                 // ヒアドキュメントの本文を収集
                 let delims = parser::heredoc_delimiters(&list);
@@ -431,7 +431,7 @@ fn run_string(shell: &mut Shell, input: &str) {
                 shell.last_status = 2;
             }
         }
-        if shell.should_exit {
+        if shell.should_exit || shell.errexit_pending {
             break;
         }
     }
@@ -717,7 +717,7 @@ fn main() {
                     }
 
                     // パース: 不完全入力なら `> ` プロンプトで継続行を読み取る
-                    match parser::parse(&accumulated, shell.last_status, &shell.positional_args) {
+                    match parser::parse(&accumulated, shell.last_status, &shell.positional_args, shell.set_nounset) {
                         Ok(Some(mut list)) => {
                             // ヒアドキュメントの本文を対話的に収集
                             let delims = parser::heredoc_delimiters(&list);
@@ -777,6 +777,8 @@ fn main() {
             }
         }
 
+        // インタラクティブモードでは errexit で終了しない
+        shell.errexit_pending = false;
         if shell.should_exit {
             break;
         }

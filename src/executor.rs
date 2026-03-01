@@ -281,7 +281,7 @@ fn execute_capture(cmd_str: &str, shell: &mut Shell) -> String {
             libc::signal(libc::SIGINT, libc::SIG_DFL);
             libc::signal(libc::SIGTSTP, libc::SIG_DFL);
         }
-        match parser::parse(cmd_str, shell.last_status, &shell.positional_args) {
+        match parser::parse(cmd_str, shell.last_status, &shell.positional_args, shell.set_nounset) {
             Ok(Some(list)) => {
                 let status = execute(shell, &list, cmd_str);
                 std::process::exit(status);
@@ -364,18 +364,35 @@ pub fn execute(shell: &mut Shell, list: &CommandList<'_>, cmd_text: &str) -> i32
     job::reap_jobs(&mut shell.jobs);
 
     let mut last_status = 0;
+    let mut in_cond_chain = false;
 
     for (i, item) in list.items.iter().enumerate() {
         // 前の接続子に基づく条件判定
         if i > 0 {
             match list.items[i - 1].connector {
-                Connector::And if last_status != 0 => continue,
-                Connector::Or if last_status == 0 => continue,
+                Connector::And if last_status != 0 => {
+                    in_cond_chain = true;
+                    continue;
+                }
+                Connector::Or if last_status == 0 => {
+                    in_cond_chain = true;
+                    continue;
+                }
                 _ => {}
             }
         }
 
         last_status = execute_pipeline(shell, &item.pipeline, cmd_text);
+
+        // errexit チェック
+        if shell.set_errexit && last_status != 0 && shell.in_condition == 0 {
+            let next_is_cond = matches!(item.connector, Connector::And | Connector::Or);
+            if !in_cond_chain && !next_is_cond {
+                shell.errexit_pending = true;
+                break;
+            }
+        }
+        in_cond_chain = matches!(item.connector, Connector::And | Connector::Or);
     }
 
     last_status
@@ -831,7 +848,11 @@ fn execute_job(shell: &mut Shell, pipeline: &Pipeline<'_>, cmd_text: &str) -> i3
         eprintln!("[{}] {}", job_id, pgid);
         0
     } else {
-        // フォアグラウンド: ターミナル制御を渡して待機
+        // フォアグラウンド: ジョブテーブルに一時登録して待機
+        let job_id = shell
+            .jobs
+            .insert(pgid, display_cmd.to_string(), active_pids.to_vec());
+
         job::give_terminal_to(shell.terminal_fd, pgid);
 
         let (status, stopped) = job::wait_for_fg(&mut shell.jobs, pgid);
@@ -840,20 +861,26 @@ fn execute_job(shell: &mut Shell, pipeline: &Pipeline<'_>, cmd_text: &str) -> i3
         job::take_terminal_back(shell.terminal_fd, shell.shell_pgid);
 
         if stopped {
-            // Ctrl+Z で停止: ジョブテーブルに追加
-            let job_id = shell
-                .jobs
-                .insert(pgid, display_cmd.to_string(), active_pids.to_vec());
-            // 停止状態をマーク（insert 後のプロセスは stopped=false なので更新する）
+            // Ctrl+Z で停止: ジョブテーブルに残す。停止状態をマーク
             if let Some(job) = shell.jobs.get_mut(job_id) {
                 for proc in &mut job.processes {
                     proc.stopped = true;
                 }
             }
             eprintln!("\n[{}]+  Stopped   {}", job_id, display_cmd);
+            status
+        } else {
+            // 完了: pipefail 判定後にジョブテーブルから削除
+            let final_status = if shell.set_pipefail {
+                shell.jobs.get(job_id)
+                    .map(|j| j.pipefail_status())
+                    .unwrap_or(status)
+            } else {
+                status
+            };
+            shell.jobs.remove_job(job_id);
+            final_status
         }
-
-        status
     }
 }
 
@@ -876,15 +903,21 @@ pub fn execute_if_block(shell: &mut Shell, block: &str) -> i32 {
         }
     };
 
-    // if 条件を評価
+    // if 条件を評価（errexit 免除）
+    shell.in_condition += 1;
     let cond_status = run_command_string(shell, &sections.condition);
+    shell.in_condition -= 1;
+    shell.errexit_pending = false;
     if cond_status == 0 {
         return run_command_string(shell, &sections.then_body);
     }
 
     // elif チェーン
     for (elif_cond, elif_body) in &sections.elif_parts {
+        shell.in_condition += 1;
         let s = run_command_string(shell, elif_cond);
+        shell.in_condition -= 1;
+        shell.errexit_pending = false;
         if s == 0 {
             return run_command_string(shell, elif_body);
         }
@@ -1129,7 +1162,11 @@ pub fn execute_while_block(shell: &mut Shell, block: &str, is_until: bool) -> i3
     shell.loop_depth += 1;
 
     loop {
+        // 条件評価は errexit 免除
+        shell.in_condition += 1;
         let cond_status = run_command_string(shell, &cond);
+        shell.in_condition -= 1;
+        shell.errexit_pending = false;
         let should_run = if is_until { cond_status != 0 } else { cond_status == 0 };
         if !should_run {
             break;
@@ -1301,7 +1338,7 @@ pub fn execute_case_block(shell: &mut Shell, block: &str) -> i32 {
 fn expand_case_word(word: &str, shell: &mut Shell) -> String {
     // パーサーで変数展開を行う（echo WORD をパースして展開済み引数を取得）
     let synthetic = format!("echo {}", word);
-    if let Ok(Some(list)) = parser::parse(&synthetic, shell.last_status, &shell.positional_args) {
+    if let Ok(Some(list)) = parser::parse(&synthetic, shell.last_status, &shell.positional_args, shell.set_nounset) {
         if let Some(cmd) = list.items.first() {
             if let Some(arg) = cmd.pipeline.commands[0].args.get(1) {
                 let cow_args = vec![arg.clone()];
@@ -1787,7 +1824,7 @@ fn run_command_string(shell: &mut Shell, input: &str) -> i32 {
             last_status = execute_if_block(shell, &block);
             shell.last_status = last_status;
             i = next_i;
-            if shell.should_return || shell.should_exit
+            if shell.should_return || shell.should_exit || shell.errexit_pending
                 || shell.break_level > 0 || shell.continue_level > 0
             {
                 return last_status;
@@ -1805,7 +1842,7 @@ fn run_command_string(shell: &mut Shell, input: &str) -> i32 {
             }
             shell.last_status = last_status;
             i = next_i;
-            if shell.should_return || shell.should_exit
+            if shell.should_return || shell.should_exit || shell.errexit_pending
                 || shell.break_level > 0 || shell.continue_level > 0
             {
                 return last_status;
@@ -1819,7 +1856,7 @@ fn run_command_string(shell: &mut Shell, input: &str) -> i32 {
             last_status = execute_case_block(shell, &block);
             shell.last_status = last_status;
             i = next_i;
-            if shell.should_return || shell.should_exit
+            if shell.should_return || shell.should_exit || shell.errexit_pending
                 || shell.break_level > 0 || shell.continue_level > 0
             {
                 return last_status;
@@ -1835,7 +1872,7 @@ fn run_command_string(shell: &mut Shell, input: &str) -> i32 {
             continue;
         }
 
-        match parser::parse(trimmed, shell.last_status, &shell.positional_args) {
+        match parser::parse(trimmed, shell.last_status, &shell.positional_args, shell.set_nounset) {
             Ok(Some(list)) => {
                 let cmd_text = trimmed.to_string();
                 last_status = execute(shell, &list, &cmd_text);
@@ -2616,5 +2653,63 @@ mod tests {
         assert!(body.contains("echo hello"));
         assert!(body.contains("echo world"));
         assert_eq!(next_i, 4);
+    }
+
+    // ── set -e (errexit) ──
+
+    #[test]
+    fn errexit_basic() {
+        let mut shell = Shell::new();
+        shell.set_errexit = true;
+        // `false` は終了ステータス 1 を返す → errexit 発動
+        let list = crate::parser::parse("false", 0, &[], false).unwrap().unwrap();
+        let status = execute(&mut shell, &list, "false");
+        assert_eq!(status, 1);
+        assert!(shell.errexit_pending);
+    }
+
+    #[test]
+    fn errexit_and_chain_exempt() {
+        let mut shell = Shell::new();
+        shell.set_errexit = true;
+        // `false && true` — && チェーン内では errexit 免除
+        let list = crate::parser::parse("false && true", 0, &[], false).unwrap().unwrap();
+        let status = execute(&mut shell, &list, "false && true");
+        assert_eq!(status, 1);
+        assert!(!shell.errexit_pending);
+    }
+
+    #[test]
+    fn errexit_or_chain_exempt() {
+        let mut shell = Shell::new();
+        shell.set_errexit = true;
+        // `false || true` — || チェーン内では errexit 免除
+        let list = crate::parser::parse("false || true", 0, &[], false).unwrap().unwrap();
+        let status = execute(&mut shell, &list, "false || true");
+        assert_eq!(status, 0);
+        assert!(!shell.errexit_pending);
+    }
+
+    #[test]
+    fn errexit_if_condition_exempt() {
+        let mut shell = Shell::new();
+        shell.set_errexit = true;
+        // if 条件内の false は errexit 免除
+        let block = "if false; then\necho yes\nelse\necho no\nfi";
+        let status = execute_if_block(&mut shell, block);
+        assert!(!shell.errexit_pending);
+        // else 分岐が実行され、echo no のステータス 0
+        assert_eq!(status, 0);
+    }
+
+    #[test]
+    fn errexit_while_condition_exempt() {
+        let mut shell = Shell::new();
+        shell.set_errexit = true;
+        // while 条件内の false は errexit 免除、ループに入らない
+        let block = "while false; do\necho body\ndone";
+        let status = execute_while_block(&mut shell, block, false);
+        assert!(!shell.errexit_pending);
+        assert_eq!(status, 0);
     }
 }

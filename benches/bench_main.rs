@@ -57,7 +57,7 @@ fn main() {
     println!("\n--- Parser ---");
 
     results.push(bench("parser", "echo hello", 10_000, || {
-        let _ = rush::parser::parse("echo hello", 0, &[]);
+        let _ = rush::parser::parse("echo hello", 0, &[], false);
     }));
 
     results.push(bench(
@@ -65,12 +65,12 @@ fn main() {
         "echo \"hello $HOME world\"",
         10_000,
         || {
-            let _ = rush::parser::parse("echo \"hello $HOME world\"", 0, &[]);
+            let _ = rush::parser::parse("echo \"hello $HOME world\"", 0, &[], false);
         },
     ));
 
     results.push(bench("parser", "ls | grep Cargo | head -1", 10_000, || {
-        let _ = rush::parser::parse("ls | grep Cargo | head -1", 0, &[]);
+        let _ = rush::parser::parse("ls | grep Cargo | head -1", 0, &[], false);
     }));
 
     results.push(bench(
@@ -78,20 +78,20 @@ fn main() {
         "cat < /dev/null > /dev/null 2> /dev/null",
         10_000,
         || {
-            let _ = rush::parser::parse("cat < /dev/null > /dev/null 2> /dev/null", 0, &[]);
+            let _ = rush::parser::parse("cat < /dev/null > /dev/null 2> /dev/null", 0, &[], false);
         },
     ));
 
     results.push(bench("parser", "sleep 1 &", 10_000, || {
-        let _ = rush::parser::parse("sleep 1 &", 0, &[]);
+        let _ = rush::parser::parse("sleep 1 &", 0, &[], false);
     }));
 
     results.push(bench("parser", "echo hello && echo world", 10_000, || {
-        let _ = rush::parser::parse("echo hello && echo world", 0, &[]);
+        let _ = rush::parser::parse("echo hello && echo world", 0, &[], false);
     }));
 
     results.push(bench("parser", "a || b ; c && d", 10_000, || {
-        let _ = rush::parser::parse("a || b ; c && d", 0, &[]);
+        let _ = rush::parser::parse("a || b ; c && d", 0, &[], false);
     }));
 
     for r in &results {
@@ -141,7 +141,7 @@ fn main() {
     println!("\n--- Full pipeline (parse + spawn + wait) ---");
 
     results.push(bench("full", "/bin/echo hello > /dev/null", 1_000, || {
-        if let Ok(Some(list)) = rush::parser::parse("/bin/echo hello > /dev/null", 0, &[]) {
+        if let Ok(Some(list)) = rush::parser::parse("/bin/echo hello > /dev/null", 0, &[], false) {
             rush::executor::execute(&mut shell, &list, "/bin/echo hello > /dev/null");
         }
     }));

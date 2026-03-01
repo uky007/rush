@@ -75,16 +75,16 @@
 
 | モジュール | 責務 | 高速化手法 |
 |-----------|------|-----------|
-| `parser` | 入力をAST（コマンド列）に変換。変数展開、パラメータ展開、位置パラメータ（`$1`〜`$9`, `$@`, `$*`, `$#`）、算術展開、継続行検出 | ゼロコピー (`Cow::Borrowed`)、位置パラメータ直接スライス渡し |
+| `parser` | 入力をAST（コマンド列）に変換。変数展開、パラメータ展開、位置パラメータ（`$1`〜`$9`, `$@`, `$*`, `$#`）、算術展開、継続行検出、`set -u` 未定義変数検出 | ゼロコピー (`Cow::Borrowed`)、位置パラメータ直接スライス渡し |
 | `executor` | コマンド実行・パイプライン接続・`if`/`elif`/`else`/`fi`・`for`/`while`/`until` ループ・`case`/`esac`・関数定義/実行。展開パイプライン: コマンド置換 → チルダ → ブレース → glob | ビルトイン in-process、スタック配列 |
 | `spawn` | 外部コマンドの起動 (`posix_spawnp`)。fd 複製 (`2>&1`) 対応 | fork+exec 回避、RAII ラッパー |
-| `builtins` | cd, pwd, echo, export, unset, source, read, exec, wait, type, command, builtin 等 32 種 | fork 不要、直接実行 |
+| `builtins` | cd, pwd, echo, export, unset, source, read, exec, wait, type, command, builtin, set 等 33 種 | fork 不要、直接実行 |
 | `job` | ジョブコントロール (bg/fg/jobs/wait) | waitpid 手動 reap |
 | `editor` | 行編集 (raw モード、Ctrl+R 逆方向検索、Tab 補完、シンタックスハイライト) | libc 直接操作、1 回の write(2) |
 | `highlight` | シンタックスハイライト・PATH キャッシュ | HashSet キャッシュ、変更検出 |
 | `complete` | Tab 補完（コマンド名、ファイル名、`&&`/`||`/`;` 後のコマンド位置認識） | PATH キャッシュ共有 |
 | `history` | コマンド履歴 (~/.rush_history)、逆方向検索、ナビゲーション | 追記モード永続化 |
-| `shell` | シェルのグローバル状態（エイリアスマップ、関数マップ、位置パラメータ） | PATH キャッシュ統合 |
+| `shell` | シェルのグローバル状態（エイリアスマップ、関数マップ、位置パラメータ、シェルオプション `errexit`/`nounset`/`pipefail`） | PATH キャッシュ統合 |
 
 ## Implementation Phases
 
@@ -181,6 +181,14 @@
 - **`builtin_shift()` 簡素化**: 環境変数同期ロジックを削除（~8行削減）
 - **CWD 依存テストの排他制御**: `set_current_dir()` を使うテスト群に `Mutex` ロックを追加し、並列実行時の競合を防止
 - **テストスイート安定化**: 274テストが並列実行で安定パス（10回連続で再現性確認済み）
+
+### Phase 12: Shell Options (`set -e` / `set -u` / `set -o pipefail`) ✅
+- **`set` ビルトイン**: `set -e`/`+e`（errexit）、`set -u`/`+u`（nounset）、`set -o pipefail`/`+o pipefail`、複合フラグ（`-eu`）、`set -o` で現在の設定表示
+- **`set -e`（errexit）**: コマンド失敗時にシェルを終了。`&&`/`||` チェーン内は免除、`if`/`while`/`until` 条件評価中は免除（`in_condition` カウンタで追跡）
+- **`set -u`（nounset）**: 未定義変数の参照をエラーにする。`${var:-default}`/`${var:=val}`/`${var:+alt}` 演算子は免除、`$@`/`$*`/`$#`/`$?`/`$$`/`$!`/`$0`/`$RANDOM`/`$SECONDS` は免除
+- **`set -o pipefail`**: パイプライン中の最初の非ゼロ終了コードを返す（右から走査）。フォアグラウンドパイプラインをジョブテーブルに一時登録し、全プロセスのステータスを追跡
+- **パーサー `Result` 化**: `expand_variables`/`expand_braced_param`/`eval_arithmetic` の戻り型を `Result` に変更し、nounset エラーを伝搬
+- **テスト**: 289テスト（+15件: set フラグ設定/解除、errexit 基本/&&免除/||免除/if免除/while免除、nounset 未定義エラー/定義済みOK/:-免除/特殊変数免除/無効時）
 
 ## Speed Comparison Targets
 

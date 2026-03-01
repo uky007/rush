@@ -54,6 +54,16 @@ pub struct Shell {
     pub functions: HashMap<String, String>,
     /// 位置パラメータ（`$1`〜`$N`）。関数呼び出し時に設定される。
     pub positional_args: Vec<String>,
+    /// `set -e` (errexit): コマンド失敗時にシェルを終了する。
+    pub set_errexit: bool,
+    /// `set -u` (nounset): 未定義変数の参照をエラーにする。
+    pub set_nounset: bool,
+    /// `set -o pipefail`: パイプライン中の最初の非ゼロ終了コードを返す。
+    pub set_pipefail: bool,
+    /// if/while/until 条件文脈の深さ。0 = 通常、>0 = 条件評価中（errexit 免除）。
+    pub in_condition: usize,
+    /// errexit 発動フラグ。run_command_string の早期リターンに使用。
+    pub errexit_pending: bool,
 }
 
 impl Shell {
@@ -77,6 +87,11 @@ impl Shell {
             loop_depth: 0,
             functions: HashMap::new(),
             positional_args: Vec::new(),
+            set_errexit: false,
+            set_nounset: false,
+            set_pipefail: false,
+            in_condition: 0,
+            errexit_pending: false,
         }
     }
 }

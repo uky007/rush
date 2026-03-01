@@ -76,6 +76,25 @@ impl Job {
         JobStatus::Running
     }
 
+    /// パイプライン中の最初の非ゼロ終了コードを返す（右から走査）。
+    ///
+    /// `set -o pipefail` 用。全プロセスが成功なら 0。
+    pub fn pipefail_status(&self) -> i32 {
+        for proc in self.processes.iter().rev() {
+            let code = if libc::WIFEXITED(proc.status) {
+                libc::WEXITSTATUS(proc.status)
+            } else if libc::WIFSIGNALED(proc.status) {
+                128 + libc::WTERMSIG(proc.status)
+            } else {
+                0
+            };
+            if code != 0 {
+                return code;
+            }
+        }
+        0
+    }
+
     /// ジョブのステータス表示文字列を返す。
     fn status_str(&self) -> &'static str {
         match self.status() {
@@ -178,6 +197,11 @@ impl JobTable {
                 }
             }
         }
+    }
+
+    /// 指定 ID のジョブを削除する。
+    pub fn remove_job(&mut self, id: usize) {
+        self.jobs.retain(|j| j.id != id);
     }
 
     /// 通知済み Done ジョブを削除する。
