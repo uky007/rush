@@ -1,7 +1,8 @@
 //! コマンド実行: コマンドリスト条件付き実行、ビルトイン判定、リダイレクト適用、
 //! パイプライン接続、展開パイプライン（コマンド置換 → チルダ → ブレース → glob）、ジョブ制御、
 //! `if`/`then`/`elif`/`else`/`fi` 複合コマンド、
-//! `for`/`while`/`until`/`do`/`done` ループ、関数定義・実行。
+//! `for`/`while`/`until`/`do`/`done` ループ、関数定義・実行、
+//! サブシェル `( cmd1; cmd2 )`（fork による環境隔離）。
 //!
 //! ## パイプライン実行
 //!
@@ -259,6 +260,87 @@ fn try_expand_range(inner: &str) -> Option<Vec<String>> {
     Some(results)
 }
 
+/// サブシェル `( cmd1; cmd2 )` を fork して実行する。
+///
+/// 子プロセスで本体テキストを `run_command_string` で実行し、
+/// 終了ステータスを返す。環境変更は親プロセスに影響しない。
+fn execute_subshell(shell: &mut Shell, body: &str, redirects: &[parser::Redirect<'_>]) -> i32 {
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        eprintln!("rush: fork: {}", std::io::Error::last_os_error());
+        return 1;
+    }
+    if pid == 0 {
+        // 子プロセス
+        unsafe {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::signal(libc::SIGTSTP, libc::SIG_DFL);
+        }
+        // リダイレクト適用
+        for r in redirects {
+            let target = r.target.as_ref();
+            match r.kind {
+                parser::RedirectKind::Output => {
+                    match std::fs::File::create(target) {
+                        Ok(f) => {
+                            use std::os::unix::io::IntoRawFd;
+                            let fd = f.into_raw_fd();
+                            unsafe { libc::dup2(fd, libc::STDOUT_FILENO); libc::close(fd); }
+                        }
+                        Err(e) => { eprintln!("rush: {}: {}", target, e); std::process::exit(1); }
+                    }
+                }
+                parser::RedirectKind::Append => {
+                    match std::fs::OpenOptions::new().create(true).append(true).open(target) {
+                        Ok(f) => {
+                            use std::os::unix::io::IntoRawFd;
+                            let fd = f.into_raw_fd();
+                            unsafe { libc::dup2(fd, libc::STDOUT_FILENO); libc::close(fd); }
+                        }
+                        Err(e) => { eprintln!("rush: {}: {}", target, e); std::process::exit(1); }
+                    }
+                }
+                parser::RedirectKind::Input => {
+                    match std::fs::File::open(target) {
+                        Ok(f) => {
+                            use std::os::unix::io::IntoRawFd;
+                            let fd = f.into_raw_fd();
+                            unsafe { libc::dup2(fd, libc::STDIN_FILENO); libc::close(fd); }
+                        }
+                        Err(e) => { eprintln!("rush: {}: {}", target, e); std::process::exit(1); }
+                    }
+                }
+                parser::RedirectKind::Stderr | parser::RedirectKind::StderrAppend => {
+                    let f = if matches!(r.kind, parser::RedirectKind::StderrAppend) {
+                        std::fs::OpenOptions::new().create(true).append(true).open(target)
+                    } else {
+                        std::fs::File::create(target).map(|f| f)
+                    };
+                    match f {
+                        Ok(f) => {
+                            use std::os::unix::io::IntoRawFd;
+                            let fd = f.into_raw_fd();
+                            unsafe { libc::dup2(fd, libc::STDERR_FILENO); libc::close(fd); }
+                        }
+                        Err(e) => { eprintln!("rush: {}: {}", target, e); std::process::exit(1); }
+                    }
+                }
+                _ => {} // HereDoc, HereString, FdDup は別途処理
+            }
+        }
+        let status = run_command_string(shell, body);
+        std::process::exit(status);
+    }
+    // 親プロセス
+    let mut status = 0i32;
+    unsafe { libc::waitpid(pid, &mut status, 0); }
+    if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else {
+        1
+    }
+}
+
 /// コマンド文字列を実行して stdout の出力を取得する（コマンド置換用）。
 fn execute_capture(cmd_str: &str, shell: &mut Shell) -> String {
     let mut pipefd = [0i32; 2];
@@ -404,6 +486,13 @@ pub fn execute(shell: &mut Shell, list: &CommandList<'_>, cmd_text: &str) -> i32
 /// 1. 単一ビルトイン（非 background） → [`execute_builtin`]（fork なし高速パス）
 /// 2. それ以外（外部コマンド、パイプライン、ビルトイン + `&`） → [`execute_job`]
 fn execute_pipeline(shell: &mut Shell, pipeline: &Pipeline<'_>, cmd_text: &str) -> i32 {
+    // 単一サブシェル（非 background）→ fork で実行
+    if pipeline.commands.len() == 1 && !pipeline.background {
+        if let Some(ref body) = pipeline.commands[0].subshell_body {
+            return execute_subshell(shell, body, &pipeline.commands[0].redirects);
+        }
+    }
+
     // 単一ビルトイン（非 background）→ fork なしの高速パス
     if pipeline.commands.len() == 1 && !pipeline.background {
         let cmd = &pipeline.commands[0];
@@ -758,32 +847,75 @@ fn execute_job(shell: &mut Shell, pipeline: &Pipeline<'_>, cmd_text: &str) -> i3
             }
         }
 
-        match spawn::spawn(
-            &args,
-            pgid,
-            stdin_fd,
-            stdout_fd,
-            redir_fds.stderr_fd,
-            &close_fds_buf[..close_count],
-            &redir_fds.dup_actions,
-        ) {
-            Ok(child_pid) => {
-                // 親側でもプロセスグループを設定（レースコンディション防止）
-                if pgid == 0 {
-                    pgid = child_pid;
-                }
-                unsafe {
-                    libc::setpgid(child_pid, pgid);
-                }
-
-                pids[pid_count] = child_pid;
-                pid_count += 1;
-            }
-            Err(e) => {
-                eprintln!("{}", e);
-                error_status = e.exit_status();
+        if let Some(ref body) = cmd.subshell_body {
+            // サブシェルをパイプライン要素として fork 実行
+            let child_pid = unsafe { libc::fork() };
+            if child_pid < 0 {
+                eprintln!("rush: fork: {}", std::io::Error::last_os_error());
                 spawn_error = true;
+                error_status = 1;
                 break;
+            }
+            if child_pid == 0 {
+                // 子プロセス: パイプ fd の設定
+                unsafe {
+                    if let Some(fd) = stdin_fd {
+                        libc::dup2(fd, libc::STDIN_FILENO);
+                        libc::close(fd);
+                    }
+                    if let Some(fd) = stdout_fd {
+                        libc::dup2(fd, libc::STDOUT_FILENO);
+                        libc::close(fd);
+                    }
+                    if let Some(fd) = redir_fds.stderr_fd {
+                        libc::dup2(fd, libc::STDERR_FILENO);
+                        libc::close(fd);
+                    }
+                    // 他のパイプ fd をすべて close
+                    for j in 0..pipe_count {
+                        if pipes[j][0] >= 0 { libc::close(pipes[j][0]); }
+                        if pipes[j][1] >= 0 { libc::close(pipes[j][1]); }
+                    }
+                    libc::signal(libc::SIGINT, libc::SIG_DFL);
+                    libc::signal(libc::SIGTSTP, libc::SIG_DFL);
+                    if pgid != 0 { libc::setpgid(0, pgid); }
+                }
+                let status = run_command_string(shell, body);
+                std::process::exit(status);
+            }
+            // 親プロセス
+            if pgid == 0 { pgid = child_pid; }
+            unsafe { libc::setpgid(child_pid, pgid); }
+            pids[pid_count] = child_pid;
+            pid_count += 1;
+        } else {
+            match spawn::spawn(
+                &args,
+                pgid,
+                stdin_fd,
+                stdout_fd,
+                redir_fds.stderr_fd,
+                &close_fds_buf[..close_count],
+                &redir_fds.dup_actions,
+            ) {
+                Ok(child_pid) => {
+                    // 親側でもプロセスグループを設定（レースコンディション防止）
+                    if pgid == 0 {
+                        pgid = child_pid;
+                    }
+                    unsafe {
+                        libc::setpgid(child_pid, pgid);
+                    }
+
+                    pids[pid_count] = child_pid;
+                    pid_count += 1;
+                }
+                Err(e) => {
+                    eprintln!("{}", e);
+                    error_status = e.exit_status();
+                    spawn_error = true;
+                    break;
+                }
             }
         }
 
@@ -1806,7 +1938,7 @@ fn extract_keyword(token: &str) -> Option<&'static str> {
 /// 複数行入力・ネストした if ブロックにも対応し、各行を
 /// [`parser::parse`] → [`execute`] で順次実行する。
 /// 最後に実行されたコマンドの終了ステータスを返す。
-fn run_command_string(shell: &mut Shell, input: &str) -> i32 {
+pub fn run_command_string(shell: &mut Shell, input: &str) -> i32 {
     let lines: Vec<&str> = input.lines().collect();
     let mut last_status = 0;
     let mut i = 0;
@@ -2711,5 +2843,57 @@ mod tests {
         let status = execute_while_block(&mut shell, block, false);
         assert!(!shell.errexit_pending);
         assert_eq!(status, 0);
+    }
+
+    // ── サブシェル ──
+
+    #[test]
+    fn subshell_env_isolation() {
+        // サブシェル内の環境変数変更は親に影響しない
+        let mut shell = Shell::new();
+        std::env::remove_var("RUSH_SUBSHELL_ENVTEST");
+        let input = "(export RUSH_SUBSHELL_ENVTEST=hello)";
+        match parser::parse(input, 0, &[], false) {
+            Ok(Some(list)) => { execute(&mut shell, &list, input); }
+            _ => panic!("parse failed"),
+        }
+        assert!(std::env::var("RUSH_SUBSHELL_ENVTEST").is_err());
+    }
+
+    #[test]
+    fn subshell_exit_status_false() {
+        let mut shell = Shell::new();
+        let input = "(false)";
+        match parser::parse(input, 0, &[], false) {
+            Ok(Some(list)) => {
+                let status = execute(&mut shell, &list, input);
+                assert_ne!(status, 0);
+            }
+            _ => panic!("parse failed"),
+        }
+    }
+
+    #[test]
+    fn subshell_last_command_status() {
+        let mut shell = Shell::new();
+        let input = "(false; true)";
+        match parser::parse(input, 0, &[], false) {
+            Ok(Some(list)) => {
+                let status = execute(&mut shell, &list, input);
+                assert_eq!(status, 0);
+            }
+            _ => panic!("parse failed"),
+        }
+    }
+
+    // ── eval ──
+
+    #[test]
+    fn eval_via_run_command_string() {
+        let mut shell = Shell::new();
+        let status = run_command_string(&mut shell, "true");
+        assert_eq!(status, 0);
+        let status = run_command_string(&mut shell, "false");
+        assert_eq!(status, 1);
     }
 }

@@ -78,7 +78,7 @@
 | `parser` | 入力をAST（コマンド列）に変換。変数展開、パラメータ展開、位置パラメータ（`$1`〜`$9`, `$@`, `$*`, `$#`）、算術展開、継続行検出、`set -u` 未定義変数検出 | ゼロコピー (`Cow::Borrowed`)、位置パラメータ直接スライス渡し |
 | `executor` | コマンド実行・パイプライン接続・`if`/`elif`/`else`/`fi`・`for`/`while`/`until` ループ・`case`/`esac`・関数定義/実行。展開パイプライン: コマンド置換 → チルダ → ブレース → glob | ビルトイン in-process、スタック配列 |
 | `spawn` | 外部コマンドの起動 (`posix_spawnp`)。fd 複製 (`2>&1`) 対応 | fork+exec 回避、RAII ラッパー |
-| `builtins` | cd, pwd, echo, export, unset, source, read, exec, wait, type, command, builtin, set 等 33 種 | fork 不要、直接実行 |
+| `builtins` | cd, pwd, echo, export, unset, source, read, exec, wait, type, command, builtin, set, eval 等 34 種 | fork 不要、直接実行 |
 | `job` | ジョブコントロール (bg/fg/jobs/wait) | waitpid 手動 reap |
 | `editor` | 行編集 (raw モード、Ctrl+R 逆方向検索、Tab 補完、シンタックスハイライト) | libc 直接操作、1 回の write(2) |
 | `highlight` | シンタックスハイライト・PATH キャッシュ | HashSet キャッシュ、変更検出 |
@@ -189,6 +189,12 @@
 - **`set -o pipefail`**: パイプライン中の最初の非ゼロ終了コードを返す（右から走査）。フォアグラウンドパイプラインをジョブテーブルに一時登録し、全プロセスのステータスを追跡
 - **パーサー `Result` 化**: `expand_variables`/`expand_braced_param`/`eval_arithmetic` の戻り型を `Result` に変更し、nounset エラーを伝搬
 - **テスト**: 289テスト（+15件: set フラグ設定/解除、errexit 基本/&&免除/||免除/if免除/while免除、nounset 未定義エラー/定義済みOK/:-免除/特殊変数免除/無効時）
+
+### Phase 13: Subshell & eval ✅
+- **サブシェル `( cmd1; cmd2 )`**: `fork()` で子プロセスを生成し、本体を `run_command_string()` で実行。環境変数・CWD の変更は親プロセスに影響しない。パイプライン `(echo hello) | cat`、コネクタ `(false) || echo ok`、リダイレクト `(echo hello) > file`、バックグラウンド `(cmd) &`、ネスト `( (cmd) )` に対応
+- **`eval` ビルトイン**: 引数を空白で結合し `run_command_string()` で評価。複合コマンド（if/for/while/case/関数定義）にも自動対応
+- **パーサー拡張**: `Token::LParen`/`RParen` 追加、`Command.subshell_body: Option<String>` フィールド追加、`collect_subshell_body()` でクォート・ネスト括弧を正しくスキップ
+- **テスト**: 309テスト（+20件: サブシェル基本/セミコロン/ネスト/パイプライン/リダイレクト/コネクタ/background/不完全/空/クォート内括弧/通常コマンド/環境隔離/終了ステータス、eval 基本/引数なし/空文字列/false/is_builtin）
 
 ## Speed Comparison Targets
 

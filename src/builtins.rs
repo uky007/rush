@@ -47,7 +47,8 @@ pub fn is_builtin(name: &str) -> bool {
                  | "trap"
                  | "break" | "continue"
                  | "local" | "shift"
-                 | "set")
+                 | "set"
+                 | "eval")
 }
 
 /// ビルトインコマンドの実行を試みる。
@@ -92,6 +93,7 @@ pub fn try_exec(shell: &mut Shell, args: &[&str], stdout: &mut dyn Write) -> Opt
         "local" => Some(builtin_local(args)),
         "shift" => Some(builtin_shift(shell, args)),
         "set" => Some(builtin_set(shell, args, stdout)),
+        "eval" => Some(builtin_eval(shell, args)),
         _ => None,
     }
 }
@@ -1281,6 +1283,21 @@ fn builtin_shift(shell: &mut Shell, args: &[&str]) -> i32 {
 /// - `-o pipefail` / `+o pipefail` — pipefail
 /// - 複合フラグ: `-eu` → errexit + nounset 両方 ON
 /// - `-o` 単独 / 引数なし → 現在の設定を表示
+/// `eval [arg ...]` — 引数を空白で結合した文字列をコマンドとして実行する。
+///
+/// 変数展開は `parser::parse()` が既に処理済みのため、eval は展開後の引数を受け取る。
+/// 複合コマンド（if/for/while/case/関数定義）にも対応するため
+/// `executor::run_command_string` を使用する。
+///
+/// 引数なしの場合は 0 を返す。
+fn builtin_eval(shell: &mut Shell, args: &[&str]) -> i32 {
+    if args.len() <= 1 {
+        return 0;
+    }
+    let input = args[1..].join(" ");
+    executor::run_command_string(shell, &input)
+}
+
 fn builtin_set(shell: &mut Shell, args: &[&str], stdout: &mut dyn Write) -> i32 {
     if args.len() <= 1 {
         // 引数なし → 現在の設定表示
@@ -1797,5 +1814,42 @@ mod tests {
         builtin_set(&mut shell, &["set", "-o"], &mut buf);
         let output = String::from_utf8(buf).unwrap();
         assert!(output.contains("errexit"));
+    }
+
+    // ── eval ──
+
+    #[test]
+    fn eval_basic() {
+        let mut shell = Shell::new();
+        let status = builtin_eval(&mut shell, &["eval", "export", "RUSH_EVAL_BASIC_TEST=hello"]);
+        assert_eq!(status, 0);
+        assert_eq!(std::env::var("RUSH_EVAL_BASIC_TEST").unwrap(), "hello");
+        std::env::remove_var("RUSH_EVAL_BASIC_TEST");
+    }
+
+    #[test]
+    fn eval_no_args() {
+        let mut shell = Shell::new();
+        let status = builtin_eval(&mut shell, &["eval"]);
+        assert_eq!(status, 0);
+    }
+
+    #[test]
+    fn eval_empty_string() {
+        let mut shell = Shell::new();
+        let status = builtin_eval(&mut shell, &["eval", ""]);
+        assert_eq!(status, 0);
+    }
+
+    #[test]
+    fn eval_false() {
+        let mut shell = Shell::new();
+        let status = builtin_eval(&mut shell, &["eval", "false"]);
+        assert_eq!(status, 1);
+    }
+
+    #[test]
+    fn eval_is_builtin() {
+        assert!(is_builtin("eval"));
     }
 }

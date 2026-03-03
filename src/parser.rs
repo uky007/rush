@@ -22,6 +22,7 @@
 //! - fd 複製: `2>&1`, `>&2`（fd 複製リダイレクト）
 //! - エスケープ: `\"`, `\\`, `\$`（ダブルクォート内）, `\X`（裸ワード）
 //! - インライン代入: `VAR=val cmd`（コマンド先頭の `VAR=val` を代入として検出）
+//! - サブシェル: `( cmd1; cmd2 )` — 本体テキストを `Command.subshell_body` に格納
 //! - 継続行検出: 末尾の `|`, `&&`, `||` を [`ParseError::IncompleteInput`] として報告
 
 use std::borrow::Cow;
@@ -79,6 +80,9 @@ pub struct Command<'a> {
     pub redirects: Vec<Redirect<'a>>,
     /// コマンド先頭の `VAR=val` 代入リスト。
     pub assignments: Vec<(String, String)>,
+    /// サブシェル `( cmd1; cmd2 )` の本体テキスト。
+    /// `Some` のとき args は空で、executor が fork して本体を実行する。
+    pub subshell_body: Option<String>,
 }
 
 /// ファイルリダイレクト指定。種別とターゲットファイルパスを持つ。
@@ -779,6 +783,8 @@ enum Token<'a> {
     FdDupPrefix(i32), // N>& — src_fd は N、次の Word が dst_fd
     HereDoc,          // <<
     HereString,       // <<<
+    LParen,           // (  — サブシェル開始
+    RParen,           // )  — サブシェル終了
 }
 
 /// 入力文字列をトークン列に変換するイテレータ。
@@ -812,6 +818,52 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
 
     fn peek_at(&self, offset: usize) -> Option<u8> {
         self.input.as_bytes().get(self.pos + offset).copied()
+    }
+
+    /// サブシェル `(` の直後から対応する `)` までの本体テキストを抽出する。
+    ///
+    /// クォート・`$()`・ネストした `()` を正しくスキップする。
+    /// `self.pos` を `)` の直後に進める。
+    fn collect_subshell_body(&mut self) -> Result<String, ParseError> {
+        let start = self.pos;
+        let mut depth: i32 = 1;
+        let bytes = self.input.as_bytes();
+        let len = bytes.len();
+        while self.pos < len && depth > 0 {
+            match bytes[self.pos] {
+                b'(' => { depth += 1; self.pos += 1; }
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 { break; }
+                    self.pos += 1;
+                }
+                b'\'' => {
+                    self.pos += 1;
+                    while self.pos < len && bytes[self.pos] != b'\'' {
+                        self.pos += 1;
+                    }
+                    if self.pos < len { self.pos += 1; }
+                }
+                b'"' => {
+                    self.pos += 1;
+                    while self.pos < len && bytes[self.pos] != b'"' {
+                        if bytes[self.pos] == b'\\' && self.pos + 1 < len {
+                            self.pos += 1;
+                        }
+                        self.pos += 1;
+                    }
+                    if self.pos < len { self.pos += 1; }
+                }
+                b'\\' if self.pos + 1 < len => { self.pos += 2; }
+                _ => { self.pos += 1; }
+            }
+        }
+        if depth > 0 {
+            return Err(ParseError::IncompleteInput);
+        }
+        let body = self.input[start..self.pos].trim().to_string();
+        self.pos += 1; // `)` をスキップ
+        Ok(body)
     }
 
     /// `$` の直後から変数名を読み取り、展開結果を `buf` に追加する。
@@ -989,6 +1041,14 @@ impl<'a, 'b> Iterator for Tokenizer<'a, 'b> {
                 self.pos += 1;
                 Some(Ok(Token::Semi))
             }
+            b'(' => {
+                self.pos += 1;
+                Some(Ok(Token::LParen))
+            }
+            b')' => {
+                self.pos += 1;
+                Some(Ok(Token::RParen))
+            }
             b'>' => {
                 self.pos += 1;
                 if self.peek() == Some(b'>') {
@@ -1150,7 +1210,7 @@ impl<'a, 'b> Iterator for Tokenizer<'a, 'b> {
                     while scan < self.input.len() {
                         match self.input.as_bytes()[scan] {
                             b' ' | b'\t' | b'\n' | b'\r' | b'|' | b'&' | b'>' | b'<'
-                            | b'\'' | b'"' | b';' => break,
+                            | b'\'' | b'"' | b';' | b'(' | b')' => break,
                             b'\\' => {
                                 has_escape = true;
                                 break;
@@ -1166,7 +1226,7 @@ impl<'a, 'b> Iterator for Tokenizer<'a, 'b> {
                     while self.pos < self.input.len() {
                         match self.input.as_bytes()[self.pos] {
                             b' ' | b'\t' | b'\n' | b'\r' | b'|' | b'&' | b'>' | b'<'
-                            | b'\'' | b'"' | b';' => break,
+                            | b'\'' | b'"' | b';' | b'(' | b')' => break,
                             b'$' if self.pos + 1 < self.input.len()
                                 && self.input.as_bytes()[self.pos + 1] == b'(' =>
                             {
@@ -1240,7 +1300,7 @@ impl<'a, 'b> Iterator for Tokenizer<'a, 'b> {
                     while self.pos < self.input.len() {
                         match self.input.as_bytes()[self.pos] {
                             b' ' | b'\t' | b'\n' | b'\r' | b'|' | b'&' | b'>' | b'<'
-                            | b'\'' | b'"' | b';' => break,
+                            | b'\'' | b'"' | b';' | b'(' | b')' => break,
                             b'$' if self.pos + 1 < self.input.len()
                                 && self.input.as_bytes()[self.pos + 1] == b'(' =>
                             {
@@ -1336,6 +1396,7 @@ pub fn parse<'a>(input: &'a str, last_status: i32, pos_args: &[String], nounset:
     let mut args: Vec<Cow<'_, str>> = Vec::new();
     let mut redirects: Vec<Redirect<'_>> = Vec::new();
     let mut assignments: Vec<(String, String)> = Vec::new();
+    let mut subshell_body: Option<String> = None;
     let mut background = false;
 
     while let Some(result) = tokens.next() {
@@ -1359,13 +1420,14 @@ pub fn parse<'a>(input: &'a str, last_status: i32, pos_args: &[String], nounset:
                 args.push(w);
             }
             Token::Pipe => {
-                if args.is_empty() && assignments.is_empty() {
+                if args.is_empty() && assignments.is_empty() && subshell_body.is_none() {
                     return Err(ParseError::EmptyPipelineSegment);
                 }
                 commands.push(Command {
                     args: std::mem::take(&mut args),
                     redirects: std::mem::take(&mut redirects),
                     assignments: std::mem::take(&mut assignments),
+                    subshell_body: subshell_body.take(),
                 });
             }
             Token::And | Token::Or | Token::Semi => {
@@ -1376,18 +1438,19 @@ pub fn parse<'a>(input: &'a str, last_status: i32, pos_args: &[String], nounset:
                 };
 
                 // `;` の前に何もなくてもスキップ（bash 互換）
-                if args.is_empty() && commands.is_empty() && assignments.is_empty() {
+                if args.is_empty() && commands.is_empty() && assignments.is_empty() && subshell_body.is_none() {
                     if matches!(connector, Connector::Seq) {
                         continue; // 先頭 `;` や `;;` はスキップ
                     }
                     return Err(ParseError::EmptyPipelineSegment);
                 }
 
-                if !args.is_empty() || !assignments.is_empty() {
+                if !args.is_empty() || !assignments.is_empty() || subshell_body.is_some() {
                     commands.push(Command {
                         args: std::mem::take(&mut args),
                         redirects: std::mem::take(&mut redirects),
                         assignments: std::mem::take(&mut assignments),
+                        subshell_body: subshell_body.take(),
                     });
                 }
 
@@ -1401,16 +1464,17 @@ pub fn parse<'a>(input: &'a str, last_status: i32, pos_args: &[String], nounset:
                 background = false;
             }
             Token::Ampersand => {
-                if args.is_empty() && commands.is_empty() && assignments.is_empty() {
+                if args.is_empty() && commands.is_empty() && assignments.is_empty() && subshell_body.is_none() {
                     return Err(ParseError::EmptyPipelineSegment);
                 }
 
                 // `&` の後にコマンドが続くケースをサポート（`cmd1 & cmd2`）
-                if !args.is_empty() || !assignments.is_empty() {
+                if !args.is_empty() || !assignments.is_empty() || subshell_body.is_some() {
                     commands.push(Command {
                         args: std::mem::take(&mut args),
                         redirects: std::mem::take(&mut redirects),
                         assignments: std::mem::take(&mut assignments),
+                        subshell_body: subshell_body.take(),
                     });
                 }
 
@@ -1473,17 +1537,31 @@ pub fn parse<'a>(input: &'a str, last_status: i32, pos_args: &[String], nounset:
                     _ => return Err(ParseError::MissingRedirectTarget),
                 }
             }
+            Token::LParen => {
+                // サブシェル開始: コマンド位置（args/assignments が空）でのみ有効
+                if !args.is_empty() || !assignments.is_empty() {
+                    return Err(ParseError::EmptyPipelineSegment);
+                }
+                let body = tokens.collect_subshell_body()?;
+                // subshell_body をセットし、) の後のリダイレクトは通常通り redirects に蓄積。
+                // コマンド境界（Pipe/And/Or/Semi/Ampersand/終端）で Command に含める。
+                subshell_body = Some(body);
+            }
+            Token::RParen => {
+                // 対応しない `)` はエラー
+                return Err(ParseError::EmptyPipelineSegment);
+            }
         }
     }
 
     // 末尾パイプ: commands があるが args がない → 継続行入力のトリガー
-    if !commands.is_empty() && args.is_empty() && redirects.is_empty() && assignments.is_empty() {
+    if !commands.is_empty() && args.is_empty() && redirects.is_empty() && assignments.is_empty() && subshell_body.is_none() {
         return Err(ParseError::IncompleteInput);
     }
 
     // 最終パイプラインの処理
-    if !args.is_empty() || !assignments.is_empty() {
-        commands.push(Command { args, redirects, assignments });
+    if !args.is_empty() || !assignments.is_empty() || subshell_body.is_some() {
+        commands.push(Command { args, redirects, assignments, subshell_body });
     } else if !redirects.is_empty() {
         // リダイレクトのみ（コマンドなし）
         return Err(ParseError::EmptyPipelineSegment);
@@ -2472,5 +2550,95 @@ mod tests {
         // nounset=false なら未定義変数はエラーにならない
         let result = parse("echo $RUSH_NOUNSET_TEST_OFF", 0, &[], false);
         assert!(result.is_ok());
+    }
+
+    // ── サブシェル ──
+
+    #[test]
+    fn subshell_basic() {
+        let list = parse("(echo hello)", 0, &[], false).unwrap().unwrap();
+        assert_eq!(list.items.len(), 1);
+        let cmd = &list.items[0].pipeline.commands[0];
+        assert!(cmd.subshell_body.is_some());
+        assert_eq!(cmd.subshell_body.as_ref().unwrap(), "echo hello");
+        assert!(cmd.args.is_empty());
+    }
+
+    #[test]
+    fn subshell_with_semicolons() {
+        let list = parse("(cd /tmp; pwd)", 0, &[], false).unwrap().unwrap();
+        let cmd = &list.items[0].pipeline.commands[0];
+        assert!(cmd.subshell_body.is_some());
+        assert_eq!(cmd.subshell_body.as_ref().unwrap(), "cd /tmp; pwd");
+    }
+
+    #[test]
+    fn subshell_nested() {
+        let list = parse("( (echo nested) )", 0, &[], false).unwrap().unwrap();
+        let cmd = &list.items[0].pipeline.commands[0];
+        assert!(cmd.subshell_body.is_some());
+        assert_eq!(cmd.subshell_body.as_ref().unwrap(), "(echo nested)");
+    }
+
+    #[test]
+    fn subshell_in_pipeline() {
+        let list = parse("(echo hello) | cat", 0, &[], false).unwrap().unwrap();
+        let pipeline = &list.items[0].pipeline;
+        assert_eq!(pipeline.commands.len(), 2);
+        assert!(pipeline.commands[0].subshell_body.is_some());
+        assert_eq!(pipeline.commands[1].args[0], "cat");
+    }
+
+    #[test]
+    fn subshell_with_redirect() {
+        let list = parse("(echo hello) > out.txt", 0, &[], false).unwrap().unwrap();
+        let cmd = &list.items[0].pipeline.commands[0];
+        assert!(cmd.subshell_body.is_some());
+        assert_eq!(cmd.redirects.len(), 1);
+        assert_eq!(cmd.redirects[0].kind, RedirectKind::Output);
+    }
+
+    #[test]
+    fn subshell_with_connector() {
+        let list = parse("(false) || echo ok", 0, &[], false).unwrap().unwrap();
+        assert_eq!(list.items.len(), 2);
+        assert!(list.items[0].pipeline.commands[0].subshell_body.is_some());
+        assert_eq!(list.items[1].pipeline.commands[0].args[0], "echo");
+    }
+
+    #[test]
+    fn subshell_background() {
+        let list = parse("(sleep 1) &", 0, &[], false).unwrap().unwrap();
+        assert!(list.items[0].pipeline.background);
+        assert!(list.items[0].pipeline.commands[0].subshell_body.is_some());
+    }
+
+    #[test]
+    fn subshell_incomplete() {
+        assert_eq!(parse("(echo hello", 0, &[], false), Err(ParseError::IncompleteInput));
+    }
+
+    #[test]
+    fn subshell_empty() {
+        let list = parse("()", 0, &[], false).unwrap().unwrap();
+        let cmd = &list.items[0].pipeline.commands[0];
+        assert!(cmd.subshell_body.is_some());
+        assert_eq!(cmd.subshell_body.as_ref().unwrap(), "");
+    }
+
+    #[test]
+    fn subshell_quoted_parens() {
+        // クォート内の ) はサブシェル終了とみなさない
+        let list = parse("(echo ')')", 0, &[], false).unwrap().unwrap();
+        let cmd = &list.items[0].pipeline.commands[0];
+        assert!(cmd.subshell_body.is_some());
+        assert_eq!(cmd.subshell_body.as_ref().unwrap(), "echo ')'");
+    }
+
+    #[test]
+    fn normal_command_no_subshell() {
+        // 通常コマンドは subshell_body が None
+        let list = parse("echo hello", 0, &[], false).unwrap().unwrap();
+        assert!(list.items[0].pipeline.commands[0].subshell_body.is_none());
     }
 }

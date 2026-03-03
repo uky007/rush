@@ -174,6 +174,20 @@ pub fn highlight(buf: &str, cache: &PathCache) -> String {
                 command_position = true;
                 redirect_target = false;
             }
+            b'(' => {
+                result.push_str(CYAN);
+                result.push('(');
+                result.push_str(RESET);
+                pos += 1;
+                command_position = true;
+            }
+            b')' => {
+                result.push_str(CYAN);
+                result.push(')');
+                result.push_str(RESET);
+                pos += 1;
+                command_position = false;
+            }
             b'>' => {
                 result.push_str(CYAN);
                 result.push('>');
@@ -318,7 +332,7 @@ pub fn highlight(buf: &str, cache: &PathCache) -> String {
                 while pos < len
                     && !matches!(
                         bytes[pos],
-                        b' ' | b'\t' | b'|' | b'&' | b'>' | b'<' | b'\'' | b'"' | b';'
+                        b' ' | b'\t' | b'|' | b'&' | b'>' | b'<' | b'\'' | b'"' | b';' | b'(' | b')'
                     )
                 {
                     if bytes[pos] == b'`' {
