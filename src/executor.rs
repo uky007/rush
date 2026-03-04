@@ -108,6 +108,9 @@ fn expand_args_full(args: &[std::borrow::Cow<'_, str>], shell: &mut Shell) -> Ve
         for word in &brace_expanded {
             if glob::has_glob_chars(word) {
                 result.extend(glob::expand(word));
+            } else if word.contains('\x1F') {
+                // 配列 ${arr[@]} のワード分割: \x1F をセパレータとして分割
+                result.extend(word.split('\x1F').filter(|s| !s.is_empty()).map(String::from));
             } else {
                 result.push(word.clone());
             }
@@ -363,7 +366,7 @@ fn execute_capture(cmd_str: &str, shell: &mut Shell) -> String {
             libc::signal(libc::SIGINT, libc::SIG_DFL);
             libc::signal(libc::SIGTSTP, libc::SIG_DFL);
         }
-        match parser::parse(cmd_str, shell.last_status, &shell.positional_args, shell.set_nounset) {
+        match parser::parse(cmd_str, shell.last_status, &shell.positional_args, shell.set_nounset, &shell.arrays) {
             Ok(Some(list)) => {
                 let status = execute(shell, &list, cmd_str);
                 std::process::exit(status);
@@ -498,9 +501,40 @@ fn execute_pipeline(shell: &mut Shell, pipeline: &Pipeline<'_>, cmd_text: &str) 
         let cmd = &pipeline.commands[0];
 
         // 代入のみ（コマンドなし）→ シェル環境に設定
-        if cmd.args.is_empty() && !cmd.assignments.is_empty() {
+        if cmd.args.is_empty() && (!cmd.assignments.is_empty()
+            || !cmd.array_assignments.is_empty() || !cmd.array_appends.is_empty() || !cmd.indexed_assignments.is_empty())
+        {
             for (name, value) in &cmd.assignments {
                 std::env::set_var(name, value);
+            }
+            // 配列代入
+            for (name, elements) in &cmd.array_assignments {
+                let mut btree = std::collections::BTreeMap::new();
+                for (i, elem) in elements.iter().enumerate() {
+                    btree.insert(i, elem.clone());
+                }
+                match elements.first() {
+                    Some(v) => std::env::set_var(name, v),
+                    None => std::env::remove_var(name),
+                }
+                shell.arrays.insert(name.clone(), btree);
+            }
+            // 配列追加
+            for (name, elements) in &cmd.array_appends {
+                let arr = shell.arrays.entry(name.clone()).or_default();
+                let next = arr.keys().last().map(|k| k + 1).unwrap_or(0);
+                for (i, elem) in elements.iter().enumerate() {
+                    arr.insert(next + i, elem.clone());
+                }
+                if let Some(v) = shell.arrays.get(name).and_then(|a| a.get(&0)) {
+                    std::env::set_var(name, v.clone());
+                }
+            }
+            // インデックス代入
+            for (name, idx, val) in &cmd.indexed_assignments {
+                let arr = shell.arrays.entry(name.clone()).or_default();
+                arr.insert(*idx, val.clone());
+                if *idx == 0 { std::env::set_var(name, val); }
             }
             return 0;
         }
@@ -1174,12 +1208,18 @@ pub fn execute_for_block(shell: &mut Shell, block: &str) -> i32 {
 
     let body = body_tokens.join("\n");
 
-    // word_tokens を展開（コマンド置換、チルダ、ブレース、glob）
+    // word_tokens を展開（変数展開 → コマンド置換、チルダ、ブレース、glob）
     let expanded_words: Vec<String> = if word_tokens.is_empty() {
         Vec::new()
     } else {
+        // まず変数展開（$VAR, ${arr[@]} 等）
         let cow_words: Vec<std::borrow::Cow<'_, str>> = word_tokens.iter()
-            .map(|s| std::borrow::Cow::Owned(s.clone()))
+            .map(|s| {
+                match parser::expand_variables(s, shell.last_status, &shell.positional_args, shell.set_nounset, &shell.arrays) {
+                    Ok(expanded) => std::borrow::Cow::Owned(expanded.into_owned()),
+                    Err(_) => std::borrow::Cow::Owned(s.clone()),
+                }
+            })
             .collect();
         expand_args_full(&cow_words, shell)
     };
@@ -1470,7 +1510,7 @@ pub fn execute_case_block(shell: &mut Shell, block: &str) -> i32 {
 fn expand_case_word(word: &str, shell: &mut Shell) -> String {
     // パーサーで変数展開を行う（echo WORD をパースして展開済み引数を取得）
     let synthetic = format!("echo {}", word);
-    if let Ok(Some(list)) = parser::parse(&synthetic, shell.last_status, &shell.positional_args, shell.set_nounset) {
+    if let Ok(Some(list)) = parser::parse(&synthetic, shell.last_status, &shell.positional_args, shell.set_nounset, &shell.arrays) {
         if let Some(cmd) = list.items.first() {
             if let Some(arg) = cmd.pipeline.commands[0].args.get(1) {
                 let cow_args = vec![arg.clone()];
@@ -2004,7 +2044,7 @@ pub fn run_command_string(shell: &mut Shell, input: &str) -> i32 {
             continue;
         }
 
-        match parser::parse(trimmed, shell.last_status, &shell.positional_args, shell.set_nounset) {
+        match parser::parse(trimmed, shell.last_status, &shell.positional_args, shell.set_nounset, &shell.arrays) {
             Ok(Some(list)) => {
                 let cmd_text = trimmed.to_string();
                 last_status = execute(shell, &list, &cmd_text);
@@ -2794,7 +2834,7 @@ mod tests {
         let mut shell = Shell::new();
         shell.set_errexit = true;
         // `false` は終了ステータス 1 を返す → errexit 発動
-        let list = crate::parser::parse("false", 0, &[], false).unwrap().unwrap();
+        let list = crate::parser::parse("false", 0, &[], false, &std::collections::HashMap::new()).unwrap().unwrap();
         let status = execute(&mut shell, &list, "false");
         assert_eq!(status, 1);
         assert!(shell.errexit_pending);
@@ -2805,7 +2845,7 @@ mod tests {
         let mut shell = Shell::new();
         shell.set_errexit = true;
         // `false && true` — && チェーン内では errexit 免除
-        let list = crate::parser::parse("false && true", 0, &[], false).unwrap().unwrap();
+        let list = crate::parser::parse("false && true", 0, &[], false, &std::collections::HashMap::new()).unwrap().unwrap();
         let status = execute(&mut shell, &list, "false && true");
         assert_eq!(status, 1);
         assert!(!shell.errexit_pending);
@@ -2816,7 +2856,7 @@ mod tests {
         let mut shell = Shell::new();
         shell.set_errexit = true;
         // `false || true` — || チェーン内では errexit 免除
-        let list = crate::parser::parse("false || true", 0, &[], false).unwrap().unwrap();
+        let list = crate::parser::parse("false || true", 0, &[], false, &std::collections::HashMap::new()).unwrap().unwrap();
         let status = execute(&mut shell, &list, "false || true");
         assert_eq!(status, 0);
         assert!(!shell.errexit_pending);
@@ -2853,7 +2893,7 @@ mod tests {
         let mut shell = Shell::new();
         std::env::remove_var("RUSH_SUBSHELL_ENVTEST");
         let input = "(export RUSH_SUBSHELL_ENVTEST=hello)";
-        match parser::parse(input, 0, &[], false) {
+        match parser::parse(input, 0, &[], false, &std::collections::HashMap::new()) {
             Ok(Some(list)) => { execute(&mut shell, &list, input); }
             _ => panic!("parse failed"),
         }
@@ -2864,7 +2904,7 @@ mod tests {
     fn subshell_exit_status_false() {
         let mut shell = Shell::new();
         let input = "(false)";
-        match parser::parse(input, 0, &[], false) {
+        match parser::parse(input, 0, &[], false, &std::collections::HashMap::new()) {
             Ok(Some(list)) => {
                 let status = execute(&mut shell, &list, input);
                 assert_ne!(status, 0);
@@ -2877,7 +2917,7 @@ mod tests {
     fn subshell_last_command_status() {
         let mut shell = Shell::new();
         let input = "(false; true)";
-        match parser::parse(input, 0, &[], false) {
+        match parser::parse(input, 0, &[], false, &std::collections::HashMap::new()) {
             Ok(Some(list)) => {
                 let status = execute(&mut shell, &list, input);
                 assert_eq!(status, 0);
@@ -2895,5 +2935,95 @@ mod tests {
         assert_eq!(status, 0);
         let status = run_command_string(&mut shell, "false");
         assert_eq!(status, 1);
+    }
+
+    // ── 配列変数 ──
+
+    #[test]
+    fn array_assignment_stores() {
+        let mut shell = Shell::new();
+        run_command_string(&mut shell, "arr=(hello world)");
+        let arr = shell.arrays.get("arr").expect("arr not found");
+        assert_eq!(arr.get(&0).unwrap(), "hello");
+        assert_eq!(arr.get(&1).unwrap(), "world");
+    }
+
+    #[test]
+    fn array_indexed_assignment_sparse() {
+        let mut shell = Shell::new();
+        run_command_string(&mut shell, "arr[5]=five");
+        let arr = shell.arrays.get("arr").expect("arr not found");
+        assert_eq!(arr.get(&5).unwrap(), "five");
+        assert!(arr.get(&0).is_none());
+    }
+
+    #[test]
+    fn array_append_elements() {
+        let mut shell = Shell::new();
+        run_command_string(&mut shell, "arr=(a b)");
+        run_command_string(&mut shell, "arr+=(c d)");
+        let arr = shell.arrays.get("arr").expect("arr not found");
+        assert_eq!(arr.len(), 4);
+        assert_eq!(arr.get(&2).unwrap(), "c");
+        assert_eq!(arr.get(&3).unwrap(), "d");
+    }
+
+    #[test]
+    fn array_echo_element() {
+        let mut shell = Shell::new();
+        run_command_string(&mut shell, "arr=(hello world)");
+        // 配列展開を直接テスト
+        let arr = shell.arrays.get("arr").expect("arr not found");
+        assert_eq!(arr.get(&1).unwrap(), "world");
+    }
+
+    #[test]
+    fn array_echo_all_split() {
+        let mut shell = Shell::new();
+        run_command_string(&mut shell, "arr=(x y z)");
+        // expand_args_full でのワード分割テスト
+        let arrays = &shell.arrays;
+        let arr = arrays.get("arr").unwrap();
+        let all: Vec<String> = arr.values().cloned().collect();
+        assert_eq!(all, vec!["x", "y", "z"]);
+    }
+
+    #[test]
+    fn array_length_via_parser() {
+        let mut shell = Shell::new();
+        run_command_string(&mut shell, "arr=(a b c)");
+        let len = shell.arrays.get("arr").unwrap().len();
+        assert_eq!(len, 3);
+    }
+
+    #[test]
+    fn array_empty_assignment() {
+        let mut shell = Shell::new();
+        run_command_string(&mut shell, "arr=()");
+        let arr = shell.arrays.get("arr").expect("arr not found");
+        assert!(arr.is_empty());
+    }
+
+    #[test]
+    fn array_unset_whole() {
+        let mut shell = Shell::new();
+        run_command_string(&mut shell, "arr=(a b c)");
+        assert!(shell.arrays.contains_key("arr"));
+        // unset arr は builtins 経由
+        let mut buf = Vec::new();
+        crate::builtins::try_exec(&mut shell, &["unset", "arr"], &mut buf);
+        assert!(!shell.arrays.contains_key("arr"));
+    }
+
+    #[test]
+    fn array_unset_element() {
+        let mut shell = Shell::new();
+        run_command_string(&mut shell, "arr=(a b c)");
+        let mut buf = Vec::new();
+        crate::builtins::try_exec(&mut shell, &["unset", "arr[1]"], &mut buf);
+        let arr = shell.arrays.get("arr").expect("arr not found");
+        assert!(arr.get(&1).is_none());
+        assert_eq!(arr.get(&0).unwrap(), "a");
+        assert_eq!(arr.get(&2).unwrap(), "c");
     }
 }

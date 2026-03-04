@@ -48,7 +48,8 @@ pub fn is_builtin(name: &str) -> bool {
                  | "break" | "continue"
                  | "local" | "shift"
                  | "set"
-                 | "eval")
+                 | "eval"
+                 | "declare")
 }
 
 /// ビルトインコマンドの実行を試みる。
@@ -76,7 +77,7 @@ pub fn try_exec(shell: &mut Shell, args: &[&str], stdout: &mut dyn Write) -> Opt
         "unalias" => Some(builtin_unalias(shell, args)),
         "command" => Some(builtin_command(shell, args, stdout)),
         "builtin" => Some(builtin_builtin(shell, args, stdout)),
-        "read" => Some(builtin_read(args)),
+        "read" => Some(builtin_read_with_shell(shell, args)),
         "exec" => Some(builtin_exec(args)),
         "wait" => Some(builtin_wait(shell, args)),
         "true" | ":" => Some(0),
@@ -94,6 +95,7 @@ pub fn try_exec(shell: &mut Shell, args: &[&str], stdout: &mut dyn Write) -> Opt
         "shift" => Some(builtin_shift(shell, args)),
         "set" => Some(builtin_set(shell, args, stdout)),
         "eval" => Some(builtin_eval(shell, args)),
+        "declare" => Some(builtin_declare(shell, args, stdout)),
         _ => None,
     }
 }
@@ -223,7 +225,21 @@ fn builtin_unset(shell: &mut Shell, args: &[&str]) -> i32 {
         }
     } else {
         for arg in &args[1..] {
+            // arr[N] パターン: 単一要素の削除
+            if let (Some(bs), Some(be)) = (arg.find('['), arg.find(']')) {
+                if be > bs {
+                    let name = &arg[..bs];
+                    let idx_str = &arg[bs + 1..be];
+                    if let Ok(idx) = idx_str.parse::<usize>() {
+                        if let Some(arr) = shell.arrays.get_mut(name) {
+                            arr.remove(&idx);
+                        }
+                        continue;
+                    }
+                }
+            }
             env::remove_var(arg);
+            shell.arrays.remove(*arg);
         }
     }
     0
@@ -504,54 +520,7 @@ fn builtin_exec(args: &[&str]) -> i32 {
 
 // ── read ────────────────────────────────────────────────────────────
 
-/// `read [-p prompt] VAR [VAR2 ...]` — stdin から 1 行読んで変数に代入する。
-/// 複数変数時は IFS で分割。変数省略時は REPLY に代入。
-fn builtin_read(args: &[&str]) -> i32 {
-    let mut vars: Vec<&str> = Vec::new();
-    let mut prompt_str: Option<&str> = None;
-    let mut i = 1;
-    while i < args.len() {
-        if args[i] == "-p" && i + 1 < args.len() {
-            prompt_str = Some(args[i + 1]);
-            i += 2;
-        } else {
-            vars.push(args[i]);
-            i += 1;
-        }
-    }
-
-    // プロンプト表示
-    if let Some(p) = prompt_str {
-        eprint!("{}", p);
-    }
-
-    // stdin から 1 行読み取り
-    let mut line = String::new();
-    match std::io::stdin().read_line(&mut line) {
-        Ok(0) => return 1, // EOF
-        Ok(_) => {}
-        Err(_) => return 1,
-    }
-    let line = line.trim_end_matches('\n').trim_end_matches('\r');
-
-    if vars.is_empty() {
-        // 変数省略時は REPLY に代入
-        env::set_var("REPLY", line);
-    } else if vars.len() == 1 {
-        env::set_var(vars[0], line);
-    } else {
-        // IFS で分割（デフォルト: スペース/タブ/改行）
-        let parts: Vec<&str> = line.splitn(vars.len(), |c: char| c == ' ' || c == '\t').collect();
-        for (j, var) in vars.iter().enumerate() {
-            if j < parts.len() {
-                env::set_var(var, parts[j]);
-            } else {
-                env::set_var(var, "");
-            }
-        }
-    }
-    0
-}
+// builtin_read は builtin_read_with_shell に統合済み（-a 配列対応）。
 
 // ── command / builtin ────────────────────────────────────────────────
 
@@ -806,7 +775,7 @@ fn builtin_source(shell: &mut Shell, args: &[&str]) -> i32 {
             continue;
         }
 
-        match parser::parse(trimmed, shell.last_status, &shell.positional_args, shell.set_nounset) {
+        match parser::parse(trimmed, shell.last_status, &shell.positional_args, shell.set_nounset, &shell.arrays) {
             Ok(Some(list)) => {
                 let cmd_text = trimmed.to_string();
                 shell.last_status = executor::execute(shell, &list, &cmd_text);
@@ -1353,6 +1322,154 @@ fn builtin_set(shell: &mut Shell, args: &[&str], stdout: &mut dyn Write) -> i32 
     0
 }
 
+/// `declare [-a] [-p] name` — 配列変数の宣言・表示。
+///
+/// - `declare -a name` → 空配列を作成
+/// - `declare -p name` → `declare -a name=([0]="a" [1]="b")` 形式で表示
+/// - `declare -p` → 全配列を表示
+fn builtin_declare(shell: &mut Shell, args: &[&str], stdout: &mut dyn Write) -> i32 {
+    if args.len() <= 1 {
+        // 全配列を表示
+        let mut names: Vec<&String> = shell.arrays.keys().collect();
+        names.sort();
+        for name in names {
+            if let Some(arr) = shell.arrays.get(name) {
+                let _ = write!(stdout, "declare -a {}=(", name);
+                for (i, (idx, val)) in arr.iter().enumerate() {
+                    if i > 0 { let _ = write!(stdout, " "); }
+                    let _ = write!(stdout, "[{}]=\"{}\"", idx, val);
+                }
+                let _ = writeln!(stdout, ")");
+            }
+        }
+        return 0;
+    }
+
+    let mut i = 1;
+    let mut flag_a = false;
+    let mut flag_p = false;
+
+    while i < args.len() {
+        match args[i] {
+            "-a" => { flag_a = true; i += 1; }
+            "-p" => { flag_p = true; i += 1; }
+            _ => break,
+        }
+    }
+
+    if flag_p {
+        // declare -p [name ...] — 指定された配列を表示
+        if i >= args.len() {
+            // 名前指定なし → 全配列を表示
+            let mut names: Vec<&String> = shell.arrays.keys().collect();
+            names.sort();
+            for name in names {
+                if let Some(arr) = shell.arrays.get(name) {
+                    let _ = write!(stdout, "declare -a {}=(", name);
+                    for (j, (idx, val)) in arr.iter().enumerate() {
+                        if j > 0 { let _ = write!(stdout, " "); }
+                        let _ = write!(stdout, "[{}]=\"{}\"", idx, val);
+                    }
+                    let _ = writeln!(stdout, ")");
+                }
+            }
+        } else {
+            for name in &args[i..] {
+                if let Some(arr) = shell.arrays.get(*name) {
+                    let _ = write!(stdout, "declare -a {}=(", name);
+                    for (j, (idx, val)) in arr.iter().enumerate() {
+                        if j > 0 { let _ = write!(stdout, " "); }
+                        let _ = write!(stdout, "[{}]=\"{}\"", idx, val);
+                    }
+                    let _ = writeln!(stdout, ")");
+                } else {
+                    eprintln!("rush: declare: {}: not found", name);
+                }
+            }
+        }
+        return 0;
+    }
+
+    if flag_a {
+        // declare -a name [name ...] — 空配列を作成
+        for name in &args[i..] {
+            shell.arrays.entry(name.to_string()).or_default();
+        }
+        return 0;
+    }
+
+    0
+}
+
+/// `read [-p prompt] [-a arr] var ...` — stdin から 1 行読み取り変数に代入する。
+/// `-a arr` で配列への読み取りをサポート。
+fn builtin_read_with_shell(shell: &mut Shell, args: &[&str]) -> i32 {
+    let mut vars: Vec<&str> = Vec::new();
+    let mut prompt_str: Option<&str> = None;
+    let mut array_name: Option<&str> = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i] {
+            "-p" if i + 1 < args.len() => {
+                prompt_str = Some(args[i + 1]);
+                i += 2;
+            }
+            "-a" if i + 1 < args.len() => {
+                array_name = Some(args[i + 1]);
+                i += 2;
+            }
+            _ => {
+                vars.push(args[i]);
+                i += 1;
+            }
+        }
+    }
+
+    // プロンプト表示
+    if let Some(p) = prompt_str {
+        eprint!("{}", p);
+    }
+
+    // stdin から 1 行読み取り
+    let mut line = String::new();
+    match std::io::stdin().read_line(&mut line) {
+        Ok(0) => return 1, // EOF
+        Ok(_) => {}
+        Err(_) => return 1,
+    }
+    let line = line.trim_end_matches('\n').trim_end_matches('\r');
+
+    // -a: 配列に代入
+    if let Some(arr_name) = array_name {
+        let parts: Vec<&str> = line.split(|c: char| c == ' ' || c == '\t').collect();
+        let mut btree = std::collections::BTreeMap::new();
+        for (j, part) in parts.iter().enumerate() {
+            btree.insert(j, part.to_string());
+        }
+        if let Some(v) = parts.first() {
+            env::set_var(arr_name, v);
+        }
+        shell.arrays.insert(arr_name.to_string(), btree);
+        return 0;
+    }
+
+    if vars.is_empty() {
+        env::set_var("REPLY", line);
+    } else if vars.len() == 1 {
+        env::set_var(vars[0], line);
+    } else {
+        let parts: Vec<&str> = line.splitn(vars.len(), |c: char| c == ' ' || c == '\t').collect();
+        for (j, var) in vars.iter().enumerate() {
+            if j < parts.len() {
+                env::set_var(var, parts[j]);
+            } else {
+                env::set_var(var, "");
+            }
+        }
+    }
+    0
+}
+
 // ── Tests ───────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1851,5 +1968,64 @@ mod tests {
     #[test]
     fn eval_is_builtin() {
         assert!(is_builtin("eval"));
+    }
+
+    // ── declare ──
+
+    #[test]
+    fn declare_is_builtin() {
+        assert!(is_builtin("declare"));
+    }
+
+    #[test]
+    fn declare_a_creates_empty_array() {
+        let mut shell = Shell::new();
+        let mut buf = Vec::new();
+        let status = builtin_declare(&mut shell, &["declare", "-a", "myarr"], &mut buf);
+        assert_eq!(status, 0);
+        assert!(shell.arrays.contains_key("myarr"));
+        assert!(shell.arrays.get("myarr").unwrap().is_empty());
+    }
+
+    #[test]
+    fn declare_p_shows_array() {
+        let mut shell = Shell::new();
+        let mut btree = std::collections::BTreeMap::new();
+        btree.insert(0, "hello".to_string());
+        btree.insert(1, "world".to_string());
+        shell.arrays.insert("arr".to_string(), btree);
+
+        let mut buf = Vec::new();
+        builtin_declare(&mut shell, &["declare", "-p", "arr"], &mut buf);
+        let output = String::from_utf8(buf).unwrap();
+        assert!(output.contains("declare -a arr="));
+        assert!(output.contains("[0]=\"hello\""));
+        assert!(output.contains("[1]=\"world\""));
+    }
+
+    #[test]
+    fn unset_array_element() {
+        let mut shell = Shell::new();
+        let mut btree = std::collections::BTreeMap::new();
+        btree.insert(0, "a".to_string());
+        btree.insert(1, "b".to_string());
+        btree.insert(2, "c".to_string());
+        shell.arrays.insert("arr".to_string(), btree);
+
+        builtin_unset(&mut shell, &["unset", "arr[1]"]);
+        let arr = shell.arrays.get("arr").unwrap();
+        assert!(arr.get(&1).is_none());
+        assert_eq!(arr.len(), 2);
+    }
+
+    #[test]
+    fn unset_array_whole() {
+        let mut shell = Shell::new();
+        let mut btree = std::collections::BTreeMap::new();
+        btree.insert(0, "x".to_string());
+        shell.arrays.insert("arr".to_string(), btree);
+
+        builtin_unset(&mut shell, &["unset", "arr"]);
+        assert!(!shell.arrays.contains_key("arr"));
     }
 }

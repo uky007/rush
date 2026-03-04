@@ -9,7 +9,7 @@
 //! エディタの PathCache はハイライト・補完用で `read_line` 呼び出し毎にリフレッシュされ、
 //! Shell の PathCache は executor での将来的な PATH 検索最適化用に保持される。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use libc::pid_t;
 
@@ -64,6 +64,8 @@ pub struct Shell {
     pub in_condition: usize,
     /// errexit 発動フラグ。run_command_string の早期リターンに使用。
     pub errexit_pending: bool,
+    /// 配列変数ストレージ。BTreeMap でスパース配列 + 順序付きイテレーションをサポート。
+    pub arrays: HashMap<String, BTreeMap<usize, String>>,
 }
 
 impl Shell {
@@ -92,6 +94,7 @@ impl Shell {
             set_pipefail: false,
             in_condition: 0,
             errexit_pending: false,
+            arrays: HashMap::new(),
         }
     }
 }

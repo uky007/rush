@@ -26,7 +26,11 @@
 //! - 継続行検出: 末尾の `|`, `&&`, `||` を [`ParseError::IncompleteInput`] として報告
 
 use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+
+/// 配列変数マップ型。キーは配列名、値はインデックス→要素の順序付きマップ。
+pub type ArrayMap = HashMap<String, BTreeMap<usize, String>>;
 
 // ── AST ─────────────────────────────────────────────────────────────
 
@@ -83,6 +87,12 @@ pub struct Command<'a> {
     /// サブシェル `( cmd1; cmd2 )` の本体テキスト。
     /// `Some` のとき args は空で、executor が fork して本体を実行する。
     pub subshell_body: Option<String>,
+    /// 配列代入 `arr=(a b c)`。
+    pub array_assignments: Vec<(String, Vec<String>)>,
+    /// 配列追加 `arr+=(a b c)`。
+    pub array_appends: Vec<(String, Vec<String>)>,
+    /// インデックス代入 `arr[N]=val`。
+    pub indexed_assignments: Vec<(String, usize, String)>,
 }
 
 /// ファイルリダイレクト指定。種別とターゲットファイルパスを持つ。
@@ -200,7 +210,7 @@ fn expand_tilde_prefix(s: &str) -> Cow<'_, str> {
 // ── Variable expansion (crate-private) ──────────────────────────────
 
 /// `$VAR` / `${VAR}` / `$?` を展開する。`$` が含まれなければゼロコピーの `Cow::Borrowed` を返す。
-fn expand_variables<'a>(s: &'a str, last_status: i32, pos_args: &[String], nounset: bool) -> Result<Cow<'a, str>, String> {
+pub fn expand_variables<'a>(s: &'a str, last_status: i32, pos_args: &[String], nounset: bool, arrays: &ArrayMap) -> Result<Cow<'a, str>, String> {
     if !s.contains('$') {
         return Ok(Cow::Borrowed(s));
     }
@@ -244,7 +254,7 @@ fn expand_variables<'a>(s: &'a str, last_status: i32, pos_args: &[String], nouns
                                     paren_depth -= 1;
                                 } else if pos + 1 < len && bytes[pos + 1] == b')' {
                                     let expr = &s[expr_start..pos];
-                                    result.push_str(&eval_arithmetic(expr, last_status, pos_args, nounset)?);
+                                    result.push_str(&eval_arithmetic(expr, last_status, pos_args, nounset, arrays)?);
                                     pos += 2; // skip '))'
                                     found = true;
                                     break;
@@ -361,7 +371,7 @@ fn expand_variables<'a>(s: &'a str, last_status: i32, pos_args: &[String], nouns
                     let inner = &s[var_start..pos];
                     pos += 1; // skip '}'
                     if !inner.is_empty() {
-                        result.push_str(&expand_braced_param(inner, last_status, pos_args, nounset)?);
+                        result.push_str(&expand_braced_param(inner, last_status, pos_args, nounset, arrays)?);
                     }
                 } else {
                     // 閉じ '}' がない → リテラル "${"
@@ -377,6 +387,9 @@ fn expand_variables<'a>(s: &'a str, last_status: i32, pos_args: &[String], nouns
                 let var_name = &s[var_start..pos];
                 if let Some(val) = resolve_special_var(var_name) {
                     result.push_str(&val);
+                } else if let Some(arr) = arrays.get(var_name) {
+                    // $arr → arr[0] と等価
+                    result.push_str(arr.get(&0).map(|s| s.as_str()).unwrap_or(""));
                 } else if let Ok(val) = std::env::var(var_name) {
                     result.push_str(&val);
                 } else if nounset {
@@ -434,19 +447,85 @@ fn is_var_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
+/// 配列添字 `name[subscript]` を解析する。`[` がなければ None。
+fn parse_array_subscript(s: &str) -> Option<(&str, &str)> {
+    let bracket_start = s.find('[')?;
+    let bracket_end = s.find(']')?;
+    if bracket_end <= bracket_start { return None; }
+    Some((&s[..bracket_start], &s[bracket_start + 1..bracket_end]))
+}
+
+/// 配列要素に展開演算子を適用する。
+fn apply_expansion_op(val: &str, _var_name: &str, op: &str, last_status: i32, pos_args: &[String], _nounset: bool, arrays: &ArrayMap) -> Result<String, String> {
+    let val = val.to_string();
+    if op.starts_with(":-") {
+        let operand = &op[2..];
+        return Ok(if val.is_empty() { expand_variables(operand, last_status, pos_args, false, arrays)?.into_owned() } else { val });
+    }
+    if op.starts_with(":+") {
+        let operand = &op[2..];
+        return Ok(if val.is_empty() { String::new() } else { expand_variables(operand, last_status, pos_args, false, arrays)?.into_owned() });
+    }
+    if op.starts_with(":?") {
+        let operand = &op[2..];
+        if val.is_empty() {
+            let msg = if operand.is_empty() { "parameter null or not set" } else { operand };
+            eprintln!("rush: {}: {}", _var_name, msg);
+            return Ok(String::new());
+        }
+        return Ok(val);
+    }
+    // ${arr[N]%%pat} 等 — パターン演算子
+    if op.starts_with("%%") { return Ok(strip_suffix_longest(&val, &op[2..])); }
+    if op.starts_with('%') { return Ok(strip_suffix_shortest(&val, &op[1..])); }
+    if op.starts_with("##") { return Ok(strip_prefix_longest(&val, &op[2..])); }
+    if op.starts_with('#') { return Ok(strip_prefix_shortest(&val, &op[1..])); }
+    if op.starts_with('/') {
+        let rest = &op[1..];
+        let (global, pattern_rest) = if rest.starts_with('/') {
+            (true, &rest[1..])
+        } else {
+            (false, rest)
+        };
+        let (pattern, replacement) = if let Some(sep) = pattern_rest.find('/') {
+            (&pattern_rest[..sep], &pattern_rest[sep + 1..])
+        } else {
+            (pattern_rest, "")
+        };
+        return Ok(if global { glob_replace_all(&val, pattern, replacement) } else { glob_replace_first(&val, pattern, replacement) });
+    }
+    Ok(val)
+}
+
 /// `${...}` 内のパラメータ展開を処理する。
 /// 対応: `${var:-default}`, `${var:=default}`, `${var:+alt}`, `${var:?msg}`,
 ///       `${#var}`, `${var%pat}`, `${var%%pat}`, `${var#pat}`, `${var##pat}`,
-///       `${var/pat/repl}`, `${var//pat/repl}`
+///       `${var/pat/repl}`, `${var//pat/repl}`, 配列添字展開
 /// 変数名から値を取得する。動的特殊変数を優先し、なければ環境変数を参照。
-fn get_var(name: &str) -> String {
-    resolve_special_var(name).unwrap_or_else(|| std::env::var(name).unwrap_or_default())
+fn get_var(name: &str, arrays: &ArrayMap) -> String {
+    if let Some(v) = resolve_special_var(name) { return v; }
+    if let Some(arr) = arrays.get(name) {
+        return arr.get(&0).cloned().unwrap_or_default();
+    }
+    std::env::var(name).unwrap_or_default()
 }
 
-fn expand_braced_param(inner: &str, last_status: i32, pos_args: &[String], nounset: bool) -> Result<String, String> {
-    // ${#var} — 文字数
+fn expand_braced_param(inner: &str, last_status: i32, pos_args: &[String], nounset: bool, arrays: &ArrayMap) -> Result<String, String> {
+    // ${#var} — 文字数 / ${#arr[@]} — 要素数
     if let Some(var_name) = inner.strip_prefix('#') {
-        let val = get_var(var_name);
+        // ${#arr[@]} / ${#arr[*]} — 配列要素数
+        if let Some((name, subscript)) = parse_array_subscript(var_name) {
+            if subscript == "@" || subscript == "*" {
+                let count = arrays.get(name).map(|a| a.len()).unwrap_or(0);
+                return Ok(count.to_string());
+            }
+            // ${#arr[N]} — 要素Nの文字数
+            if let Ok(idx) = subscript.parse::<usize>() {
+                let val = arrays.get(name).and_then(|a| a.get(&idx)).map(|s| s.as_str()).unwrap_or("");
+                return Ok(val.chars().count().to_string());
+            }
+        }
+        let val = get_var(var_name, arrays);
         return Ok(val.chars().count().to_string());
     }
 
@@ -459,26 +538,65 @@ fn expand_braced_param(inner: &str, last_status: i32, pos_args: &[String], nouns
 
     // 変数名の後に演算子がなければ通常の ${VAR}
     if name_end == bytes.len() {
-        let val = get_var(inner);
-        if val.is_empty() && nounset && resolve_special_var(inner).is_none() && std::env::var(inner).is_err() {
+        let val = get_var(inner, arrays);
+        if val.is_empty() && nounset && resolve_special_var(inner).is_none()
+            && !arrays.contains_key(inner) && std::env::var(inner).is_err()
+        {
             return Err(inner.to_string());
         }
         return Ok(val);
     }
 
     let var_name = &inner[..name_end];
-    let val = get_var(var_name);
     let op_and_rest = &inner[name_end..];
+
+    // 配列添字アクセス: ${arr[N]}, ${arr[@]}, ${arr[*]}
+    if op_and_rest.starts_with('[') {
+        if let Some(bracket_end) = op_and_rest.find(']') {
+            let subscript = &op_and_rest[1..bracket_end];
+            let after_bracket = &op_and_rest[bracket_end + 1..];
+
+            let val = if subscript == "@" {
+                // ${arr[@]} — 全要素を \x1F 区切りで返す
+                if let Some(arr) = arrays.get(var_name) {
+                    arr.values().cloned().collect::<Vec<_>>().join("\x1F")
+                } else {
+                    String::new()
+                }
+            } else if subscript == "*" {
+                // ${arr[*]} — 全要素をスペース結合
+                if let Some(arr) = arrays.get(var_name) {
+                    arr.values().cloned().collect::<Vec<_>>().join(" ")
+                } else {
+                    String::new()
+                }
+            } else if let Ok(idx) = subscript.parse::<usize>() {
+                // ${arr[N]} — 要素アクセス
+                arrays.get(var_name).and_then(|a| a.get(&idx)).cloned().unwrap_or_default()
+            } else {
+                String::new()
+            };
+
+            // after_bracket に展開演算子があれば適用
+            if after_bracket.is_empty() {
+                return Ok(val);
+            }
+            // 展開演算子を val に適用
+            return apply_expansion_op(&val, var_name, after_bracket, last_status, pos_args, nounset, arrays);
+        }
+    }
+
+    let val = get_var(var_name, arrays);
 
     // ${var:-default}, ${var:=default}, ${var:+alt}, ${var:?msg}
     if op_and_rest.starts_with(":-") {
         let operand = &op_and_rest[2..];
-        return Ok(if val.is_empty() { expand_variables(operand, last_status, pos_args, false)?.into_owned() } else { val });
+        return Ok(if val.is_empty() { expand_variables(operand, last_status, pos_args, false, arrays)?.into_owned() } else { val });
     }
     if op_and_rest.starts_with(":=") {
         let operand = &op_and_rest[2..];
         if val.is_empty() {
-            let def = expand_variables(operand, last_status, pos_args, false)?.into_owned();
+            let def = expand_variables(operand, last_status, pos_args, false, arrays)?.into_owned();
             std::env::set_var(var_name, &def);
             return Ok(def);
         }
@@ -486,7 +604,7 @@ fn expand_braced_param(inner: &str, last_status: i32, pos_args: &[String], nouns
     }
     if op_and_rest.starts_with(":+") {
         let operand = &op_and_rest[2..];
-        return Ok(if val.is_empty() { String::new() } else { expand_variables(operand, last_status, pos_args, false)?.into_owned() });
+        return Ok(if val.is_empty() { String::new() } else { expand_variables(operand, last_status, pos_args, false, arrays)?.into_owned() });
     }
     if op_and_rest.starts_with(":?") {
         let operand = &op_and_rest[2..];
@@ -624,8 +742,8 @@ fn glob_replace_all(val: &str, pattern: &str, replacement: &str) -> String {
 
 /// `$((expr))` の算術式を評価し、結果を文字列で返す。
 /// 式中の `$VAR` は先に変数展開し、裸の変数名は環境変数として参照する。
-fn eval_arithmetic(expr: &str, last_status: i32, pos_args: &[String], nounset: bool) -> Result<String, String> {
-    let expanded = expand_variables(expr, last_status, pos_args, nounset)?;
+fn eval_arithmetic(expr: &str, last_status: i32, pos_args: &[String], nounset: bool, arrays: &ArrayMap) -> Result<String, String> {
+    let expanded = expand_variables(expr, last_status, pos_args, nounset, arrays)?;
     let mut parser = ArithParser::new(&expanded);
     match parser.parse_expr() {
         Some(val) => Ok(val.to_string()),
@@ -798,11 +916,12 @@ struct Tokenizer<'a, 'b> {
     pos_args: &'b [String],
     nounset: bool,
     nounset_error: Option<String>,
+    arrays: &'b ArrayMap,
 }
 
 impl<'a, 'b> Tokenizer<'a, 'b> {
-    fn new(input: &'a str, last_status: i32, pos_args: &'b [String], nounset: bool) -> Self {
-        Self { input, pos: 0, last_status, pos_args, nounset, nounset_error: None }
+    fn new(input: &'a str, last_status: i32, pos_args: &'b [String], nounset: bool, arrays: &'b ArrayMap) -> Self {
+        Self { input, pos: 0, last_status, pos_args, nounset, nounset_error: None, arrays }
     }
 
     fn skip_whitespace(&mut self) {
@@ -887,7 +1006,7 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
                                     paren_depth -= 1;
                                 } else if self.pos + 1 < len && bytes[self.pos + 1] == b')' {
                                     let expr = &self.input[expr_start..self.pos];
-                                    match eval_arithmetic(expr, self.last_status, self.pos_args, self.nounset) {
+                                    match eval_arithmetic(expr, self.last_status, self.pos_args, self.nounset, self.arrays) {
                                         Ok(val) => buf.push_str(&val),
                                         Err(var_name) => {
                                             if self.nounset_error.is_none() { self.nounset_error = Some(var_name); }
@@ -978,7 +1097,7 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
                     let inner = &self.input[var_start..self.pos];
                     self.pos += 1; // skip '}'
                     if !inner.is_empty() {
-                        match expand_braced_param(inner, self.last_status, self.pos_args, self.nounset) {
+                        match expand_braced_param(inner, self.last_status, self.pos_args, self.nounset, self.arrays) {
                             Ok(val) => buf.push_str(&val),
                             Err(var_name) => {
                                 if self.nounset_error.is_none() { self.nounset_error = Some(var_name); }
@@ -998,6 +1117,8 @@ impl<'a, 'b> Tokenizer<'a, 'b> {
                 let var_name = &self.input[var_start..self.pos];
                 if let Some(val) = resolve_special_var(var_name) {
                     buf.push_str(&val);
+                } else if let Some(arr) = self.arrays.get(var_name) {
+                    buf.push_str(arr.get(&0).map(|s| s.as_str()).unwrap_or(""));
                 } else if let Ok(val) = std::env::var(var_name) {
                     buf.push_str(&val);
                 } else if self.nounset {
@@ -1187,7 +1308,7 @@ impl<'a, 'b> Iterator for Tokenizer<'a, 'b> {
                         if self.input.as_bytes()[self.pos] == b'"' {
                             let word = &self.input[start..self.pos];
                             self.pos += 1; // skip closing quote
-                            match expand_variables(word, self.last_status, self.pos_args, self.nounset) {
+                            match expand_variables(word, self.last_status, self.pos_args, self.nounset, self.arrays) {
                                 Ok(cow) => return Some(Ok(Token::Word(cow))),
                                 Err(var_name) => {
                                     if self.nounset_error.is_none() { self.nounset_error = Some(var_name); }
@@ -1288,7 +1409,7 @@ impl<'a, 'b> Iterator for Tokenizer<'a, 'b> {
                             }
                         }
                     }
-                    match expand_variables(&buf, self.last_status, self.pos_args, self.nounset) {
+                    match expand_variables(&buf, self.last_status, self.pos_args, self.nounset, self.arrays) {
                         Ok(expanded) => Some(Ok(Token::Word(Cow::Owned(expanded.into_owned())))),
                         Err(var_name) => {
                             if self.nounset_error.is_none() { self.nounset_error = Some(var_name); }
@@ -1334,7 +1455,7 @@ impl<'a, 'b> Iterator for Tokenizer<'a, 'b> {
                         }
                     }
                     let word = &self.input[start..self.pos];
-                    match expand_variables(word, self.last_status, self.pos_args, self.nounset) {
+                    match expand_variables(word, self.last_status, self.pos_args, self.nounset, self.arrays) {
                         Ok(cow) => Some(Ok(Token::Word(cow))),
                         Err(var_name) => {
                             if self.nounset_error.is_none() { self.nounset_error = Some(var_name); }
@@ -1389,30 +1510,114 @@ pub fn fill_heredoc_bodies(list: &mut CommandList<'_>, bodies: &[String]) {
 /// - 構文エラー → `Err(ParseError)`
 ///
 /// `last_status` は `$?` 展開に使用される。
-pub fn parse<'a>(input: &'a str, last_status: i32, pos_args: &[String], nounset: bool) -> Result<Option<CommandList<'a>>, ParseError> {
-    let mut tokens = Tokenizer::new(input, last_status, pos_args, nounset);
+pub fn parse<'a>(input: &'a str, last_status: i32, pos_args: &[String], nounset: bool, arrays: &ArrayMap) -> Result<Option<CommandList<'a>>, ParseError> {
+    let mut tokens = Tokenizer::new(input, last_status, pos_args, nounset, arrays);
     let mut items: Vec<ListItem<'_>> = Vec::new();
     let mut commands: Vec<Command<'_>> = Vec::new();
     let mut args: Vec<Cow<'_, str>> = Vec::new();
     let mut redirects: Vec<Redirect<'_>> = Vec::new();
     let mut assignments: Vec<(String, String)> = Vec::new();
     let mut subshell_body: Option<String> = None;
+    let mut array_assignments: Vec<(String, Vec<String>)> = Vec::new();
+    let mut array_appends: Vec<(String, Vec<String>)> = Vec::new();
+    let mut indexed_assignments: Vec<(String, usize, String)> = Vec::new();
     let mut background = false;
+    let mut pending_token: Option<Result<Token<'_>, ParseError>> = None;
 
-    while let Some(result) = tokens.next() {
+    while let Some(result) = pending_token.take().or_else(|| tokens.next()) {
         let token = result?;
         match token {
             Token::Word(w) => {
                 // コマンド先頭の VAR=val を代入として検出
                 // 条件: args が空（まだコマンド名を見ていない）かつ有効な識別子=値の形式
                 if args.is_empty() {
+                    // arr+=(...)  — 配列追加
+                    if let Some(plus_eq) = w.find("+=") {
+                        let name = &w[..plus_eq];
+                        if !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                            && !name.as_bytes()[0].is_ascii_digit()
+                        {
+                            let after_eq = &w[plus_eq + 2..];
+                            if after_eq.is_empty() {
+                                // 次のトークンを確認
+                                if let Some(next) = tokens.next() {
+                                    match next {
+                                        Ok(Token::LParen) => {
+                                            let mut elements = Vec::new();
+                                            loop {
+                                                match tokens.next() {
+                                                    Some(Ok(Token::RParen)) => break,
+                                                    Some(Ok(Token::Word(elem))) => elements.push(elem.to_string()),
+                                                    None => break,
+                                                    Some(Err(e)) => return Err(e),
+                                                    _ => {}
+                                                }
+                                            }
+                                            array_appends.push((name.to_string(), elements));
+                                            continue;
+                                        }
+                                        other => { pending_token = Some(other); }
+                                    }
+                                }
+                            }
+                            // arr+=val （非配列、通常の文字列追加）
+                            let cur = std::env::var(name).unwrap_or_default();
+                            let new_val = format!("{}{}", cur, after_eq);
+                            assignments.push((name.to_string(), new_val));
+                            continue;
+                        }
+                    }
+
+                    // arr[N]=val  — インデックス代入
+                    if let Some(bracket_start) = w.find('[') {
+                        if let Some(bracket_end) = w.find(']') {
+                            if bracket_end > bracket_start {
+                                let name = &w[..bracket_start];
+                                if let Some(eq_pos) = w[bracket_end..].find('=') {
+                                    let idx_str = &w[bracket_start + 1..bracket_end];
+                                    if let Ok(idx) = idx_str.parse::<usize>() {
+                                        if !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                                            && !name.as_bytes()[0].is_ascii_digit()
+                                        {
+                                            let value = w[bracket_end + 1 + eq_pos..].to_string();
+                                            indexed_assignments.push((name.to_string(), idx, value));
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     if let Some(eq_pos) = w.find('=') {
                         let name = &w[..eq_pos];
                         if !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
                             && !name.as_bytes()[0].is_ascii_digit()
                         {
-                            let value = w[eq_pos + 1..].to_string();
-                            assignments.push((name.to_string(), value));
+                            let value = &w[eq_pos + 1..];
+                            // arr=(...) — 配列代入: 値が空で次トークンが LParen
+                            if value.is_empty() {
+                                if let Some(next) = tokens.next() {
+                                    match next {
+                                        Ok(Token::LParen) => {
+                                            let mut elements = Vec::new();
+                                            loop {
+                                                match tokens.next() {
+                                                    Some(Ok(Token::RParen)) => break,
+                                                    Some(Ok(Token::Word(elem))) => elements.push(elem.to_string()),
+                                                    None => break,
+                                                    Some(Err(e)) => return Err(e),
+                                                    _ => {}
+                                                }
+                                            }
+                                            array_assignments.push((name.to_string(), elements));
+                                            continue;
+                                        }
+                                        other => { pending_token = Some(other); }
+                                    }
+                                }
+                            }
+                            assignments.push((name.to_string(), value.to_string()));
                             continue;
                         }
                     }
@@ -1420,7 +1625,9 @@ pub fn parse<'a>(input: &'a str, last_status: i32, pos_args: &[String], nounset:
                 args.push(w);
             }
             Token::Pipe => {
-                if args.is_empty() && assignments.is_empty() && subshell_body.is_none() {
+                if args.is_empty() && assignments.is_empty() && subshell_body.is_none()
+                    && array_assignments.is_empty() && array_appends.is_empty() && indexed_assignments.is_empty()
+                {
                     return Err(ParseError::EmptyPipelineSegment);
                 }
                 commands.push(Command {
@@ -1428,6 +1635,9 @@ pub fn parse<'a>(input: &'a str, last_status: i32, pos_args: &[String], nounset:
                     redirects: std::mem::take(&mut redirects),
                     assignments: std::mem::take(&mut assignments),
                     subshell_body: subshell_body.take(),
+                    array_assignments: std::mem::take(&mut array_assignments),
+                    array_appends: std::mem::take(&mut array_appends),
+                    indexed_assignments: std::mem::take(&mut indexed_assignments),
                 });
             }
             Token::And | Token::Or | Token::Semi => {
@@ -1438,19 +1648,26 @@ pub fn parse<'a>(input: &'a str, last_status: i32, pos_args: &[String], nounset:
                 };
 
                 // `;` の前に何もなくてもスキップ（bash 互換）
-                if args.is_empty() && commands.is_empty() && assignments.is_empty() && subshell_body.is_none() {
+                if args.is_empty() && commands.is_empty() && assignments.is_empty() && subshell_body.is_none()
+                    && array_assignments.is_empty() && array_appends.is_empty() && indexed_assignments.is_empty()
+                {
                     if matches!(connector, Connector::Seq) {
                         continue; // 先頭 `;` や `;;` はスキップ
                     }
                     return Err(ParseError::EmptyPipelineSegment);
                 }
 
-                if !args.is_empty() || !assignments.is_empty() || subshell_body.is_some() {
+                if !args.is_empty() || !assignments.is_empty() || subshell_body.is_some()
+                    || !array_assignments.is_empty() || !array_appends.is_empty() || !indexed_assignments.is_empty()
+                {
                     commands.push(Command {
                         args: std::mem::take(&mut args),
                         redirects: std::mem::take(&mut redirects),
                         assignments: std::mem::take(&mut assignments),
                         subshell_body: subshell_body.take(),
+                        array_assignments: std::mem::take(&mut array_assignments),
+                        array_appends: std::mem::take(&mut array_appends),
+                        indexed_assignments: std::mem::take(&mut indexed_assignments),
                     });
                 }
 
@@ -1464,17 +1681,24 @@ pub fn parse<'a>(input: &'a str, last_status: i32, pos_args: &[String], nounset:
                 background = false;
             }
             Token::Ampersand => {
-                if args.is_empty() && commands.is_empty() && assignments.is_empty() && subshell_body.is_none() {
+                if args.is_empty() && commands.is_empty() && assignments.is_empty() && subshell_body.is_none()
+                    && array_assignments.is_empty() && array_appends.is_empty() && indexed_assignments.is_empty()
+                {
                     return Err(ParseError::EmptyPipelineSegment);
                 }
 
                 // `&` の後にコマンドが続くケースをサポート（`cmd1 & cmd2`）
-                if !args.is_empty() || !assignments.is_empty() || subshell_body.is_some() {
+                if !args.is_empty() || !assignments.is_empty() || subshell_body.is_some()
+                    || !array_assignments.is_empty() || !array_appends.is_empty() || !indexed_assignments.is_empty()
+                {
                     commands.push(Command {
                         args: std::mem::take(&mut args),
                         redirects: std::mem::take(&mut redirects),
                         assignments: std::mem::take(&mut assignments),
                         subshell_body: subshell_body.take(),
+                        array_assignments: std::mem::take(&mut array_assignments),
+                        array_appends: std::mem::take(&mut array_appends),
+                        indexed_assignments: std::mem::take(&mut indexed_assignments),
                     });
                 }
 
@@ -1555,13 +1779,17 @@ pub fn parse<'a>(input: &'a str, last_status: i32, pos_args: &[String], nounset:
     }
 
     // 末尾パイプ: commands があるが args がない → 継続行入力のトリガー
-    if !commands.is_empty() && args.is_empty() && redirects.is_empty() && assignments.is_empty() && subshell_body.is_none() {
+    if !commands.is_empty() && args.is_empty() && redirects.is_empty() && assignments.is_empty() && subshell_body.is_none()
+        && array_assignments.is_empty() && array_appends.is_empty() && indexed_assignments.is_empty()
+    {
         return Err(ParseError::IncompleteInput);
     }
 
     // 最終パイプラインの処理
-    if !args.is_empty() || !assignments.is_empty() || subshell_body.is_some() {
-        commands.push(Command { args, redirects, assignments, subshell_body });
+    if !args.is_empty() || !assignments.is_empty() || subshell_body.is_some()
+        || !array_assignments.is_empty() || !array_appends.is_empty() || !indexed_assignments.is_empty()
+    {
+        commands.push(Command { args, redirects, assignments, subshell_body, array_assignments, array_appends, indexed_assignments });
     } else if !redirects.is_empty() {
         // リダイレクトのみ（コマンドなし）
         return Err(ParseError::EmptyPipelineSegment);
@@ -1601,7 +1829,7 @@ mod tests {
 
     /// パース結果から最初のパイプラインの各コマンドの引数を文字列ベクタとして取り出す。
     fn parse_args(input: &str) -> Vec<Vec<String>> {
-        let list = parse(input, 0, &[], false).unwrap().unwrap();
+        let list = parse(input, 0, &[], false, &HashMap::new()).unwrap().unwrap();
         list.items[0]
             .pipeline
             .commands
@@ -1682,7 +1910,7 @@ mod tests {
 
     #[test]
     fn redirect_output() {
-        let list = parse("echo hello > out.txt", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo hello > out.txt", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         let p = &list.items[0].pipeline;
         assert_eq!(p.commands.len(), 1);
         assert_eq!(p.commands[0].args.len(), 2);
@@ -1693,7 +1921,7 @@ mod tests {
 
     #[test]
     fn redirect_append() {
-        let list = parse("echo hello >> out.txt", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo hello >> out.txt", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         let p = &list.items[0].pipeline;
         assert_eq!(p.commands[0].redirects[0].kind, RedirectKind::Append);
         assert_eq!(p.commands[0].redirects[0].target, "out.txt");
@@ -1701,7 +1929,7 @@ mod tests {
 
     #[test]
     fn redirect_input() {
-        let list = parse("cat < in.txt", 0, &[], false).unwrap().unwrap();
+        let list = parse("cat < in.txt", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         let p = &list.items[0].pipeline;
         assert_eq!(p.commands[0].redirects[0].kind, RedirectKind::Input);
         assert_eq!(p.commands[0].redirects[0].target, "in.txt");
@@ -1709,7 +1937,7 @@ mod tests {
 
     #[test]
     fn redirect_stderr() {
-        let list = parse("ls 2> err.txt", 0, &[], false).unwrap().unwrap();
+        let list = parse("ls 2> err.txt", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         let p = &list.items[0].pipeline;
         assert_eq!(p.commands[0].redirects[0].kind, RedirectKind::Stderr);
         assert_eq!(p.commands[0].redirects[0].target, "err.txt");
@@ -1717,7 +1945,7 @@ mod tests {
 
     #[test]
     fn redirect_stderr_append() {
-        let list = parse("cmd 2>> err.log", 0, &[], false).unwrap().unwrap();
+        let list = parse("cmd 2>> err.log", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         let p = &list.items[0].pipeline;
         assert_eq!(p.commands[0].redirects[0].kind, RedirectKind::StderrAppend);
         assert_eq!(p.commands[0].redirects[0].target, "err.log");
@@ -1725,7 +1953,7 @@ mod tests {
 
     #[test]
     fn here_string() {
-        let list = parse("cat <<<hello", 0, &[], false).unwrap().unwrap();
+        let list = parse("cat <<<hello", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         let p = &list.items[0].pipeline;
         assert_eq!(p.commands[0].args[0], "cat");
         assert_eq!(p.commands[0].redirects[0].kind, RedirectKind::HereString);
@@ -1734,7 +1962,7 @@ mod tests {
 
     #[test]
     fn here_string_with_space() {
-        let list = parse("cat <<< word", 0, &[], false).unwrap().unwrap();
+        let list = parse("cat <<< word", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         let p = &list.items[0].pipeline;
         assert_eq!(p.commands[0].redirects[0].kind, RedirectKind::HereString);
         assert_eq!(p.commands[0].redirects[0].target, "word");
@@ -1742,7 +1970,7 @@ mod tests {
 
     #[test]
     fn here_doc_delimiter() {
-        let list = parse("cat <<EOF", 0, &[], false).unwrap().unwrap();
+        let list = parse("cat <<EOF", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         let p = &list.items[0].pipeline;
         assert_eq!(p.commands[0].redirects[0].kind, RedirectKind::HereDoc);
         assert_eq!(p.commands[0].redirects[0].target, "EOF");
@@ -1750,21 +1978,21 @@ mod tests {
 
     #[test]
     fn here_doc_delimiters_fn() {
-        let list = parse("cat <<EOF", 0, &[], false).unwrap().unwrap();
+        let list = parse("cat <<EOF", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         let delims = heredoc_delimiters(&list);
         assert_eq!(delims, vec!["EOF"]);
     }
 
     #[test]
     fn redirect_no_space() {
-        let list = parse("echo hello >out.txt", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo hello >out.txt", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         let p = &list.items[0].pipeline;
         assert_eq!(p.commands[0].redirects[0].target, "out.txt");
     }
 
     #[test]
     fn multiple_redirects() {
-        let list = parse("cmd < in.txt > out.txt 2> err.txt", 0, &[], false).unwrap().unwrap();
+        let list = parse("cmd < in.txt > out.txt 2> err.txt", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         let p = &list.items[0].pipeline;
         assert_eq!(p.commands[0].redirects.len(), 3);
         assert_eq!(p.commands[0].redirects[0].kind, RedirectKind::Input);
@@ -1776,7 +2004,7 @@ mod tests {
 
     #[test]
     fn pipeline_with_redirects() {
-        let list = parse("cat < in.txt | grep hello > out.txt", 0, &[], false).unwrap().unwrap();
+        let list = parse("cat < in.txt | grep hello > out.txt", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         let p = &list.items[0].pipeline;
         assert_eq!(p.commands.len(), 2);
         assert_eq!(p.commands[0].redirects[0].kind, RedirectKind::Input);
@@ -1789,7 +2017,7 @@ mod tests {
 
     #[test]
     fn two_is_not_stderr_redirect_with_space() {
-        let list = parse("echo 2 > file", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo 2 > file", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         let p = &list.items[0].pipeline;
         assert_eq!(p.commands[0].args.len(), 2);
         assert_eq!(p.commands[0].args[1], "2");
@@ -1800,9 +2028,9 @@ mod tests {
 
     #[test]
     fn empty_input() {
-        assert!(parse("", 0, &[], false).unwrap().is_none());
-        assert!(parse("   ", 0, &[], false).unwrap().is_none());
-        assert!(parse("\t\n", 0, &[], false).unwrap().is_none());
+        assert!(parse("", 0, &[], false, &HashMap::new()).unwrap().is_none());
+        assert!(parse("   ", 0, &[], false, &HashMap::new()).unwrap().is_none());
+        assert!(parse("\t\n", 0, &[], false, &HashMap::new()).unwrap().is_none());
     }
 
     // ── エラーケース ──
@@ -1810,7 +2038,7 @@ mod tests {
     #[test]
     fn err_unterminated_single_quote() {
         assert_eq!(
-            parse("echo 'hello", 0, &[], false),
+            parse("echo 'hello", 0, &[], false, &HashMap::new()),
             Err(ParseError::UnterminatedQuote('\'')),
         );
     }
@@ -1818,43 +2046,43 @@ mod tests {
     #[test]
     fn err_unterminated_double_quote() {
         assert_eq!(
-            parse("echo \"hello", 0, &[], false),
+            parse("echo \"hello", 0, &[], false, &HashMap::new()),
             Err(ParseError::UnterminatedQuote('"')),
         );
     }
 
     #[test]
     fn err_missing_redirect_target() {
-        assert_eq!(parse("echo >", 0, &[], false), Err(ParseError::MissingRedirectTarget));
+        assert_eq!(parse("echo >", 0, &[], false, &HashMap::new()), Err(ParseError::MissingRedirectTarget));
     }
 
     #[test]
     fn err_redirect_followed_by_pipe() {
-        assert_eq!(parse("echo > | cat", 0, &[], false), Err(ParseError::MissingRedirectTarget));
+        assert_eq!(parse("echo > | cat", 0, &[], false, &HashMap::new()), Err(ParseError::MissingRedirectTarget));
     }
 
     #[test]
     fn err_leading_pipe() {
-        assert_eq!(parse("| ls", 0, &[], false), Err(ParseError::EmptyPipelineSegment));
+        assert_eq!(parse("| ls", 0, &[], false, &HashMap::new()), Err(ParseError::EmptyPipelineSegment));
     }
 
     #[test]
     fn err_trailing_pipe() {
-        assert_eq!(parse("ls |", 0, &[], false), Err(ParseError::IncompleteInput));
+        assert_eq!(parse("ls |", 0, &[], false, &HashMap::new()), Err(ParseError::IncompleteInput));
     }
 
     #[test]
     fn err_double_pipe_operator() {
         // `ls | | grep` → first `|` consumed as Pipe, then `| grep` → EmptyPipelineSegment
         // because after Pipe, args is empty and next token is `|` (Pipe)
-        assert_eq!(parse("ls | | grep", 0, &[], false), Err(ParseError::EmptyPipelineSegment));
+        assert_eq!(parse("ls | | grep", 0, &[], false, &HashMap::new()), Err(ParseError::EmptyPipelineSegment));
     }
 
     // ── background (&) ──
 
     #[test]
     fn background_simple() {
-        let list = parse("sleep 10 &", 0, &[], false).unwrap().unwrap();
+        let list = parse("sleep 10 &", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         let p = &list.items[0].pipeline;
         assert!(p.background);
         assert_eq!(p.commands.len(), 1);
@@ -1863,7 +2091,7 @@ mod tests {
 
     #[test]
     fn background_pipeline() {
-        let list = parse("ls | grep foo &", 0, &[], false).unwrap().unwrap();
+        let list = parse("ls | grep foo &", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         let p = &list.items[0].pipeline;
         assert!(p.background);
         assert_eq!(p.commands.len(), 2);
@@ -1871,13 +2099,13 @@ mod tests {
 
     #[test]
     fn background_bare_ampersand() {
-        assert_eq!(parse("&", 0, &[], false), Err(ParseError::EmptyPipelineSegment));
+        assert_eq!(parse("&", 0, &[], false, &HashMap::new()), Err(ParseError::EmptyPipelineSegment));
     }
 
     #[test]
     fn background_followed_by_command() {
         // `cmd & extra` → 2 items: cmd (background), extra (foreground)
-        let list = parse("cmd & extra", 0, &[], false).unwrap().unwrap();
+        let list = parse("cmd & extra", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items.len(), 2);
         assert!(list.items[0].pipeline.background);
         assert_eq!(list.items[0].pipeline.commands[0].args[0], "cmd");
@@ -1887,7 +2115,7 @@ mod tests {
 
     #[test]
     fn no_background_flag() {
-        let list = parse("ls", 0, &[], false).unwrap().unwrap();
+        let list = parse("ls", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert!(!list.items[0].pipeline.background);
     }
 
@@ -1895,7 +2123,7 @@ mod tests {
 
     #[test]
     fn cow_is_borrowed() {
-        let list = parse("echo hello", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo hello", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         for arg in &list.items[0].pipeline.commands[0].args {
             assert!(matches!(arg, Cow::Borrowed(_)), "expected Borrowed, got Owned");
         }
@@ -1903,7 +2131,7 @@ mod tests {
 
     #[test]
     fn cow_quoted_is_borrowed() {
-        let list = parse("echo 'hello world'", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo 'hello world'", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert!(matches!(&list.items[0].pipeline.commands[0].args[1], Cow::Borrowed(_)));
     }
 
@@ -1912,20 +2140,20 @@ mod tests {
     #[test]
     fn expand_env_var() {
         std::env::set_var("RUSH_TEST_VAR", "hello");
-        let list = parse("echo $RUSH_TEST_VAR", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo $RUSH_TEST_VAR", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "hello");
         std::env::remove_var("RUSH_TEST_VAR");
     }
 
     #[test]
     fn expand_last_status() {
-        let list = parse("echo $?", 42, &[], false).unwrap().unwrap();
+        let list = parse("echo $?", 42, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "42");
     }
 
     #[test]
     fn expand_dollar_dollar() {
-        let list = parse("echo $$", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo $$", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         let val: i32 = list.items[0].pipeline.commands[0].args[1].parse().unwrap();
         assert!(val > 0); // should be a valid PID
     }
@@ -1933,20 +2161,20 @@ mod tests {
     #[test]
     fn expand_dollar_bang() {
         std::env::set_var("RUSH_LAST_BG_PID", "12345");
-        let list = parse("echo $!", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo $!", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "12345");
         std::env::remove_var("RUSH_LAST_BG_PID");
     }
 
     #[test]
     fn expand_dollar_zero() {
-        let list = parse("echo $0", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo $0", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "rush");
     }
 
     #[test]
     fn expand_random() {
-        let list = parse("echo $RANDOM", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo $RANDOM", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         let val: u64 = list.items[0].pipeline.commands[0].args[1]
             .parse()
             .expect("$RANDOM should be a number");
@@ -1955,7 +2183,7 @@ mod tests {
 
     #[test]
     fn expand_seconds() {
-        let list = parse("echo $SECONDS", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo $SECONDS", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         let val: u64 = list.items[0].pipeline.commands[0].args[1]
             .parse()
             .expect("$SECONDS should be a number");
@@ -1965,7 +2193,7 @@ mod tests {
 
     #[test]
     fn expand_random_in_braces() {
-        let list = parse("echo ${RANDOM}", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo ${RANDOM}", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         let val: u64 = list.items[0].pipeline.commands[0].args[1]
             .parse()
             .expect("${RANDOM} should be a number");
@@ -1974,7 +2202,7 @@ mod tests {
 
     #[test]
     fn expand_seconds_in_braces() {
-        let list = parse("echo ${SECONDS}", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo ${SECONDS}", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         let val: u64 = list.items[0].pipeline.commands[0].args[1]
             .parse()
             .expect("${SECONDS} should be a number");
@@ -1984,14 +2212,14 @@ mod tests {
     #[test]
     fn expand_undefined_var() {
         std::env::remove_var("RUSH_NONEXISTENT_VAR_XYZ");
-        let list = parse("echo $RUSH_NONEXISTENT_VAR_XYZ", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo $RUSH_NONEXISTENT_VAR_XYZ", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "");
     }
 
     #[test]
     fn single_quote_no_expand() {
         std::env::set_var("RUSH_TEST_VAR2", "expanded");
-        let list = parse("echo '$RUSH_TEST_VAR2'", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo '$RUSH_TEST_VAR2'", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "$RUSH_TEST_VAR2");
         assert!(matches!(&list.items[0].pipeline.commands[0].args[1], Cow::Borrowed(_)));
         std::env::remove_var("RUSH_TEST_VAR2");
@@ -2000,7 +2228,7 @@ mod tests {
     #[test]
     fn double_quote_expand() {
         std::env::set_var("RUSH_TEST_VAR3", "world");
-        let list = parse("echo \"hello $RUSH_TEST_VAR3\"", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo \"hello $RUSH_TEST_VAR3\"", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "hello world");
         std::env::remove_var("RUSH_TEST_VAR3");
     }
@@ -2008,34 +2236,34 @@ mod tests {
     #[test]
     fn redirect_target_expand() {
         std::env::set_var("RUSH_TEST_DIR", "/tmp");
-        let list = parse("echo hello > $RUSH_TEST_DIR/out.txt", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo hello > $RUSH_TEST_DIR/out.txt", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].redirects[0].target, "/tmp/out.txt");
         std::env::remove_var("RUSH_TEST_DIR");
     }
 
     #[test]
     fn bare_dollar_at_end() {
-        let list = parse("echo $", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo $", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "$");
     }
 
     #[test]
     fn dollar_at_expands_positional() {
         // $@ expands to all positional parameters (empty when none set)
-        let list = parse("echo $@", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo $@", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "");
     }
 
     #[test]
     fn no_dollar_cow_borrowed() {
-        let list = parse("echo hello", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo hello", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert!(matches!(&list.items[0].pipeline.commands[0].args[0], Cow::Borrowed(_)));
         assert!(matches!(&list.items[0].pipeline.commands[0].args[1], Cow::Borrowed(_)));
     }
 
     #[test]
     fn double_quote_no_dollar_cow_borrowed() {
-        let list = parse("echo \"hello\"", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo \"hello\"", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert!(matches!(&list.items[0].pipeline.commands[0].args[1], Cow::Borrowed(_)));
     }
 
@@ -2043,7 +2271,7 @@ mod tests {
 
     #[test]
     fn and_connector() {
-        let list = parse("echo a && echo b", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo a && echo b", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items.len(), 2);
         assert_eq!(list.items[0].connector, Connector::And);
         assert_eq!(list.items[0].pipeline.commands[0].args[0], "echo");
@@ -2055,21 +2283,21 @@ mod tests {
 
     #[test]
     fn or_connector() {
-        let list = parse("false || echo ok", 0, &[], false).unwrap().unwrap();
+        let list = parse("false || echo ok", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items.len(), 2);
         assert_eq!(list.items[0].connector, Connector::Or);
     }
 
     #[test]
     fn seq_connector() {
-        let list = parse("echo a ; echo b", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo a ; echo b", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items.len(), 2);
         assert_eq!(list.items[0].connector, Connector::Seq);
     }
 
     #[test]
     fn mixed_connectors() {
-        let list = parse("a && b || c ; d", 0, &[], false).unwrap().unwrap();
+        let list = parse("a && b || c ; d", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items.len(), 4);
         assert_eq!(list.items[0].connector, Connector::And);
         assert_eq!(list.items[1].connector, Connector::Or);
@@ -2079,7 +2307,7 @@ mod tests {
 
     #[test]
     fn background_then_command() {
-        let list = parse("sleep 1 & echo done", 0, &[], false).unwrap().unwrap();
+        let list = parse("sleep 1 & echo done", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items.len(), 2);
         assert!(list.items[0].pipeline.background);
         assert!(!list.items[1].pipeline.background);
@@ -2088,72 +2316,72 @@ mod tests {
 
     #[test]
     fn leading_semi_skipped() {
-        let list = parse("; echo hello", 0, &[], false).unwrap().unwrap();
+        let list = parse("; echo hello", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items.len(), 1);
         assert_eq!(list.items[0].pipeline.commands[0].args[0], "echo");
     }
 
     #[test]
     fn trailing_semi_ok() {
-        let list = parse("echo hello ;", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo hello ;", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items.len(), 1);
     }
 
     #[test]
     fn double_semi_skipped() {
-        let list = parse("echo a ;; echo b", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo a ;; echo b", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items.len(), 2);
     }
 
     #[test]
     fn only_semicolons() {
-        assert!(parse(";;;", 0, &[], false).unwrap().is_none());
+        assert!(parse(";;;", 0, &[], false, &HashMap::new()).unwrap().is_none());
     }
 
     #[test]
     fn err_leading_and() {
-        assert_eq!(parse("&& cmd", 0, &[], false), Err(ParseError::EmptyPipelineSegment));
+        assert_eq!(parse("&& cmd", 0, &[], false, &HashMap::new()), Err(ParseError::EmptyPipelineSegment));
     }
 
     #[test]
     fn err_trailing_and() {
-        assert_eq!(parse("cmd &&", 0, &[], false), Err(ParseError::IncompleteInput));
+        assert_eq!(parse("cmd &&", 0, &[], false, &HashMap::new()), Err(ParseError::IncompleteInput));
     }
 
     #[test]
     fn err_leading_or() {
         // `||` at start: first `||` is Or token, empty pipeline before it
-        assert_eq!(parse("|| cmd", 0, &[], false), Err(ParseError::EmptyPipelineSegment));
+        assert_eq!(parse("|| cmd", 0, &[], false, &HashMap::new()), Err(ParseError::EmptyPipelineSegment));
     }
 
     #[test]
     fn err_trailing_or() {
-        assert_eq!(parse("cmd ||", 0, &[], false), Err(ParseError::IncompleteInput));
+        assert_eq!(parse("cmd ||", 0, &[], false, &HashMap::new()), Err(ParseError::IncompleteInput));
     }
 
     // ── エスケープテスト ──
 
     #[test]
     fn escape_double_quote_in_dquote() {
-        let list = parse(r#"echo "hello\"world""#, 0, &[], false).unwrap().unwrap();
+        let list = parse(r#"echo "hello\"world""#, 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "hello\"world");
     }
 
     #[test]
     fn escape_backslash_in_dquote() {
-        let list = parse(r#"echo "a\\b""#, 0, &[], false).unwrap().unwrap();
+        let list = parse(r#"echo "a\\b""#, 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "a\\b");
     }
 
     #[test]
     fn escape_dollar_in_dquote() {
-        let list = parse(r#"echo "\$HOME""#, 0, &[], false).unwrap().unwrap();
+        let list = parse(r#"echo "\$HOME""#, 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "$HOME");
     }
 
     #[test]
     fn escape_space_in_bare_word() {
-        let list = parse(r"echo file\ name", 0, &[], false).unwrap().unwrap();
+        let list = parse(r"echo file\ name", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "file name");
     }
 
@@ -2162,7 +2390,7 @@ mod tests {
     #[test]
     fn expand_braced_var() {
         std::env::set_var("RUSH_TEST_BRACE", "braced");
-        let list = parse("echo ${RUSH_TEST_BRACE}", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo ${RUSH_TEST_BRACE}", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "braced");
         std::env::remove_var("RUSH_TEST_BRACE");
     }
@@ -2170,7 +2398,7 @@ mod tests {
     #[test]
     fn expand_braced_var_with_suffix() {
         std::env::set_var("RUSH_TEST_BSUF", "val");
-        let list = parse("echo ${RUSH_TEST_BSUF}suffix", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo ${RUSH_TEST_BSUF}suffix", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "valsuffix");
         std::env::remove_var("RUSH_TEST_BSUF");
     }
@@ -2178,14 +2406,14 @@ mod tests {
     #[test]
     fn expand_braced_undefined() {
         std::env::remove_var("RUSH_TEST_BUNDEF_XYZ");
-        let list = parse("echo ${RUSH_TEST_BUNDEF_XYZ}", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo ${RUSH_TEST_BUNDEF_XYZ}", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "");
     }
 
     #[test]
     fn braced_unclosed() {
         // `${` without closing `}` → literal "${" then rest
-        let list = parse("echo ${abc", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo ${abc", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "${abc");
     }
 
@@ -2223,21 +2451,21 @@ mod tests {
 
     #[test]
     fn fd_dup_2_to_1() {
-        let list = parse("cmd 2>&1", 0, &[], false).unwrap().unwrap();
+        let list = parse("cmd 2>&1", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         let r = &list.items[0].pipeline.commands[0].redirects[0];
         assert_eq!(r.kind, RedirectKind::FdDup { src_fd: 2, dst_fd: 1 });
     }
 
     #[test]
     fn fd_dup_stdout_to_stderr() {
-        let list = parse("cmd >&2", 0, &[], false).unwrap().unwrap();
+        let list = parse("cmd >&2", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         let r = &list.items[0].pipeline.commands[0].redirects[0];
         assert_eq!(r.kind, RedirectKind::FdDup { src_fd: 1, dst_fd: 2 });
     }
 
     #[test]
     fn fd_dup_with_file_redirect() {
-        let list = parse("cmd > out 2>&1", 0, &[], false).unwrap().unwrap();
+        let list = parse("cmd > out 2>&1", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         let redirects = &list.items[0].pipeline.commands[0].redirects;
         assert_eq!(redirects.len(), 2);
         assert_eq!(redirects[0].kind, RedirectKind::Output);
@@ -2247,32 +2475,32 @@ mod tests {
 
     #[test]
     fn fd_dup_bad_target() {
-        assert_eq!(parse("cmd 2>&abc", 0, &[], false), Err(ParseError::BadFdRedirect));
+        assert_eq!(parse("cmd 2>&abc", 0, &[], false, &HashMap::new()), Err(ParseError::BadFdRedirect));
     }
 
     // ── コマンド置換パススルーテスト ──
 
     #[test]
     fn cmd_sub_passthrough() {
-        let list = parse("echo $(date)", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo $(date)", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "$(date)");
     }
 
     #[test]
     fn backtick_passthrough() {
-        let list = parse("echo `date`", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo `date`", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "`date`");
     }
 
     #[test]
     fn cmd_sub_nested() {
-        let list = parse("echo $(echo $(whoami))", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo $(echo $(whoami))", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "$(echo $(whoami))");
     }
 
     #[test]
     fn cmd_sub_in_double_quotes() {
-        let list = parse("echo \"today is $(date)\"", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo \"today is $(date)\"", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "today is $(date)");
     }
 
@@ -2281,11 +2509,11 @@ mod tests {
     #[test]
     fn param_default() {
         std::env::remove_var("RUSH_TEST_PDEF");
-        let list = parse("echo ${RUSH_TEST_PDEF:-hello}", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo ${RUSH_TEST_PDEF:-hello}", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "hello");
 
         std::env::set_var("RUSH_TEST_PDEF", "world");
-        let list = parse("echo ${RUSH_TEST_PDEF:-hello}", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo ${RUSH_TEST_PDEF:-hello}", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "world");
         std::env::remove_var("RUSH_TEST_PDEF");
     }
@@ -2293,11 +2521,11 @@ mod tests {
     #[test]
     fn param_alt() {
         std::env::remove_var("RUSH_TEST_PALT");
-        let list = parse("echo ${RUSH_TEST_PALT:+yes}", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo ${RUSH_TEST_PALT:+yes}", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "");
 
         std::env::set_var("RUSH_TEST_PALT", "val");
-        let list = parse("echo ${RUSH_TEST_PALT:+yes}", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo ${RUSH_TEST_PALT:+yes}", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "yes");
         std::env::remove_var("RUSH_TEST_PALT");
     }
@@ -2305,7 +2533,7 @@ mod tests {
     #[test]
     fn param_length() {
         std::env::set_var("RUSH_TEST_PLEN", "hello");
-        let list = parse("echo ${#RUSH_TEST_PLEN}", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo ${#RUSH_TEST_PLEN}", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "5");
         std::env::remove_var("RUSH_TEST_PLEN");
     }
@@ -2313,9 +2541,9 @@ mod tests {
     #[test]
     fn param_strip_suffix() {
         std::env::set_var("RUSH_TEST_PSUF", "hello.tar.gz");
-        let list = parse("echo ${RUSH_TEST_PSUF%.*}", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo ${RUSH_TEST_PSUF%.*}", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "hello.tar");
-        let list = parse("echo ${RUSH_TEST_PSUF%%.*}", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo ${RUSH_TEST_PSUF%%.*}", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "hello");
         std::env::remove_var("RUSH_TEST_PSUF");
     }
@@ -2323,9 +2551,9 @@ mod tests {
     #[test]
     fn param_strip_prefix() {
         std::env::set_var("RUSH_TEST_PPRE", "/usr/local/bin");
-        let list = parse("echo ${RUSH_TEST_PPRE#*/}", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo ${RUSH_TEST_PPRE#*/}", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "usr/local/bin");
-        let list = parse("echo ${RUSH_TEST_PPRE##*/}", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo ${RUSH_TEST_PPRE##*/}", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "bin");
         std::env::remove_var("RUSH_TEST_PPRE");
     }
@@ -2333,9 +2561,9 @@ mod tests {
     #[test]
     fn param_replace() {
         std::env::set_var("RUSH_TEST_PREP", "hello world hello");
-        let list = parse("echo ${RUSH_TEST_PREP/hello/bye}", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo ${RUSH_TEST_PREP/hello/bye}", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "bye world hello");
-        let list = parse("echo ${RUSH_TEST_PREP//hello/bye}", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo ${RUSH_TEST_PREP//hello/bye}", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "bye world bye");
         std::env::remove_var("RUSH_TEST_PREP");
     }
@@ -2344,46 +2572,46 @@ mod tests {
 
     #[test]
     fn arith_basic() {
-        let list = parse("echo $((1+2))", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo $((1+2))", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "3");
     }
 
     #[test]
     fn arith_precedence() {
-        let list = parse("echo $((2+3*4))", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo $((2+3*4))", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "14");
     }
 
     #[test]
     fn arith_parens() {
-        let list = parse("echo $((2*(3+4)))", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo $((2*(3+4)))", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "14");
     }
 
     #[test]
     fn arith_div_mod() {
-        let list = parse("echo $((10/3))", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo $((10/3))", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "3");
-        let list = parse("echo $((10%3))", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo $((10%3))", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "1");
     }
 
     #[test]
     fn arith_negative() {
-        let list = parse("echo $((-5+3))", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo $((-5+3))", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "-2");
     }
 
     #[test]
     fn arith_spaces() {
-        let list = parse("echo $(( 10 + 20 ))", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo $(( 10 + 20 ))", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "30");
     }
 
     #[test]
     fn arith_variable() {
         std::env::set_var("RUSH_TEST_ARITH", "7");
-        let list = parse("echo $((RUSH_TEST_ARITH+3))", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo $((RUSH_TEST_ARITH+3))", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "10");
         std::env::remove_var("RUSH_TEST_ARITH");
     }
@@ -2391,14 +2619,14 @@ mod tests {
     #[test]
     fn arith_dollar_variable() {
         std::env::set_var("RUSH_TEST_ARITH2", "5");
-        let list = parse("echo $(($RUSH_TEST_ARITH2*2))", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo $(($RUSH_TEST_ARITH2*2))", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "10");
         std::env::remove_var("RUSH_TEST_ARITH2");
     }
 
     #[test]
     fn arith_in_double_quotes() {
-        let list = parse("echo \"result=$((1+2))\"", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo \"result=$((1+2))\"", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "result=3");
     }
 
@@ -2406,24 +2634,24 @@ mod tests {
 
     #[test]
     fn incomplete_trailing_pipe() {
-        assert_eq!(parse("ls |", 0, &[], false), Err(ParseError::IncompleteInput));
+        assert_eq!(parse("ls |", 0, &[], false, &HashMap::new()), Err(ParseError::IncompleteInput));
         // 継続入力後の再パースは成功する
-        let list = parse("ls |\ngrep foo", 0, &[], false).unwrap().unwrap();
+        let list = parse("ls |\ngrep foo", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands.len(), 2);
     }
 
     #[test]
     fn incomplete_trailing_and() {
-        assert_eq!(parse("true &&", 0, &[], false), Err(ParseError::IncompleteInput));
-        let list = parse("true &&\necho ok", 0, &[], false).unwrap().unwrap();
+        assert_eq!(parse("true &&", 0, &[], false, &HashMap::new()), Err(ParseError::IncompleteInput));
+        let list = parse("true &&\necho ok", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items.len(), 2);
         assert_eq!(list.items[0].connector, Connector::And);
     }
 
     #[test]
     fn incomplete_trailing_or() {
-        assert_eq!(parse("false ||", 0, &[], false), Err(ParseError::IncompleteInput));
-        let list = parse("false ||\necho ok", 0, &[], false).unwrap().unwrap();
+        assert_eq!(parse("false ||", 0, &[], false, &HashMap::new()), Err(ParseError::IncompleteInput));
+        let list = parse("false ||\necho ok", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items.len(), 2);
         assert_eq!(list.items[0].connector, Connector::Or);
     }
@@ -2431,15 +2659,15 @@ mod tests {
     #[test]
     fn multiline_quoted_string() {
         // 最初のパースは UnterminatedQuote
-        assert!(matches!(parse("echo \"hello", 0, &[], false), Err(ParseError::UnterminatedQuote('"'))));
+        assert!(matches!(parse("echo \"hello", 0, &[], false, &HashMap::new()), Err(ParseError::UnterminatedQuote('"'))));
         // 継続入力後は成功
-        let list = parse("echo \"hello\nworld\"", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo \"hello\nworld\"", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "hello\nworld");
     }
 
     #[test]
     fn inline_assignment_only() {
-        let list = parse("FOO=bar", 0, &[], false).unwrap().unwrap();
+        let list = parse("FOO=bar", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         let cmd = &list.items[0].pipeline.commands[0];
         assert!(cmd.args.is_empty());
         assert_eq!(cmd.assignments, vec![("FOO".to_string(), "bar".to_string())]);
@@ -2447,7 +2675,7 @@ mod tests {
 
     #[test]
     fn inline_assignment_with_command() {
-        let list = parse("FOO=bar echo hello", 0, &[], false).unwrap().unwrap();
+        let list = parse("FOO=bar echo hello", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         let cmd = &list.items[0].pipeline.commands[0];
         assert_eq!(cmd.args[0], "echo");
         assert_eq!(cmd.args[1], "hello");
@@ -2456,7 +2684,7 @@ mod tests {
 
     #[test]
     fn multiple_assignments() {
-        let list = parse("A=1 B=2 cmd", 0, &[], false).unwrap().unwrap();
+        let list = parse("A=1 B=2 cmd", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         let cmd = &list.items[0].pipeline.commands[0];
         assert_eq!(cmd.args[0], "cmd");
         assert_eq!(cmd.assignments.len(), 2);
@@ -2467,7 +2695,7 @@ mod tests {
     #[test]
     fn assignment_not_after_command() {
         // FOO=bar should not be treated as assignment when after a command word
-        let list = parse("echo FOO=bar", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo FOO=bar", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         let cmd = &list.items[0].pipeline.commands[0];
         assert!(cmd.assignments.is_empty());
         assert_eq!(cmd.args[1], "FOO=bar");
@@ -2478,14 +2706,14 @@ mod tests {
     #[test]
     fn dollar_1_no_positional() {
         // $1 with no positional args → empty
-        let list = parse("echo $1", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo $1", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "");
     }
 
     #[test]
     fn dollar_1_with_positional() {
         let args = vec!["hello".to_string(), "world".to_string()];
-        let list = parse("echo $1 $2", 0, &args, false).unwrap().unwrap();
+        let list = parse("echo $1 $2", 0, &args, false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "hello");
         assert_eq!(list.items[0].pipeline.commands[0].args[2], "world");
     }
@@ -2493,14 +2721,14 @@ mod tests {
     #[test]
     fn dollar_hash_count() {
         let args = vec!["a".to_string(), "b".to_string(), "c".to_string()];
-        let list = parse("echo $#", 0, &args, false).unwrap().unwrap();
+        let list = parse("echo $#", 0, &args, false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "3");
     }
 
     #[test]
     fn dollar_star_all_args() {
         let args = vec!["a".to_string(), "b".to_string()];
-        let list = parse("echo $*", 0, &args, false).unwrap().unwrap();
+        let list = parse("echo $*", 0, &args, false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "a b");
     }
 
@@ -2509,7 +2737,7 @@ mod tests {
     #[test]
     fn nounset_undefined_var_error() {
         std::env::remove_var("RUSH_NOUNSET_TEST_UNDEF");
-        let result = parse("echo $RUSH_NOUNSET_TEST_UNDEF", 0, &[], true);
+        let result = parse("echo $RUSH_NOUNSET_TEST_UNDEF", 0, &[], true, &HashMap::new());
         assert!(result.is_err());
         match result.unwrap_err() {
             ParseError::UnboundVariable(name) => assert_eq!(name, "RUSH_NOUNSET_TEST_UNDEF"),
@@ -2520,7 +2748,7 @@ mod tests {
     #[test]
     fn nounset_defined_var_ok() {
         std::env::set_var("RUSH_NOUNSET_TEST_DEF", "hello");
-        let result = parse("echo $RUSH_NOUNSET_TEST_DEF", 0, &[], true);
+        let result = parse("echo $RUSH_NOUNSET_TEST_DEF", 0, &[], true, &HashMap::new());
         assert!(result.is_ok());
         let list = result.unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "hello");
@@ -2531,7 +2759,7 @@ mod tests {
     fn nounset_default_operator_exempt() {
         std::env::remove_var("RUSH_NOUNSET_TEST_DFLT");
         // ${var:-default} は nounset エラーにならない
-        let result = parse("echo ${RUSH_NOUNSET_TEST_DFLT:-ok}", 0, &[], true);
+        let result = parse("echo ${RUSH_NOUNSET_TEST_DFLT:-ok}", 0, &[], true, &HashMap::new());
         assert!(result.is_ok());
         let list = result.unwrap().unwrap();
         assert_eq!(list.items[0].pipeline.commands[0].args[1], "ok");
@@ -2540,7 +2768,7 @@ mod tests {
     #[test]
     fn nounset_special_vars_exempt() {
         // $@, $#, $?, $$ 等は nounset 対象外
-        let result = parse("echo $@ $# $? $$", 0, &[], true);
+        let result = parse("echo $@ $# $? $$", 0, &[], true, &HashMap::new());
         assert!(result.is_ok());
     }
 
@@ -2548,7 +2776,7 @@ mod tests {
     fn nounset_disabled_no_error() {
         std::env::remove_var("RUSH_NOUNSET_TEST_OFF");
         // nounset=false なら未定義変数はエラーにならない
-        let result = parse("echo $RUSH_NOUNSET_TEST_OFF", 0, &[], false);
+        let result = parse("echo $RUSH_NOUNSET_TEST_OFF", 0, &[], false, &HashMap::new());
         assert!(result.is_ok());
     }
 
@@ -2556,7 +2784,7 @@ mod tests {
 
     #[test]
     fn subshell_basic() {
-        let list = parse("(echo hello)", 0, &[], false).unwrap().unwrap();
+        let list = parse("(echo hello)", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items.len(), 1);
         let cmd = &list.items[0].pipeline.commands[0];
         assert!(cmd.subshell_body.is_some());
@@ -2566,7 +2794,7 @@ mod tests {
 
     #[test]
     fn subshell_with_semicolons() {
-        let list = parse("(cd /tmp; pwd)", 0, &[], false).unwrap().unwrap();
+        let list = parse("(cd /tmp; pwd)", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         let cmd = &list.items[0].pipeline.commands[0];
         assert!(cmd.subshell_body.is_some());
         assert_eq!(cmd.subshell_body.as_ref().unwrap(), "cd /tmp; pwd");
@@ -2574,7 +2802,7 @@ mod tests {
 
     #[test]
     fn subshell_nested() {
-        let list = parse("( (echo nested) )", 0, &[], false).unwrap().unwrap();
+        let list = parse("( (echo nested) )", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         let cmd = &list.items[0].pipeline.commands[0];
         assert!(cmd.subshell_body.is_some());
         assert_eq!(cmd.subshell_body.as_ref().unwrap(), "(echo nested)");
@@ -2582,7 +2810,7 @@ mod tests {
 
     #[test]
     fn subshell_in_pipeline() {
-        let list = parse("(echo hello) | cat", 0, &[], false).unwrap().unwrap();
+        let list = parse("(echo hello) | cat", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         let pipeline = &list.items[0].pipeline;
         assert_eq!(pipeline.commands.len(), 2);
         assert!(pipeline.commands[0].subshell_body.is_some());
@@ -2591,7 +2819,7 @@ mod tests {
 
     #[test]
     fn subshell_with_redirect() {
-        let list = parse("(echo hello) > out.txt", 0, &[], false).unwrap().unwrap();
+        let list = parse("(echo hello) > out.txt", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         let cmd = &list.items[0].pipeline.commands[0];
         assert!(cmd.subshell_body.is_some());
         assert_eq!(cmd.redirects.len(), 1);
@@ -2600,7 +2828,7 @@ mod tests {
 
     #[test]
     fn subshell_with_connector() {
-        let list = parse("(false) || echo ok", 0, &[], false).unwrap().unwrap();
+        let list = parse("(false) || echo ok", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert_eq!(list.items.len(), 2);
         assert!(list.items[0].pipeline.commands[0].subshell_body.is_some());
         assert_eq!(list.items[1].pipeline.commands[0].args[0], "echo");
@@ -2608,19 +2836,19 @@ mod tests {
 
     #[test]
     fn subshell_background() {
-        let list = parse("(sleep 1) &", 0, &[], false).unwrap().unwrap();
+        let list = parse("(sleep 1) &", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert!(list.items[0].pipeline.background);
         assert!(list.items[0].pipeline.commands[0].subshell_body.is_some());
     }
 
     #[test]
     fn subshell_incomplete() {
-        assert_eq!(parse("(echo hello", 0, &[], false), Err(ParseError::IncompleteInput));
+        assert_eq!(parse("(echo hello", 0, &[], false, &HashMap::new()), Err(ParseError::IncompleteInput));
     }
 
     #[test]
     fn subshell_empty() {
-        let list = parse("()", 0, &[], false).unwrap().unwrap();
+        let list = parse("()", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         let cmd = &list.items[0].pipeline.commands[0];
         assert!(cmd.subshell_body.is_some());
         assert_eq!(cmd.subshell_body.as_ref().unwrap(), "");
@@ -2629,7 +2857,7 @@ mod tests {
     #[test]
     fn subshell_quoted_parens() {
         // クォート内の ) はサブシェル終了とみなさない
-        let list = parse("(echo ')')", 0, &[], false).unwrap().unwrap();
+        let list = parse("(echo ')')", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         let cmd = &list.items[0].pipeline.commands[0];
         assert!(cmd.subshell_body.is_some());
         assert_eq!(cmd.subshell_body.as_ref().unwrap(), "echo ')'");
@@ -2638,7 +2866,135 @@ mod tests {
     #[test]
     fn normal_command_no_subshell() {
         // 通常コマンドは subshell_body が None
-        let list = parse("echo hello", 0, &[], false).unwrap().unwrap();
+        let list = parse("echo hello", 0, &[], false, &HashMap::new()).unwrap().unwrap();
         assert!(list.items[0].pipeline.commands[0].subshell_body.is_none());
+    }
+
+    // ── 配列変数 ──
+
+    #[test]
+    fn array_assignment_basic() {
+        let list = parse("arr=(a b c)", 0, &[], false, &HashMap::new()).unwrap().unwrap();
+        let cmd = &list.items[0].pipeline.commands[0];
+        assert_eq!(cmd.array_assignments.len(), 1);
+        assert_eq!(cmd.array_assignments[0].0, "arr");
+        assert_eq!(cmd.array_assignments[0].1, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn array_assignment_empty() {
+        let list = parse("arr=()", 0, &[], false, &HashMap::new()).unwrap().unwrap();
+        let cmd = &list.items[0].pipeline.commands[0];
+        assert_eq!(cmd.array_assignments.len(), 1);
+        assert_eq!(cmd.array_assignments[0].0, "arr");
+        assert!(cmd.array_assignments[0].1.is_empty());
+    }
+
+    #[test]
+    fn array_append() {
+        let list = parse("arr+=(x y)", 0, &[], false, &HashMap::new()).unwrap().unwrap();
+        let cmd = &list.items[0].pipeline.commands[0];
+        assert_eq!(cmd.array_appends.len(), 1);
+        assert_eq!(cmd.array_appends[0].0, "arr");
+        assert_eq!(cmd.array_appends[0].1, vec!["x", "y"]);
+    }
+
+    #[test]
+    fn array_indexed_assignment() {
+        let list = parse("arr[2]=val", 0, &[], false, &HashMap::new()).unwrap().unwrap();
+        let cmd = &list.items[0].pipeline.commands[0];
+        assert_eq!(cmd.indexed_assignments.len(), 1);
+        assert_eq!(cmd.indexed_assignments[0], ("arr".to_string(), 2, "val".to_string()));
+    }
+
+    #[test]
+    fn normal_assignment_not_array() {
+        // VAR=val は通常代入（配列と混同しない）
+        let list = parse("VAR=hello", 0, &[], false, &HashMap::new()).unwrap().unwrap();
+        let cmd = &list.items[0].pipeline.commands[0];
+        assert_eq!(cmd.assignments.len(), 1);
+        assert!(cmd.array_assignments.is_empty());
+    }
+
+    #[test]
+    fn array_expand_element() {
+        let mut arrays = HashMap::new();
+        let mut btree = BTreeMap::new();
+        btree.insert(0, "hello".to_string());
+        btree.insert(1, "world".to_string());
+        arrays.insert("arr".to_string(), btree);
+
+        let list = parse("echo ${arr[0]}", 0, &[], false, &arrays).unwrap().unwrap();
+        let args: Vec<String> = list.items[0].pipeline.commands[0].args.iter().map(|a| a.to_string()).collect();
+        assert_eq!(args, vec!["echo", "hello"]);
+    }
+
+    #[test]
+    fn array_expand_all_at() {
+        let mut arrays = HashMap::new();
+        let mut btree = BTreeMap::new();
+        btree.insert(0, "a".to_string());
+        btree.insert(1, "b".to_string());
+        btree.insert(2, "c".to_string());
+        arrays.insert("arr".to_string(), btree);
+
+        let list = parse("echo ${arr[@]}", 0, &[], false, &arrays).unwrap().unwrap();
+        let args: Vec<String> = list.items[0].pipeline.commands[0].args.iter().map(|a| a.to_string()).collect();
+        // ${arr[@]} は \x1F 区切り — パーサーレベルではまだ1ワード
+        assert_eq!(args[0], "echo");
+        assert!(args[1].contains('\x1F') || args[1] == "a\x1Fb\x1Fc");
+    }
+
+    #[test]
+    fn array_expand_all_star() {
+        let mut arrays = HashMap::new();
+        let mut btree = BTreeMap::new();
+        btree.insert(0, "x".to_string());
+        btree.insert(1, "y".to_string());
+        arrays.insert("arr".to_string(), btree);
+
+        let list = parse("echo ${arr[*]}", 0, &[], false, &arrays).unwrap().unwrap();
+        let args: Vec<String> = list.items[0].pipeline.commands[0].args.iter().map(|a| a.to_string()).collect();
+        assert_eq!(args, vec!["echo", "x y"]);
+    }
+
+    #[test]
+    fn array_length() {
+        let mut arrays = HashMap::new();
+        let mut btree = BTreeMap::new();
+        btree.insert(0, "a".to_string());
+        btree.insert(1, "bb".to_string());
+        btree.insert(2, "ccc".to_string());
+        arrays.insert("arr".to_string(), btree);
+
+        let list = parse("echo ${#arr[@]}", 0, &[], false, &arrays).unwrap().unwrap();
+        let args: Vec<String> = list.items[0].pipeline.commands[0].args.iter().map(|a| a.to_string()).collect();
+        assert_eq!(args, vec!["echo", "3"]);
+    }
+
+    #[test]
+    fn array_element_length() {
+        let mut arrays = HashMap::new();
+        let mut btree = BTreeMap::new();
+        btree.insert(0, "hello".to_string());
+        arrays.insert("arr".to_string(), btree);
+
+        let list = parse("echo ${#arr[0]}", 0, &[], false, &arrays).unwrap().unwrap();
+        let args: Vec<String> = list.items[0].pipeline.commands[0].args.iter().map(|a| a.to_string()).collect();
+        assert_eq!(args, vec!["echo", "5"]);
+    }
+
+    #[test]
+    fn array_bare_var_is_element_zero() {
+        let mut arrays = HashMap::new();
+        let mut btree = BTreeMap::new();
+        btree.insert(0, "first".to_string());
+        btree.insert(1, "second".to_string());
+        arrays.insert("arr".to_string(), btree);
+
+        // $arr → arr[0]
+        let list = parse("echo $arr", 0, &[], false, &arrays).unwrap().unwrap();
+        let args: Vec<String> = list.items[0].pipeline.commands[0].args.iter().map(|a| a.to_string()).collect();
+        assert_eq!(args, vec!["echo", "first"]);
     }
 }
