@@ -75,16 +75,16 @@
 
 | モジュール | 責務 | 高速化手法 |
 |-----------|------|-----------|
-| `parser` | 入力をAST（コマンド列）に変換。変数展開、パラメータ展開、位置パラメータ（`$1`〜`$9`, `$@`, `$*`, `$#`）、算術展開、継続行検出、`set -u` 未定義変数検出 | ゼロコピー (`Cow::Borrowed`)、位置パラメータ直接スライス渡し |
-| `executor` | コマンド実行・パイプライン接続・`if`/`elif`/`else`/`fi`・`for`/`while`/`until` ループ・`case`/`esac`・関数定義/実行。展開パイプライン: コマンド置換 → チルダ → ブレース → glob | ビルトイン in-process、スタック配列 |
+| `parser` | 入力をAST（コマンド列）に変換。変数展開、配列展開（`${arr[@]}`等）、パラメータ展開、位置パラメータ（`$1`〜`$9`, `$@`, `$*`, `$#`）、算術展開、継続行検出、`set -u` 未定義変数検出 | ゼロコピー (`Cow::Borrowed`)、位置パラメータ直接スライス渡し |
+| `executor` | コマンド実行・パイプライン接続・`if`/`elif`/`else`/`fi`・`for`/`while`/`until` ループ・`case`/`esac`・関数定義/実行。展開パイプライン: コマンド置換 → チルダ → ブレース → glob。配列代入実行 | ビルトイン in-process、スタック配列 |
 | `spawn` | 外部コマンドの起動 (`posix_spawnp`)。fd 複製 (`2>&1`) 対応 | fork+exec 回避、RAII ラッパー |
-| `builtins` | cd, pwd, echo, export, unset, source, read, exec, wait, type, command, builtin, set, eval 等 34 種 | fork 不要、直接実行 |
+| `builtins` | cd, pwd, echo, export, unset, source, read, exec, wait, type, command, builtin, set, eval, declare 等 35 種 | fork 不要、直接実行 |
 | `job` | ジョブコントロール (bg/fg/jobs/wait) | waitpid 手動 reap |
 | `editor` | 行編集 (raw モード、Ctrl+R 逆方向検索、Tab 補完、シンタックスハイライト) | libc 直接操作、1 回の write(2) |
 | `highlight` | シンタックスハイライト・PATH キャッシュ | HashSet キャッシュ、変更検出 |
 | `complete` | Tab 補完（コマンド名、ファイル名、`&&`/`||`/`;` 後のコマンド位置認識） | PATH キャッシュ共有 |
 | `history` | コマンド履歴 (~/.rush_history)、逆方向検索、ナビゲーション | 追記モード永続化 |
-| `shell` | シェルのグローバル状態（エイリアスマップ、関数マップ、位置パラメータ、シェルオプション `errexit`/`nounset`/`pipefail`） | PATH キャッシュ統合 |
+| `shell` | シェルのグローバル状態（エイリアスマップ、関数マップ、配列変数マップ、位置パラメータ、シェルオプション `errexit`/`nounset`/`pipefail`） | PATH キャッシュ統合 |
 
 ## Implementation Phases
 
@@ -195,6 +195,22 @@
 - **`eval` ビルトイン**: 引数を空白で結合し `run_command_string()` で評価。複合コマンド（if/for/while/case/関数定義）にも自動対応
 - **パーサー拡張**: `Token::LParen`/`RParen` 追加、`Command.subshell_body: Option<String>` フィールド追加、`collect_subshell_body()` でクォート・ネスト括弧を正しくスキップ
 - **テスト**: 309テスト（+20件: サブシェル基本/セミコロン/ネスト/パイプライン/リダイレクト/コネクタ/background/不完全/空/クォート内括弧/通常コマンド/環境隔離/終了ステータス、eval 基本/引数なし/空文字列/false/is_builtin）
+
+### Phase 14: Array Variables ✅
+- **配列宣言**: `arr=(a b c)`、`arr=()`（空配列）
+- **要素アクセス**: `${arr[N]}`（インデックス指定）、`$arr`/`${arr}`（= `${arr[0]}`）
+- **全要素展開**: `${arr[@]}`（個別ワード分割）、`${arr[*]}`（スペース結合）
+- **要素数・文字数**: `${#arr[@]}`/`${#arr[*]}`（要素数）、`${#arr[N]}`（要素Nの文字数）
+- **インデックス代入**: `arr[N]=val`（スパース配列対応）
+- **末尾追加**: `arr+=(d e)`
+- **展開演算子**: `${arr[N]:-default}`、`${arr[N]#pat}`、`${arr[N]%pat}` 等（既存のパラメータ展開を配列要素に適用）
+- **`unset`**: `unset arr`（配列全体削除）、`unset 'arr[N]'`（単一要素削除）
+- **`declare` ビルトイン**: `declare -a arr`（配列宣言）、`declare -p arr`（内容表示: `declare -a arr=([0]="a" [1]="b")` 形式）
+- **`read -a`**: 標準入力をIFS分割して配列に格納
+- **`for` ループ対応**: `for x in ${arr[@]}; do ...; done`（for ループ内ワードリストの変数展開を修正）
+- **ストレージ**: `Shell.arrays: HashMap<String, BTreeMap<usize, String>>`（BTreeMap でスパース配列 + 順序付きイテレーション）
+- **ワード分割**: `\x1F`（Unit Separator）をセンチネルとして `${arr[@]}` の要素間に挿入、`expand_args_full()` で分割
+- **テスト**: 334テスト（+25件: パーサー11件、エグゼキュータ9件、ビルトイン5件）
 
 ## Speed Comparison Targets
 
