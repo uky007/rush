@@ -75,8 +75,8 @@
 
 | モジュール | 責務 | 高速化手法 |
 |-----------|------|-----------|
-| `parser` | 入力をAST（コマンド列）に変換。変数展開、配列展開（`${arr[@]}`等）、パラメータ展開、位置パラメータ（`$1`〜`$9`, `$@`, `$*`, `$#`）、算術展開、継続行検出、`set -u` 未定義変数検出 | ゼロコピー (`Cow::Borrowed`)、位置パラメータ直接スライス渡し |
-| `executor` | コマンド実行・パイプライン接続・`if`/`elif`/`else`/`fi`・`for`/`while`/`until` ループ・`case`/`esac`・関数定義/実行。展開パイプライン: コマンド置換 → チルダ → ブレース → glob。配列代入実行 | ビルトイン in-process、スタック配列 |
+| `parser` | 入力をAST（コマンド列）に変換。変数展開、配列展開（`${arr[@]}`等）、パラメータ展開、位置パラメータ（`$1`〜`$9`, `$@`, `$*`, `$#`）、算術展開、プロセス置換（`<(cmd)` / `>(cmd)`）、継続行検出、`set -u` 未定義変数検出 | ゼロコピー (`Cow::Borrowed`)、位置パラメータ直接スライス渡し |
+| `executor` | コマンド実行・パイプライン接続・プロセス置換・`if`/`elif`/`else`/`fi`・`for`/`while`/`until` ループ・`case`/`esac`・関数定義/実行。展開パイプライン: コマンド置換 → チルダ → ブレース → glob → プロセス置換。配列代入実行 | ビルトイン in-process、スタック配列 |
 | `spawn` | 外部コマンドの起動 (`posix_spawnp`)。fd 複製 (`2>&1`) 対応 | fork+exec 回避、RAII ラッパー |
 | `builtins` | cd, pwd, echo, export, unset, source, read, exec, wait, type, command, builtin, set, eval, declare 等 35 種 | fork 不要、直接実行 |
 | `job` | ジョブコントロール (bg/fg/jobs/wait) | waitpid 手動 reap |
@@ -211,6 +211,17 @@
 - **ストレージ**: `Shell.arrays: HashMap<String, BTreeMap<usize, String>>`（BTreeMap でスパース配列 + 順序付きイテレーション）
 - **ワード分割**: `\x1F`（Unit Separator）をセンチネルとして `${arr[@]}` の要素間に挿入、`expand_args_full()` で分割
 - **テスト**: 334テスト（+25件: パーサー11件、エグゼキュータ9件、ビルトイン5件）
+
+### Phase 15: Process Substitution (`<(cmd)` / `>(cmd)`) ✅
+- **入力プロセス置換 `<(cmd)`**: コマンドの stdout を `pipe()` + `fork()` で実行し、`/dev/fd/N` パスとして引数に渡す。`diff <(sort file1) <(sort file2)` のようなコマンド比較に使用
+- **出力プロセス置換 `>(cmd)`**: `/dev/fd/N` への書き込みがコマンドの stdin に流れる。`tee >(cat > /dev/null)` のようなパイプ分岐に使用
+- **リダイレクトターゲット対応**: `cmd < <(echo hello)` のようにリダイレクト先としてプロセス置換を使用可能
+- **パイプライン内蔵**: `<(cmd1 | cmd2)` のようにプロセス置換内にパイプラインを含む構文に対応
+- **トークナイザ**: `<(`/`>(` を `ProcSubIn`/`ProcSubOut` トークンとして認識、`collect_subshell_body()` を再利用して本体抽出
+- **センチネル方式**: `\x1E`（Record Separator）を使い、全展開ステージを安全に通過。`expand_proc_subs()` で `/dev/fd/N` に置換
+- **fd ライフサイクル管理**: proc sub の fd は `posix_spawnp` 後に親が close、パイプライン完了後に子プロセスを `waitpid`
+- **シンタックスハイライト**: `<(cmd)`/`>(cmd)` をシアンで着色（括弧 depth トラッキングでネスト対応）
+- **テスト**: 344テスト（+10件: パーサー6件、エグゼキュータ4件）
 
 ## Speed Comparison Targets
 

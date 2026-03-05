@@ -94,6 +94,11 @@ use crate::spawn;
 fn expand_args_full(args: &[std::borrow::Cow<'_, str>], shell: &mut Shell) -> Vec<String> {
     let mut result = Vec::new();
     for arg in args {
+        // プロセス置換センチネルはそのまま通過（後で expand_proc_subs が処理）
+        if arg.starts_with("\x1E") {
+            result.push(arg.to_string());
+            continue;
+        }
         // 1. コマンド置換
         let sub_expanded = if arg.contains("$(") || arg.contains('`') {
             std::borrow::Cow::Owned(expand_command_subs(arg, shell))
@@ -117,6 +122,131 @@ fn expand_args_full(args: &[std::borrow::Cow<'_, str>], shell: &mut Shell) -> Ve
         }
     }
     result
+}
+
+// ── プロセス置換 ───────────────────────────────────────────────────
+
+/// プロセス置換で生成された子プロセスの情報。
+struct ProcSubInfo {
+    parent_fd: i32,         // 親が保持する fd（spawn 後に close する）
+    child_pid: libc::pid_t, // コマンド実行子プロセスの PID
+}
+
+/// 入力プロセス置換 `<(cmd)` をセットアップする。
+///
+/// `pipe()` + `fork()` でコマンドを実行し、子の stdout をパイプの write end に接続。
+/// 親は read end を保持し、`/dev/fd/N` 経由で読み取る。
+fn setup_proc_sub_in(cmd_body: &str, shell: &mut Shell) -> Option<ProcSubInfo> {
+    let mut fds = [0i32; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        eprintln!("rush: pipe: {}", std::io::Error::last_os_error());
+        return None;
+    }
+    let read_fd = fds[0];
+    let write_fd = fds[1];
+
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        eprintln!("rush: fork: {}", std::io::Error::last_os_error());
+        unsafe { libc::close(read_fd); libc::close(write_fd); }
+        return None;
+    }
+    if pid == 0 {
+        // 子プロセス
+        unsafe {
+            libc::close(read_fd);
+            libc::dup2(write_fd, libc::STDOUT_FILENO);
+            libc::close(write_fd);
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::signal(libc::SIGTSTP, libc::SIG_DFL);
+        }
+        let status = run_command_string(shell, cmd_body);
+        std::process::exit(status);
+    }
+    // 親プロセス
+    unsafe { libc::close(write_fd); }
+    Some(ProcSubInfo { parent_fd: read_fd, child_pid: pid })
+}
+
+/// 出力プロセス置換 `>(cmd)` をセットアップする。
+///
+/// `pipe()` + `fork()` でコマンドを実行し、子の stdin をパイプの read end に接続。
+/// 親は write end を保持し、`/dev/fd/N` 経由で書き込む。
+fn setup_proc_sub_out(cmd_body: &str, shell: &mut Shell) -> Option<ProcSubInfo> {
+    let mut fds = [0i32; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        eprintln!("rush: pipe: {}", std::io::Error::last_os_error());
+        return None;
+    }
+    let read_fd = fds[0];
+    let write_fd = fds[1];
+
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        eprintln!("rush: fork: {}", std::io::Error::last_os_error());
+        unsafe { libc::close(read_fd); libc::close(write_fd); }
+        return None;
+    }
+    if pid == 0 {
+        // 子プロセス
+        unsafe {
+            libc::close(write_fd);
+            libc::dup2(read_fd, libc::STDIN_FILENO);
+            libc::close(read_fd);
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::signal(libc::SIGTSTP, libc::SIG_DFL);
+        }
+        let status = run_command_string(shell, cmd_body);
+        std::process::exit(status);
+    }
+    // 親プロセス
+    unsafe { libc::close(read_fd); }
+    Some(ProcSubInfo { parent_fd: write_fd, child_pid: pid })
+}
+
+/// 引数中の `\x1E<cmd` / `\x1E>cmd` センチネルを検出し、プロセス置換をセットアップ。
+/// `/dev/fd/N` パスに置換した引数と、ProcSubInfo リストを返す。
+fn expand_proc_subs(args: &mut Vec<String>, shell: &mut Shell) -> Vec<ProcSubInfo> {
+    let mut infos = Vec::new();
+    for arg in args.iter_mut() {
+        if arg.starts_with("\x1E<") {
+            let cmd_body = arg[2..].to_string();
+            if let Some(info) = setup_proc_sub_in(&cmd_body, shell) {
+                *arg = format!("/dev/fd/{}", info.parent_fd);
+                infos.push(info);
+            }
+        } else if arg.starts_with("\x1E>") {
+            let cmd_body = arg[2..].to_string();
+            if let Some(info) = setup_proc_sub_out(&cmd_body, shell) {
+                *arg = format!("/dev/fd/{}", info.parent_fd);
+                infos.push(info);
+            }
+        }
+    }
+    infos
+}
+
+/// プロセス置換のリダイレクトターゲットをセットアップし、fd を返す。
+fn expand_proc_sub_redirect(target: &str, shell: &mut Shell) -> Option<(i32, ProcSubInfo)> {
+    if target.starts_with("\x1E<") {
+        let cmd_body = &target[2..];
+        setup_proc_sub_in(cmd_body, shell).map(|info| (info.parent_fd, info))
+    } else if target.starts_with("\x1E>") {
+        let cmd_body = &target[2..];
+        setup_proc_sub_out(cmd_body, shell).map(|info| (info.parent_fd, info))
+    } else {
+        None
+    }
+}
+
+/// プロセス置換の後始末: 各 fd を close し、子プロセスを waitpid。
+fn cleanup_proc_subs(infos: &[ProcSubInfo]) {
+    for info in infos {
+        unsafe {
+            libc::close(info.parent_fd);
+            libc::waitpid(info.child_pid, std::ptr::null_mut(), 0);
+        }
+    }
 }
 
 /// ブレース展開: `{a,b,c}` → カンマ区切り、`{1..5}` → 数値レンジ、`{a..z}` → 文字レンジ。
@@ -539,9 +669,11 @@ fn execute_pipeline(shell: &mut Shell, pipeline: &Pipeline<'_>, cmd_text: &str) 
             return 0;
         }
 
-        // FdDup があれば spawn パスにフォールバック
+        // FdDup またはプロセス置換があれば spawn パスにフォールバック
         let has_fd_dup = cmd.redirects.iter().any(|r| matches!(r.kind, RedirectKind::FdDup { .. }));
-        if !has_fd_dup {
+        let has_proc_sub = cmd.args.iter().any(|a| a.starts_with("\x1E"))
+            || cmd.redirects.iter().any(|r| r.target.starts_with("\x1E"));
+        if !has_fd_dup && !has_proc_sub {
             let expanded = expand_args_full(&cmd.args, shell);
             let args: Vec<&str> = expanded.iter().map(|s| s.as_str()).collect();
             // ユーザー定義関数の呼び出しチェック（ビルトインより優先）
@@ -645,17 +777,19 @@ struct RedirectFds {
     stdout_fd: Option<i32>,
     stderr_fd: Option<i32>,
     dup_actions: Vec<(i32, i32)>, // (src_fd, dst_fd) — spawn で適用
+    proc_subs: Vec<ProcSubInfo>,  // プロセス置換の子プロセス情報
 }
 
 /// リダイレクト先ファイルを開き、raw fd を返す。
 ///
 /// 開いた fd は呼び出し側（spawn 後の親プロセス）で close する責任がある。
-fn open_redirect_fds(redirects: &[parser::Redirect<'_>]) -> Result<RedirectFds, i32> {
+fn open_redirect_fds(redirects: &[parser::Redirect<'_>], shell: &mut Shell) -> Result<RedirectFds, i32> {
     let mut fds = RedirectFds {
         stdin_fd: None,
         stdout_fd: None,
         stderr_fd: None,
         dup_actions: Vec::new(),
+        proc_subs: Vec::new(),
     };
 
     for r in redirects {
@@ -666,11 +800,20 @@ fn open_redirect_fds(redirects: &[parser::Redirect<'_>]) -> Result<RedirectFds, 
                 if let Some(old) = fds.stdout_fd {
                     unsafe { libc::close(old); }
                 }
-                let f = File::create(target).map_err(|e| {
-                    eprintln!("rush: {}: {}", target, e);
-                    1
-                })?;
-                fds.stdout_fd = Some(f.into_raw_fd());
+                if target.starts_with("\x1E") {
+                    if let Some((fd, info)) = expand_proc_sub_redirect(target, shell) {
+                        fds.stdout_fd = Some(fd);
+                        fds.proc_subs.push(info);
+                    } else {
+                        return Err(1);
+                    }
+                } else {
+                    let f = File::create(target).map_err(|e| {
+                        eprintln!("rush: {}: {}", target, e);
+                        1
+                    })?;
+                    fds.stdout_fd = Some(f.into_raw_fd());
+                }
             }
             RedirectKind::Append => {
                 if let Some(old) = fds.stdout_fd {
@@ -690,11 +833,21 @@ fn open_redirect_fds(redirects: &[parser::Redirect<'_>]) -> Result<RedirectFds, 
                 if let Some(old) = fds.stdin_fd {
                     unsafe { libc::close(old); }
                 }
-                let f = File::open(target).map_err(|e| {
-                    eprintln!("rush: {}: {}", target, e);
-                    1
-                })?;
-                fds.stdin_fd = Some(f.into_raw_fd());
+                if target.starts_with("\x1E") {
+                    // プロセス置換のリダイレクトターゲット
+                    if let Some((fd, info)) = expand_proc_sub_redirect(target, shell) {
+                        fds.stdin_fd = Some(fd);
+                        fds.proc_subs.push(info);
+                    } else {
+                        return Err(1);
+                    }
+                } else {
+                    let f = File::open(target).map_err(|e| {
+                        eprintln!("rush: {}: {}", target, e);
+                        1
+                    })?;
+                    fds.stdin_fd = Some(f.into_raw_fd());
+                }
             }
             RedirectKind::Stderr => {
                 if let Some(old) = fds.stderr_fd {
@@ -810,6 +963,7 @@ fn execute_job(shell: &mut Shell, pipeline: &Pipeline<'_>, cmd_text: &str) -> i3
     let mut pgid: libc::pid_t = 0;
     let mut spawn_error = false;
     let mut error_status = 1i32;
+    let mut all_proc_subs: Vec<ProcSubInfo> = Vec::new();
 
     // ── close 対象 fd 収集用スタック配列 ──
     let mut close_fds_buf: [i32; 16] = [-1; 16];
@@ -827,7 +981,11 @@ fn execute_job(shell: &mut Shell, pipeline: &Pipeline<'_>, cmd_text: &str) -> i3
             .collect();
 
         // コマンド置換 + チルダ + glob 展開
-        let expanded = expand_args_full(&cmd.args, shell);
+        let mut expanded = expand_args_full(&cmd.args, shell);
+
+        // プロセス置換の展開（引数中の \x1E を /dev/fd/N に置換）
+        let proc_subs = expand_proc_subs(&mut expanded, shell);
+
         let args: Vec<&str> = expanded.iter().map(|s| s.as_str()).collect();
 
         // stdin/stdout の決定（パイプ接続）
@@ -841,10 +999,11 @@ fn execute_job(shell: &mut Shell, pipeline: &Pipeline<'_>, cmd_text: &str) -> i3
             stdout_fd = Some(pipes[i][1]);
         }
 
-        // リダイレクトの fd を開く
-        let redir_fds = match open_redirect_fds(&cmd.redirects) {
+        // リダイレクトの fd を開く（プロセス置換のリダイレクトを含む）
+        let redir_fds = match open_redirect_fds(&cmd.redirects, shell) {
             Ok(fds) => fds,
             Err(status) => {
+                cleanup_proc_subs(&proc_subs);
                 error_status = status;
                 spawn_error = true;
                 break;
@@ -974,6 +1133,18 @@ fn execute_job(shell: &mut Shell, pipeline: &Pipeline<'_>, cmd_text: &str) -> i3
             unsafe { libc::close(fd); }
         }
 
+        // プロセス置換の fd を親側で close（spawn した子が fd を継承した後）
+        // リダイレクト経由のプロセス置換 fd も close
+        for ps in &redir_fds.proc_subs {
+            unsafe { libc::close(ps.parent_fd); }
+        }
+        for ps in &proc_subs {
+            unsafe { libc::close(ps.parent_fd); }
+        }
+        // ProcSubInfo を全体リストに移動（waitpid 用）
+        all_proc_subs.extend(proc_subs);
+        all_proc_subs.extend(redir_fds.proc_subs);
+
         // インライン代入を復元（子プロセスにのみ影響させるため）
         for (k, old) in saved_env {
             match old {
@@ -998,6 +1169,10 @@ fn execute_job(shell: &mut Shell, pipeline: &Pipeline<'_>, cmd_text: &str) -> i3
                 libc::waitpid(pid, std::ptr::null_mut(), 0);
             }
         }
+        // プロセス置換の子プロセスも待機
+        for ps in &all_proc_subs {
+            unsafe { libc::waitpid(ps.child_pid, std::ptr::null_mut(), 0); }
+        }
         return error_status;
     }
 
@@ -1012,6 +1187,10 @@ fn execute_job(shell: &mut Shell, pipeline: &Pipeline<'_>, cmd_text: &str) -> i3
             .jobs
             .insert(pgid, display_cmd.to_string(), active_pids.to_vec());
         eprintln!("[{}] {}", job_id, pgid);
+        // プロセス置換の子プロセスを待機
+        for ps in &all_proc_subs {
+            unsafe { libc::waitpid(ps.child_pid, std::ptr::null_mut(), 0); }
+        }
         0
     } else {
         // フォアグラウンド: ジョブテーブルに一時登録して待機
@@ -1025,6 +1204,11 @@ fn execute_job(shell: &mut Shell, pipeline: &Pipeline<'_>, cmd_text: &str) -> i3
 
         // ターミナルをシェルに戻す
         job::take_terminal_back(shell.terminal_fd, shell.shell_pgid);
+
+        // プロセス置換の子プロセスを待機
+        for ps in &all_proc_subs {
+            unsafe { libc::waitpid(ps.child_pid, std::ptr::null_mut(), 0); }
+        }
 
         if stopped {
             // Ctrl+Z で停止: ジョブテーブルに残す。停止状態をマーク
@@ -3025,5 +3209,39 @@ mod tests {
         assert!(arr.get(&1).is_none());
         assert_eq!(arr.get(&0).unwrap(), "a");
         assert_eq!(arr.get(&2).unwrap(), "c");
+    }
+
+    // ── プロセス置換テスト ──
+
+    #[test]
+    fn proc_sub_cat_echo() {
+        let mut shell = Shell::new();
+        // cat <(echo hello) → "hello"
+        let status = run_command_string(&mut shell, "cat <(echo hello)");
+        assert_eq!(status, 0);
+    }
+
+    #[test]
+    fn proc_sub_diff_same() {
+        let mut shell = Shell::new();
+        // diff <(echo same) <(echo same) → status 0
+        let status = run_command_string(&mut shell, "diff <(echo same) <(echo same)");
+        assert_eq!(status, 0);
+    }
+
+    #[test]
+    fn proc_sub_diff_different() {
+        let mut shell = Shell::new();
+        // diff <(echo a) <(echo b) → status 1
+        let status = run_command_string(&mut shell, "diff <(echo a) <(echo b)");
+        assert_eq!(status, 1);
+    }
+
+    #[test]
+    fn proc_sub_output() {
+        let mut shell = Shell::new();
+        // echo hello | tee >(cat > /dev/null) → status 0
+        let status = run_command_string(&mut shell, "echo hello | tee >(cat > /dev/null)");
+        assert_eq!(status, 0);
     }
 }

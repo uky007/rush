@@ -189,30 +189,72 @@ pub fn highlight(buf: &str, cache: &PathCache) -> String {
                 command_position = false;
             }
             b'>' => {
-                result.push_str(CYAN);
-                result.push('>');
-                pos += 1;
-                if pos < len && bytes[pos] == b'>' {
-                    result.push('>');
-                    pos += 1;
-                } else if pos < len && bytes[pos] == b'&' {
-                    // >&N
-                    result.push('&');
-                    pos += 1;
-                    while pos < len && bytes[pos].is_ascii_digit() {
-                        result.push(bytes[pos] as char);
+                if pos + 1 < len && bytes[pos + 1] == b'(' {
+                    // >(cmd) — 出力プロセス置換
+                    result.push_str(CYAN);
+                    result.push_str(">(");
+                    pos += 2;
+                    let mut depth = 1;
+                    while pos < len && depth > 0 {
+                        match bytes[pos] {
+                            b'(' => { depth += 1; result.push('('); }
+                            b')' => {
+                                depth -= 1;
+                                if depth > 0 { result.push(')'); }
+                            }
+                            _ => result.push(bytes[pos] as char),
+                        }
                         pos += 1;
                     }
+                    result.push(')');
+                    result.push_str(RESET);
+                } else {
+                    result.push_str(CYAN);
+                    result.push('>');
+                    pos += 1;
+                    if pos < len && bytes[pos] == b'>' {
+                        result.push('>');
+                        pos += 1;
+                    } else if pos < len && bytes[pos] == b'&' {
+                        // >&N
+                        result.push('&');
+                        pos += 1;
+                        while pos < len && bytes[pos].is_ascii_digit() {
+                            result.push(bytes[pos] as char);
+                            pos += 1;
+                        }
+                    }
+                    result.push_str(RESET);
+                    redirect_target = true;
                 }
-                result.push_str(RESET);
-                redirect_target = true;
             }
             b'<' => {
-                result.push_str(CYAN);
-                result.push('<');
-                result.push_str(RESET);
-                pos += 1;
-                redirect_target = true;
+                if pos + 1 < len && bytes[pos + 1] == b'(' {
+                    // <(cmd) — 入力プロセス置換
+                    result.push_str(CYAN);
+                    result.push_str("<(");
+                    pos += 2;
+                    let mut depth = 1;
+                    while pos < len && depth > 0 {
+                        match bytes[pos] {
+                            b'(' => { depth += 1; result.push('('); }
+                            b')' => {
+                                depth -= 1;
+                                if depth > 0 { result.push(')'); }
+                            }
+                            _ => result.push(bytes[pos] as char),
+                        }
+                        pos += 1;
+                    }
+                    result.push(')');
+                    result.push_str(RESET);
+                } else {
+                    result.push_str(CYAN);
+                    result.push('<');
+                    result.push_str(RESET);
+                    pos += 1;
+                    redirect_target = true;
+                }
             }
             b'\'' => {
                 result.push_str(YELLOW);

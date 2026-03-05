@@ -903,6 +903,8 @@ enum Token<'a> {
     HereString,       // <<<
     LParen,           // (  — サブシェル開始
     RParen,           // )  — サブシェル終了
+    ProcSubIn(Cow<'a, str>),   // <(cmd) — 入力プロセス置換
+    ProcSubOut(Cow<'a, str>),  // >(cmd) — 出力プロセス置換
 }
 
 /// 入力文字列をトークン列に変換するイテレータ。
@@ -1172,7 +1174,14 @@ impl<'a, 'b> Iterator for Tokenizer<'a, 'b> {
             }
             b'>' => {
                 self.pos += 1;
-                if self.peek() == Some(b'>') {
+                if self.peek() == Some(b'(') {
+                    self.pos += 1; // "(" をスキップ
+                    let body = self.collect_subshell_body();
+                    match body {
+                        Ok(b) => Some(Ok(Token::ProcSubOut(Cow::Owned(b)))),
+                        Err(e) => Some(Err(e)),
+                    }
+                } else if self.peek() == Some(b'>') {
                     self.pos += 1;
                     Some(Ok(Token::RedirectAppend))
                 } else if self.peek() == Some(b'&') {
@@ -1183,7 +1192,14 @@ impl<'a, 'b> Iterator for Tokenizer<'a, 'b> {
                 }
             }
             b'<' => {
-                if self.peek_at(1) == Some(b'<') && self.peek_at(2) == Some(b'<') {
+                if self.peek_at(1) == Some(b'(') {
+                    self.pos += 2; // "<(" をスキップ
+                    let body = self.collect_subshell_body();
+                    match body {
+                        Ok(b) => Some(Ok(Token::ProcSubIn(Cow::Owned(b)))),
+                        Err(e) => Some(Err(e)),
+                    }
+                } else if self.peek_at(1) == Some(b'<') && self.peek_at(2) == Some(b'<') {
                     self.pos += 3;
                     Some(Ok(Token::HereString))
                 } else if self.peek_at(1) == Some(b'<') {
@@ -1724,9 +1740,21 @@ pub fn parse<'a>(input: &'a str, last_status: i32, pos_args: &[String], nounset:
                     Some(Ok(Token::Word(target))) => {
                         redirects.push(Redirect { kind, target });
                     }
+                    Some(Ok(Token::ProcSubIn(body))) => {
+                        redirects.push(Redirect { kind, target: Cow::Owned(format!("\x1E<{}", body)) });
+                    }
+                    Some(Ok(Token::ProcSubOut(body))) => {
+                        redirects.push(Redirect { kind, target: Cow::Owned(format!("\x1E>{}", body)) });
+                    }
                     Some(Err(e)) => return Err(e),
                     _ => return Err(ParseError::MissingRedirectTarget),
                 }
+            }
+            Token::ProcSubIn(body) => {
+                args.push(Cow::Owned(format!("\x1E<{}", body)));
+            }
+            Token::ProcSubOut(body) => {
+                args.push(Cow::Owned(format!("\x1E>{}", body)));
             }
             Token::HereDoc => {
                 // <<DELIM — ヒアドキュメント（デリミタをターゲットに格納）
@@ -2996,5 +3024,65 @@ mod tests {
         let list = parse("echo $arr", 0, &[], false, &arrays).unwrap().unwrap();
         let args: Vec<String> = list.items[0].pipeline.commands[0].args.iter().map(|a| a.to_string()).collect();
         assert_eq!(args, vec!["echo", "first"]);
+    }
+
+    // ── プロセス置換テスト ──
+
+    #[test]
+    fn proc_sub_in_basic() {
+        let arrays = HashMap::new();
+        let list = parse("cat <(echo hello)", 0, &[], false, &arrays).unwrap().unwrap();
+        let args: Vec<String> = list.items[0].pipeline.commands[0].args.iter().map(|a| a.to_string()).collect();
+        assert_eq!(args, vec!["cat", "\x1E<echo hello"]);
+    }
+
+    #[test]
+    fn proc_sub_out_basic() {
+        let arrays = HashMap::new();
+        let list = parse("echo hello >(cat)", 0, &[], false, &arrays).unwrap().unwrap();
+        let args: Vec<String> = list.items[0].pipeline.commands[0].args.iter().map(|a| a.to_string()).collect();
+        assert_eq!(args, vec!["echo", "hello", "\x1E>cat"]);
+    }
+
+    #[test]
+    fn proc_sub_multiple() {
+        let arrays = HashMap::new();
+        let list = parse("diff <(sort a) <(sort b)", 0, &[], false, &arrays).unwrap().unwrap();
+        let args: Vec<String> = list.items[0].pipeline.commands[0].args.iter().map(|a| a.to_string()).collect();
+        assert_eq!(args, vec!["diff", "\x1E<sort a", "\x1E<sort b"]);
+    }
+
+    #[test]
+    fn proc_sub_redirect_target() {
+        let arrays = HashMap::new();
+        let list = parse("cmd < <(echo hello)", 0, &[], false, &arrays).unwrap().unwrap();
+        let cmd = &list.items[0].pipeline.commands[0];
+        assert_eq!(cmd.args.len(), 1);
+        assert_eq!(cmd.args[0], "cmd");
+        assert_eq!(cmd.redirects.len(), 1);
+        assert_eq!(cmd.redirects[0].target, "\x1E<echo hello");
+    }
+
+    #[test]
+    fn proc_sub_with_pipe() {
+        let arrays = HashMap::new();
+        let list = parse("cat <(ls | sort)", 0, &[], false, &arrays).unwrap().unwrap();
+        let args: Vec<String> = list.items[0].pipeline.commands[0].args.iter().map(|a| a.to_string()).collect();
+        assert_eq!(args, vec!["cat", "\x1E<ls | sort"]);
+    }
+
+    #[test]
+    fn normal_redirect_not_affected() {
+        let arrays = HashMap::new();
+        // 通常の < リダイレクトが壊れていないこと
+        let list = parse("cat < file.txt", 0, &[], false, &arrays).unwrap().unwrap();
+        let cmd = &list.items[0].pipeline.commands[0];
+        assert_eq!(cmd.args.len(), 1);
+        assert_eq!(cmd.redirects[0].target, "file.txt");
+
+        // 通常の > リダイレクトも壊れていないこと
+        let list2 = parse("echo hello > out.txt", 0, &[], false, &arrays).unwrap().unwrap();
+        let cmd2 = &list2.items[0].pipeline.commands[0];
+        assert_eq!(cmd2.redirects[0].target, "out.txt");
     }
 }
